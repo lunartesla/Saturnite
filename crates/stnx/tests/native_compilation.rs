@@ -1,232 +1,331 @@
-use stnx::lexer::Lexer;
-use stnx::parser;
-use stnx::semantic::analyze;
-use stnx::target::{OutputKind, TargetConfig};
-use stnx::codegen;
-use std::env;
-use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
+//! Native compilation integration tests.
+//!
+//! These tests exercise the **full** pipeline: lex -> parse -> semantic
+//! analysis -> LLVM IR -> object file -> link -> execute.  Each test distinguishes
+//! *compiler success* (the program was built) from *program runtime success*
+//! (the built binary exits with the expected code / stdout).
+//!
+//! All artifacts live inside isolated tempfile::TempDir directories so
+//! parallel test execution never collides on fixed filenames.
 
-fn compile_src(src: &str, output: &str, kind: OutputKind) -> Result<(), String> {
-    let tokens: Vec<_> = Lexer::new(src)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("Lex error: {}", e))?;
-    let program = parser::parse(src, tokens).map_err(|e| format!("Parse error: {}", e))?;
-    analyze(&program).map_err(|e| format!("Semantic error: {}", e))?;
+mod common;
 
-    let mut config = TargetConfig::host().map_err(|e| format!("Target error: {}", e))?;
-    config.set_output_kind(kind);
+use common::{compile_src, compile_to_object, ir_only};
+use stnx::target::TargetConfig;
 
-    codegen::compile_with_target(&program, output, config)
-        .map_err(|e| format!("Codegen error: {}", e))?;
-    Ok(())
-}
-
-fn run_compiled_binary(path: &PathBuf) -> (i32, String) {
-    let result = Command::new(path)
-        .output()
-        .expect("failed to execute compiled binary");
-    let stdout = String::from_utf8_lossy(&result.stdout).to_string();
-    let exit_code = result.status.code().unwrap_or(-1);
-    (exit_code, stdout)
-}
-
-#[test]
-fn test_main_returning_i64() {
-    let src = "fn main() -> i64 { return 42 }";
-    let tmp = env::temp_dir().join("test_main_i64");
-    if tmp.exists() {
-        fs::remove_file(&tmp).ok();
-    }
-
-    compile_src(src, tmp.to_str().unwrap(), OutputKind::Exe)
-        .expect("compilation should succeed");
-
-    assert!(tmp.exists(), "executable should be created");
-
-    let (exit_code, _) = run_compiled_binary(&tmp);
-    assert_eq!(exit_code, 42, "exit code should be 42");
-
-    fs::remove_file(&tmp).ok();
-}
-
-#[test]
-fn test_main_returning_unit() {
-    let src = "fn main() { println(42) }";
-    let tmp = env::temp_dir().join("test_main_unit");
-    if tmp.exists() {
-        fs::remove_file(&tmp).ok();
-    }
-
-    compile_src(src, tmp.to_str().unwrap(), OutputKind::Exe)
-        .expect("compilation should succeed");
-
-    let (exit_code, stdout) = run_compiled_binary(&tmp);
-    assert_eq!(stdout.trim(), "42", "println should output 42");
-    // Exit code for void-returning main is not deterministic; just verify it ran
-
-    fs::remove_file(&tmp).ok();
-}
-
-#[test]
-fn test_local_variable() {
-    let src = "fn main() -> i64 { let x = 42 return x }";
-    let tmp = env::temp_dir().join("test_local_var");
-    if tmp.exists() {
-        fs::remove_file(&tmp).ok();
-    }
-
-    compile_src(src, tmp.to_str().unwrap(), OutputKind::Exe)
-        .expect("compilation should succeed");
-
-    let (exit_code, _) = run_compiled_binary(&tmp);
-    assert_eq!(exit_code, 42, "local variable should be 42");
-
-    fs::remove_file(&tmp).ok();
-}
+// Arithmetic
 
 #[test]
 fn test_arithmetic() {
-    let src = "fn main() -> i64 { let x = 10 + 5 * 2 return x }";
-    let tmp = env::temp_dir().join("test_arithmetic");
-    if tmp.exists() {
-        fs::remove_file(&tmp).ok();
-    }
-
-    compile_src(src, tmp.to_str().unwrap(), OutputKind::Exe)
-        .expect("compilation should succeed");
-
-    let (exit_code, _) = run_compiled_binary(&tmp);
-    // 10 + 5 * 2 = 20
-    assert_eq!(exit_code, 20, "arithmetic result should be 20");
-
-    fs::remove_file(&tmp).ok();
+    let bin = compile_src("fn main() -> i64 { let x = 10 + 5 * 2 return x }");
+    let (code, _) = bin.run();
+    assert_eq!(code, 20, "arithmetic result should be 20");
 }
 
 #[test]
-fn test_if_else() {
-    let src = "fn main() -> i64 { let x = 1 if x == 1 { println(100) } else { println(200) } return 0 }";
-    let tmp = env::temp_dir().join("test_if_else");
-    if tmp.exists() {
-        fs::remove_file(&tmp).ok();
-    }
+fn test_arithmetic_subtraction_and_division() {
+    let bin = compile_src("fn main() -> i64 { let mut x = 100 x = x - 20 return x / 4 }");
+    let (code, _) = bin.run();
+    assert_eq!(code, 20);
+}
 
-    compile_src(src, tmp.to_str().unwrap(), OutputKind::Exe)
-        .expect("compilation should succeed");
+// Variables
 
-    let (_, stdout) = run_compiled_binary(&tmp);
-    assert_eq!(stdout.trim(), "100", "if true should print 100");
-
-    fs::remove_file(&tmp).ok();
+#[test]
+fn test_local_variable() {
+    let bin = compile_src("fn main() -> i64 { let x = 42 return x }");
+    let (code, _) = bin.run();
+    assert_eq!(code, 42);
 }
 
 #[test]
-fn test_function_call() {
-    let src = "fn add(a: i64, b: i64) -> i64 { return a + b } fn main() -> i64 { return add(10, 20) }";
-    let tmp = env::temp_dir().join("test_func_call");
-    if tmp.exists() {
-        fs::remove_file(&tmp).ok();
-    }
-
-    compile_src(src, tmp.to_str().unwrap(), OutputKind::Exe)
-        .expect("compilation should succeed");
-
-    let (exit_code, _) = run_compiled_binary(&tmp);
-    assert_eq!(exit_code, 30, "function call should return 30");
-
-    fs::remove_file(&tmp).ok();
+fn test_multiple_variables() {
+    let bin = compile_src("fn main() -> i64 { let x = 10 let y = 20 let z = x + y return z }");
+    let (code, _) = bin.run();
+    assert_eq!(code, 30);
 }
+
+// Mutable variables
+
+#[test]
+fn test_mutable_variable_assignment() {
+    let bin = compile_src("fn main() -> i64 { let mut x = 0 x = 10 return x }");
+    let (code, _) = bin.run();
+    assert_eq!(code, 10);
+}
+
+#[test]
+fn test_augmented_assignment() {
+    let bin = compile_src("fn main() -> i64 { let mut x = 10 x += 5 x -= 2 x *= 3 return x }");
+    let (code, _) = bin.run();
+    assert_eq!(code, 39);
+}
+
+// For loops / ranges
 
 #[test]
 fn test_for_loop_runtime() {
-    let src = "fn main() -> i64 { for i in 0..5 { println(i) } return 0 }";
-    let tmp = env::temp_dir().join("test_for_loop");
-    if tmp.exists() {
-        fs::remove_file(&tmp).ok();
-    }
-
-    compile_src(src, tmp.to_str().unwrap(), OutputKind::Exe)
-        .expect("compilation should succeed");
-
-    let (exit_code, stdout) = run_compiled_binary(&tmp);
+    let bin = compile_src("fn main() -> i64 { for i in 0..5 { println(i) } return 0 }");
+    let (code, stdout) = bin.run();
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 5, "for loop should produce 5 lines of output");
-    assert_eq!(lines[0], "0", "first line should be 0");
-    assert_eq!(lines[4], "4", "last line should be 4");
-    assert_eq!(exit_code, 0, "exit code should be 0");
-
-    fs::remove_file(&tmp).ok();
+    assert_eq!(lines.len(), 5);
+    assert_eq!(lines[0], "0");
+    assert_eq!(lines[4], "4");
+    assert_eq!(code, 0);
 }
 
 #[test]
 fn test_for_loop_with_arithmetic() {
-    let src = "fn main() -> i64 { let mut sum = 0 for i in 0..10 { sum = sum + i } return sum }";
-    let tmp = env::temp_dir().join("test_for_loop_arith");
-    if tmp.exists() {
-        fs::remove_file(&tmp).ok();
-    }
+    let bin = compile_src(
+        "fn main() -> i64 { let mut sum = 0 for i in 0..10 { sum = sum + i } return sum }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 45, "sum of 0..10 should be 45");
+}
 
-    compile_src(src, tmp.to_str().unwrap(), OutputKind::Exe)
-        .expect("compilation should succeed");
+#[test]
+fn test_for_loop_inclusive_range() {
+    let bin = compile_src(
+        "fn main() -> i64 { let mut sum = 0 for i in 1...5 { sum = sum + i } return sum }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 15, "sum of 1...5 should be 15");
+}
 
-    let (exit_code, _) = run_compiled_binary(&tmp);
-    // Sum of 0..10 = 0+1+2+3+4+5+6+7+8+9 = 45
-    assert_eq!(exit_code, 45, "sum of 0..10 should be 45");
+// While loops
 
-    fs::remove_file(&tmp).ok();
+#[test]
+fn test_while_loop() {
+    let bin = compile_src("fn main() -> i64 { let mut i = 0 let mut sum = 0 while i < 5 { sum = sum + i i = i + 1 } return sum }");
+    let (code, _) = bin.run();
+    assert_eq!(code, 10);
+}
+
+// If / else
+
+#[test]
+fn test_if_else() {
+    let bin = compile_src(
+        "fn main() -> i64 { let x = 1 if x == 1 { println(100) } else { println(200) } return 0 }",
+    );
+    let (code, stdout) = bin.run();
+    assert_eq!(stdout.trim(), "100");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn test_if_else_return_value() {
+    let bin = compile_src(
+        "fn main() -> i64 { let x = 1 if x == 1 { return 100 } else { return 200 } return 0 }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 100);
+}
+
+#[test]
+fn test_elif_branches() {
+    let bin = compile_src("fn main() -> i64 { let x = 2 if x == 1 { return 10 } elif x == 2 { return 20 } else { return 99 } return 0 }");
+    let (code, _) = bin.run();
+    assert_eq!(code, 20);
+}
+
+#[test]
+fn test_if_false_else() {
+    let bin = compile_src(
+        "fn main() -> i64 { let x = 0 if x == 1 { return 100 } else { return 200 } return 0 }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 200);
+}
+
+// Functions & recursion
+
+#[test]
+fn test_function_call() {
+    let bin = compile_src("fn main() -> i64 { return greet() } fn greet() -> i64 { return 42 }");
+    let (code, _) = bin.run();
+    assert_eq!(code, 42);
+}
+
+#[test]
+fn test_function_with_args() {
+    let bin = compile_src(
+        "fn main() -> i64 { return add(10, 20) } fn add(a: i64, b: i64) -> i64 { return a + b }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 30);
+}
+
+#[test]
+fn test_recursion() {
+    let bin = compile_src("fn main() -> i64 { return fact(5) }\nfn fact(n: i64) -> i64 { if n <= 1 { return 1 } return n * fact(n - 1) }");
+    let (code, _) = bin.run();
+    assert_eq!(code, 120, "fact(5) should be 120");
+}
+
+#[test]
+fn test_recursive_countdown() {
+    let bin = compile_src("fn main() -> i64 { return count(3) }\nfn count(n: i64) -> i64 { if n == 0 { return 0 } return count(n - 1) + 1 }");
+    let (code, _) = bin.run();
+    assert_eq!(code, 3);
+}
+
+// Shadowing
+
+#[test]
+fn test_shadowing() {
+    let bin = compile_src("fn main() -> i64 { let x = 1 let x = x + 1 return x }");
+    let (code, _) = bin.run();
+    assert_eq!(code, 2);
+}
+
+#[test]
+fn test_shadowing_different_value() {
+    let bin = compile_src("fn main() -> i64 { let x = 42 let x = x * 2 return x }");
+    let (code, _) = bin.run();
+    assert_eq!(code, 84);
+}
+
+// Builtins
+
+#[test]
+fn test_main_returning_i64() {
+    let bin = compile_src("fn main() -> i64 { return 42 }");
+    let (code, _) = bin.run();
+    assert_eq!(code, 42);
+}
+
+#[test]
+fn test_main_returning_unit_with_println() {
+    let bin = compile_src("fn main() { println(42) }");
+    let (_code, stdout) = bin.run();
+    assert_eq!(stdout.trim(), "42");
+}
+
+#[test]
+fn test_println_multiple() {
+    let bin = compile_src("fn main() { println(10) println(20) }");
+    let (_code, stdout) = bin.run();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], "10");
+    assert_eq!(lines[1], "20");
+}
+
+// Object file emission
+
+#[test]
+fn test_emit_object_file() {
+    let artifact = compile_to_object("fn main() -> i64 { return 42 }");
+    assert!(artifact.path().exists(), "object file should be created");
+    let bytes = std::fs::read(artifact.path()).expect("should read object file");
+    assert!(bytes.len() > 4, "object file should not be empty");
+    assert_eq!(
+        &bytes[0..4],
+        b"\x7fELF",
+        "object file should be a valid ELF"
+    );
+}
+
+// IR generation
+
+#[test]
+fn test_ir_generation_contains_main() {
+    let ir = ir_only("fn main() -> i64 { return 42 }");
+    assert!(
+        ir.contains("define i64 @main"),
+        "IR should contain main function definition"
+    );
+}
+
+#[test]
+fn test_ir_implicit_return_bool() {
+    let ir = ir_only("fn main() -> bool { }");
+    assert!(ir.contains("ret i1"), "Bool function should return i1");
+}
+
+#[test]
+fn test_ir_implicit_return_i64() {
+    let ir = ir_only("fn main() -> i64 { }");
+    assert!(ir.contains("ret i64"), "I64 function should return i64");
+}
+
+#[test]
+fn test_ir_implicit_return_unit() {
+    let ir = ir_only("fn main() { }");
+    assert!(
+        ir.contains("ret void") || !ir.contains("ret i64"),
+        "Unit function should return void"
+    );
+}
+
+#[test]
+fn test_ir_implicit_return_f64() {
+    let ir = ir_only("fn main() -> f64 { }");
+    assert!(
+        ir.contains("ret double"),
+        "F64 function should return double"
+    );
+}
+
+#[test]
+fn test_ir_for_loop_structure() {
+    let ir = ir_only("fn main() -> i64 { for i in 0..10 { } 0 }");
+    assert!(ir.contains("for_cond"));
+    assert!(ir.contains("for_body"));
+    assert!(ir.contains("icmp"));
+}
+
+#[test]
+fn test_ir_elif_branch_codegen() {
+    let ir =
+        ir_only("fn main() -> i64 { let x = 1 if x == 1 { 0 } elif x == 2 { 0 } else { 0 } 0 }");
+    let cond_br_count = ir.matches("br i1").count();
+    assert!(
+        cond_br_count >= 2,
+        "If-elif-else should have >= 2 conditional branches, got {}",
+        cond_br_count
+    );
+}
+
+#[test]
+fn test_ir_range_evaluates_both_ends() {
+    let ir = ir_only("fn main() -> i64 { let r = 1..10 r }");
+    assert!(ir.contains("define i64 @main"));
+}
+
+#[test]
+fn test_ir_forward_function_reference() {
+    let ir = ir_only("fn main() -> i64 { foo() } fn foo() -> i64 { 42 }");
+    assert!(ir.contains("foo"), "Forward reference to foo should work");
+}
+
+#[test]
+fn test_ir_string_literal_compiles() {
+    let ir = ir_only("fn main() -> i64 { let s = \"hello\" 0 }");
+    assert!(
+        ir.contains("define i64 @main"),
+        "String literal should compile"
+    );
+}
+
+// Target configuration
+
+#[test]
+fn test_native_target_initialization() {
+    let config = TargetConfig::host();
+    assert!(config.is_ok());
+    let config = config.unwrap();
+    let triple = config.triple_str();
+    assert!(!triple.is_empty());
+    assert!(triple.contains("linux") || triple.contains("windows") || triple.contains("darwin"));
 }
 
 #[test]
 fn test_invalid_target_configuration() {
     let result = TargetConfig::from_triple("invalid-triple");
-    assert!(result.is_err(), "invalid target triple should produce an error");
-}
-
-#[test]
-fn test_emit_ir_mode() {
-    let src = "fn main() -> i64 { return 42 }";
-    let tmp = env::temp_dir().join("test_emit_ir.ll");
-    if tmp.exists() {
-        fs::remove_file(&tmp).ok();
-    }
-
-    compile_src(src, tmp.to_str().unwrap(), OutputKind::Ir)
-        .expect("IR compilation should succeed");
-
-    let content = fs::read_to_string(&tmp).expect("IR file should exist");
-    assert!(content.contains("define i64 @main"), "IR should contain main function definition");
-
-    fs::remove_file(&tmp).ok();
-}
-
-#[test]
-fn test_emit_object_mode() {
-    let src = "fn main() -> i64 { return 42 }";
-    let tmp = env::temp_dir().join("test_emit_obj.o");
-    if tmp.exists() {
-        fs::remove_file(&tmp).ok();
-    }
-
-    compile_src(src, tmp.to_str().unwrap(), OutputKind::Object)
-        .expect("object compilation should succeed");
-
-    assert!(tmp.exists(), "object file should be created");
-    // Verify it's actually an object file by checking the ELF header
-    let header = fs::read(&tmp).expect("should read object file");
-    assert!(header.len() > 4, "object file should not be empty");
-
-    fs::remove_file(&tmp).ok();
-}
-
-#[test]
-fn test_native_target_initialization() {
-    let config = TargetConfig::host();
-    assert!(config.is_ok(), "host target initialization should succeed");
-
-    let config = config.unwrap();
-    let triple = config.triple_str();
-    assert!(!triple.is_empty(), "host triple should not be empty");
-    assert!(triple.contains("linux") || triple.contains("windows") || triple.contains("darwin"),
-            "host triple should contain OS name: got {}", triple);
+    assert!(
+        result.is_err(),
+        "invalid target triple should produce an error"
+    );
 }

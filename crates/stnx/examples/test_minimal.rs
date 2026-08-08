@@ -1,8 +1,8 @@
-use stnx::ast::{Expr, BinOp};
-use stnx::lexer::{Lexer, Token, TokenKind};
+use chumsky::extra::Default as ExtraDefault;
 use chumsky::prelude::*;
-use chumsky::extra::Default;
 use std::ops::Range;
+use stnx::ast::{BinOp, Expr};
+use stnx::lexer::{Lexer, Token, TokenKind};
 
 fn expr<'a>() -> impl Parser<'a, &'a [Token], Expr> {
     comparison().boxed()
@@ -13,14 +13,14 @@ fn comparison<'a>() -> impl Parser<'a, &'a [Token], Expr> {
 }
 
 fn additive<'a>() -> impl Parser<'a, &'a [Token], Expr> {
-    multiplicative().foldl(add_op().repeated(), |lhs, (op, rhs)| {
-        Expr::Binary {
+    multiplicative()
+        .foldl(add_op().repeated(), |lhs, (op, rhs)| Expr::Binary {
             op,
             lhs: Box::new(lhs),
             rhs: Box::new(rhs),
             span: Range::default(),
-        }
-    }).boxed()
+        })
+        .boxed()
 }
 
 fn multiplicative<'a>() -> impl Parser<'a, &'a [Token], Expr> {
@@ -32,7 +32,7 @@ fn unary<'a>() -> impl Parser<'a, &'a [Token], Expr> {
 }
 
 fn primary<'a>() -> impl Parser<'a, &'a [Token], Expr> {
-    let integer_lit = any::<&[Token], Default>()
+    let integer_lit = any::<&[Token], ExtraDefault>()
         .filter(|t: &Token| matches!(&t.kind, TokenKind::Integer(_)))
         .map(|t| match &t.kind {
             TokenKind::Integer(n) => Expr::Integer(*n, t.span.clone()),
@@ -43,7 +43,7 @@ fn primary<'a>() -> impl Parser<'a, &'a [Token], Expr> {
 }
 
 fn add_op<'a>() -> impl Parser<'a, &'a [Token], (BinOp, Expr)> {
-    any::<&[Token], Default>()
+    any::<&[Token], ExtraDefault>()
         .filter(|t: &Token| t.kind == TokenKind::Plus)
         .map(|_| BinOp::Add)
         .then(expr())
@@ -56,7 +56,7 @@ fn main() {
     let lexer = Lexer::new(src);
     let tokens: Vec<_> = lexer.collect::<Result<Vec<_>, _>>().unwrap();
     println!("Tokens: {:?}", tokens);
-    
+
     let result = expr().parse(&tokens);
     println!("Result: {:?}", result);
 }

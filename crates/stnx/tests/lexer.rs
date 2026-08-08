@@ -1,9 +1,9 @@
 use stnx::lexer::{Lexer, TokenKind};
 
 fn lex(src: &str) -> Result<Vec<TokenKind>, stnx::error::LexError> {
-    Lexer::new(src).collect::<Result<Vec<_>, _>>().map(|tokens| {
-        tokens.into_iter().map(|t| t.kind).collect()
-    })
+    Lexer::new(src)
+        .collect::<Result<Vec<_>, _>>()
+        .map(|tokens| tokens.into_iter().map(|t| t.kind).collect())
 }
 
 #[test]
@@ -14,8 +14,8 @@ fn test_valid_integer() {
 
 #[test]
 fn test_valid_float() {
-    let tokens = lex("3.14").unwrap();
-    assert_eq!(tokens, vec![TokenKind::Float(3.14)]);
+    let tokens = lex("3.5").unwrap();
+    assert_eq!(tokens, vec![TokenKind::Float(3.5)]);
 }
 
 #[test]
@@ -55,7 +55,11 @@ fn test_invalid_token_dollar() {
 fn test_integer_overflow() {
     let src = "99999999999999999999999";
     let tokens = lex(src).unwrap();
-    assert_eq!(tokens, vec![TokenKind::Error], "Overflow should produce Error token");
+    assert_eq!(
+        tokens,
+        vec![TokenKind::Error],
+        "Overflow should produce Error token"
+    );
 }
 
 #[test]

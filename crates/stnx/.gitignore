@@ -1,1 +1,7 @@
+# Compiled runtime / object files
 *.o
+*.a
+
+# Saturnite build output (target/debug, target/release)
+target/
+

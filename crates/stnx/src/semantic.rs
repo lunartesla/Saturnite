@@ -9,6 +9,12 @@ pub struct Scope {
     parent: Option<Box<Scope>>,
 }
 
+impl Default for Scope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Scope {
     pub fn new() -> Self {
         Self {
@@ -42,7 +48,9 @@ impl Scope {
         if let Some((_, mutable)) = self.variables.get(name) {
             Some(*mutable)
         } else {
-            self.parent.as_ref().and_then(|p| p.lookup_variable_mutability(name))
+            self.parent
+                .as_ref()
+                .and_then(|p| p.lookup_variable_mutability(name))
         }
     }
 
@@ -72,7 +80,9 @@ pub fn analyze(program: &Program) -> CompilerResult<()> {
 
     // Check for main function
     if !global_scope.functions.contains_key("main") {
-        return Err(CompilerError::semantic("no `main` function defined".to_string()));
+        return Err(CompilerError::semantic(
+            "no `main` function defined".to_string(),
+        ));
     }
 
     for func in &program.functions {
@@ -120,9 +130,9 @@ fn check_expr(
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                     if lt != rt {
                         return Err(CompilerError::semantic(format!(
-                                "binary op {:?}: type mismatch {:?} vs {:?}",
-                                op, lt, rt
-                            )));
+                            "binary op {:?}: type mismatch {:?} vs {:?}",
+                            op, lt, rt
+                        )));
                     }
                     Ok(lt)
                 }
@@ -150,16 +160,16 @@ fn check_expr(
                     let arg_ty = check_expr(arg, scope, return_type)?;
                     if arg_ty != Type::I64 {
                         return Err(CompilerError::semantic(format!(
-                                "println expects i64 argument, got {:?}",
-                                arg_ty
-                            )));
+                            "println expects i64 argument, got {:?}",
+                            arg_ty
+                        )));
                     }
                 }
                 return Ok(Type::Unit);
             }
-            let (param_types, ret_type) = scope.lookup_function(func).ok_or_else(|| {
-                CompilerError::semantic(format!("undefined function: {}", func))
-            })?;
+            let (param_types, ret_type) = scope
+                .lookup_function(func)
+                .ok_or_else(|| CompilerError::semantic(format!("undefined function: {}", func)))?;
             if args.len() != param_types.len() {
                 return Err(CompilerError::semantic(format!(
                     "function {} expects {} args, got {}",
@@ -172,9 +182,9 @@ fn check_expr(
                 let actual = check_expr(arg, scope, return_type)?;
                 if actual != *expected {
                     return Err(CompilerError::semantic(format!(
-                            "function {} arg type mismatch: expected {:?}, got {:?}",
-                            func, expected, actual
-                        )));
+                        "function {} arg type mismatch: expected {:?}, got {:?}",
+                        func, expected, actual
+                    )));
                 }
             }
             Ok(ret_type)
@@ -209,7 +219,9 @@ fn check_expr(
             }
             Ok(Type::Unit)
         }
-        Expr::For { var, iter, body, .. } => {
+        Expr::For {
+            var, iter, body, ..
+        } => {
             check_expr(iter, scope, return_type)?;
             let loop_scope = Scope::with_parent(scope.clone());
             let mut loop_scope = loop_scope;
@@ -219,7 +231,9 @@ fn check_expr(
             }
             Ok(Type::Unit)
         }
-        Expr::While { condition, body, .. } => {
+        Expr::While {
+            condition, body, ..
+        } => {
             let cond_ty = check_expr(condition, scope, return_type)?;
             if cond_ty != Type::Bool {
                 return Err(CompilerError::semantic("while condition must be bool"));
@@ -238,33 +252,37 @@ fn check_expr(
             let val_ty = check_expr(value, scope, return_type)?;
             if var_ty != val_ty {
                 return Err(CompilerError::semantic(format!(
-                        "assign type mismatch: variable is {:?}, value is {:?}",
-                        var_ty, val_ty
-                    )));
+                    "assign type mismatch: variable is {:?}, value is {:?}",
+                    var_ty, val_ty
+                )));
             }
             // Check that the variable is mutable
             if !scope.lookup_variable_mutability(target).unwrap_or(false) {
                 return Err(CompilerError::semantic(format!(
-                    "cannot assign to immutable variable: {}", target
+                    "cannot assign to immutable variable: {}",
+                    target
                 )));
             }
             Ok(var_ty)
         }
-        Expr::AugAssign { target, op, value, .. } => {
+        Expr::AugAssign {
+            target, op, value, ..
+        } => {
             let var_ty = scope.lookup_variable(target).ok_or_else(|| {
                 CompilerError::semantic(format!("undefined variable: {}", target))
             })?;
             let val_ty = check_expr(value, scope, return_type)?;
             if var_ty != val_ty {
                 return Err(CompilerError::semantic(format!(
-                        "aug-assign type mismatch: {:?} vs {:?}",
-                        var_ty, val_ty
-                    )));
+                    "aug-assign type mismatch: {:?} vs {:?}",
+                    var_ty, val_ty
+                )));
             }
             // Check that the variable is mutable
             if !scope.lookup_variable_mutability(target).unwrap_or(false) {
                 return Err(CompilerError::semantic(format!(
-                    "cannot assign to immutable variable: {}", target
+                    "cannot assign to immutable variable: {}",
+                    target
                 )));
             }
             let _ = op;
@@ -275,15 +293,15 @@ fn check_expr(
             let end_ty = check_expr(end, scope, return_type)?;
             if start_ty != Type::I64 {
                 return Err(CompilerError::semantic(format!(
-                        "range start type mismatch: expected I64, got {:?}",
-                        start_ty
-                    )));
+                    "range start type mismatch: expected I64, got {:?}",
+                    start_ty
+                )));
             }
             if end_ty != Type::I64 {
                 return Err(CompilerError::semantic(format!(
-                        "range end type mismatch: expected I64, got {:?}",
-                        end_ty
-                    )));
+                    "range end type mismatch: expected I64, got {:?}",
+                    end_ty
+                )));
             }
             Ok(Type::I64)
         }
@@ -297,11 +315,20 @@ fn check_stmt(
 ) -> CompilerResult<()> {
     use crate::ast::Stmt;
     match stmt {
-        Stmt::Let { name, mutable, ty, value, .. } => {
+        Stmt::Let {
+            name,
+            mutable,
+            ty,
+            value,
+            ..
+        } => {
             let inferred = check_expr(value, scope, return_type)?;
             if let Some(t) = ty {
                 if *t != inferred {
-                    return Err(CompilerError::semantic(format!("type mismatch: expected {:?}, got {:?}", t, inferred)));
+                    return Err(CompilerError::semantic(format!(
+                        "type mismatch: expected {:?}, got {:?}",
+                        t, inferred
+                    )));
                 }
             }
             let resolved = ty.clone().unwrap_or(inferred);
@@ -310,34 +337,32 @@ fn check_stmt(
         Stmt::Expr(e, _) => {
             check_expr(e, scope, return_type)?;
         }
-        Stmt::Return(opt, _) => {
-            match opt {
-                Some(e) => {
-                    let inferred = check_expr(e, scope, return_type)?;
-                    if inferred != *return_type {
-                        return Err(CompilerError::semantic(format!(
-                                "return type mismatch: expected {:?}, got {:?}",
-                                return_type, inferred
-                            )));
-                    }
-                }
-                None => {
-                    if *return_type != crate::ast::Type::Unit {
-                        return Err(CompilerError::semantic(format!(
-                                "expected return value of type {:?}, got none",
-                                return_type
-                            )));
-                    }
+        Stmt::Return(opt, _) => match opt {
+            Some(e) => {
+                let inferred = check_expr(e, scope, return_type)?;
+                if inferred != *return_type {
+                    return Err(CompilerError::semantic(format!(
+                        "return type mismatch: expected {:?}, got {:?}",
+                        return_type, inferred
+                    )));
                 }
             }
-        }
+            None => {
+                if *return_type != crate::ast::Type::Unit {
+                    return Err(CompilerError::semantic(format!(
+                        "expected return value of type {:?}, got none",
+                        return_type
+                    )));
+                }
+            }
+        },
         Stmt::Println(e, _) => {
             let arg_ty = check_expr(e, scope, return_type)?;
             if arg_ty != Type::I64 {
                 return Err(CompilerError::semantic(format!(
-                        "println expects i64 argument, got {:?}",
-                        arg_ty
-                    )));
+                    "println expects i64 argument, got {:?}",
+                    arg_ty
+                )));
             }
         }
     }

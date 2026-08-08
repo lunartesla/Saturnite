@@ -34,8 +34,8 @@ pub use ast::Program;
 //   - [`Linker`]           : links object files into a final executable.
 
 pub use codegen::{
-    check_linker, compile_to_executable, compile_with_target, generate_ir, run_diagnostics,
-    CodeGenerator, ObjectEmitter, Linker,
+    check_linker, compile_to_executable, compile_with_target, compile_with_target_ext, generate_ir,
+    run_diagnostics, CodeGenerator, Linker, ObjectEmitter,
 };
 
 // --- Target configuration re-exports ---
@@ -51,6 +51,5 @@ pub use target::{
 // here so downstream consumers can `use stnx::{LexError, ParseError, ...}`.
 
 pub use error::{
-    CodegenError, CompilerError, CompilerResult, LexError, LinkError, ParseError,
-    SemanticError, TargetError, TargetResult, TypeError,
+    CompilerError, CompilerResult, LexError, LinkError, ParseError, TargetError, TargetResult,
 };

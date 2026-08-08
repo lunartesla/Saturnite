@@ -28,11 +28,23 @@ impl<'cfg> Linker<'cfg> {
         let linker_cmd = self.select_linker(os, env);
         let args = self.build_linker_args(os, env, obj_path, output_path);
 
-        let linker_name = linker_cmd.first()
-            .map(|s| s.as_str())
-            .unwrap_or("cc");
+        let linker_name = linker_cmd.first().map(|s| s.as_str()).unwrap_or("cc");
 
-        let output = Command::new(&linker_cmd[0])
+        // Use `which` to locate the linker on PATH before spawning.
+        // If unavailable, fail with a clear diagnostic.
+        let linker_path = which::which(linker_name).map_err(|_| {
+            LinkError::linker_not_found(format!(
+                "{} (searched PATH for {:?})\n\
+                 Target platform: {} with {} environment.\n\
+                 A C compiler/linker is required to link executables.",
+                linker_name,
+                linker_name,
+                describe_os(os),
+                describe_env(env)
+            ))
+        })?;
+
+        let output = Command::new(&linker_path)
             .args(&linker_cmd[1..])
             .args(&args)
             .output()
@@ -79,7 +91,7 @@ impl<'cfg> Linker<'cfg> {
     fn build_linker_args(
         &self,
         os: &OperatingSystem,
-        _env: &Environment,
+        env: &Environment,
         obj_path: &Path,
         output_path: &Path,
     ) -> Vec<String> {
@@ -90,11 +102,21 @@ impl<'cfg> Linker<'cfg> {
         let runtime = runtime_object_path();
         let runtime_str = runtime.display().to_string();
 
-        match os {
-            OperatingSystem::Linux | OperatingSystem::Darwin => {
+        match (os, env) {
+            (OperatingSystem::Linux, _) | (OperatingSystem::Darwin, _) => {
                 vec![obj_str, "-o".to_string(), output_str, runtime_str]
             }
-            OperatingSystem::Windows => {
+            (OperatingSystem::Windows, Environment::Msvc) => {
+                vec![
+                    obj_str,
+                    format!("/OUT:{}", output_str),
+                    format!("/DEFAULTLIB:{}", runtime_str),
+                ]
+            }
+            (OperatingSystem::Windows, Environment::Gnu) => {
+                vec![obj_str, "-o".to_string(), output_str, runtime_str]
+            }
+            (OperatingSystem::Windows, _) => {
                 vec![obj_str, format!("/OUT:{}", output_str), runtime_str]
             }
             _ => {
@@ -108,50 +130,52 @@ pub fn check_linker_available(target_config: &TargetConfig) -> Result<(), Compil
     let os = target_config.os();
     let env = target_config.environment();
 
-    let linker_cmd = {
-        let linker = Linker::new(target_config);
-        linker.select_linker(os, env)
-    };
+    let linker = Linker::new(target_config);
+    let linker_name = linker.select_linker(os, env)[0].clone();
 
-    let linker_name = &linker_cmd[0];
-
-    // MSVC's `link.exe` does not understand `--version`; it uses `/?` for help.
-    // All other linkers (cc, gcc, clang) accept `--version`.
-    let check_arg = match (os, env) {
-        (OperatingSystem::Windows, Environment::Msvc) => "/?",
-        _ => "--version",
-    };
-
-    let check = Command::new(linker_name).arg(check_arg).output();
-
-    match check {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let msg = format!(
-                "Linker '{}' was found but exited with status {:?}.\n\
-                 Detected platform: {} with {} environment.\n\
-                 stderr: {}",
-                linker_name,
-                output.status.code(),
-                describe_os(os),
-                describe_env(env),
-                if stderr.is_empty() { "(empty)".to_string() } else { stderr },
-            );
-            Err(CompilerError::Link(LinkError::linking_failed(
-                linker_name.clone(),
-                Some(msg),
-            )))
+    // Use `which` to verify the linker binary is discoverable on PATH.
+    match which::which(&linker_name) {
+        Ok(path) => {
+            // MSVC's `link.exe` uses `/?` for help; all others accept `--version`.
+            let check_arg = match (os, env) {
+                (OperatingSystem::Windows, Environment::Msvc) => "/?",
+                _ => "--version",
+            };
+            let check = Command::new(&path).arg(check_arg).output();
+            match check {
+                Ok(output) if output.status.success() => Ok(()),
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    let msg = format!(
+                        "Linker '{}' was found at {} but exited with status {:?}.\n\
+                         Detected platform: {} with {} environment.\n\
+                         stderr: {}",
+                        linker_name,
+                        path.display(),
+                        output.status.code(),
+                        describe_os(os),
+                        describe_env(env),
+                        if stderr.is_empty() {
+                            "(empty)".to_string()
+                        } else {
+                            stderr
+                        },
+                    );
+                    Err(CompilerError::Link(LinkError::linking_failed(
+                        linker_name,
+                        Some(msg),
+                    )))
+                }
+                Err(e) => Err(CompilerError::Link(LinkError::linking_failed(
+                    linker_name,
+                    Some(e.to_string()),
+                ))),
+            }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(CompilerError::Link(LinkError::linker_not_found(linker_name.clone())))
-        }
-        Err(e) => {
-            Err(CompilerError::Link(LinkError::linking_failed(
-                linker_name.clone(),
-                Some(e.to_string()),
-            )))
-        }
+        Err(_) => Err(CompilerError::Link(LinkError::linker_not_found(format!(
+            "{} (searched PATH for {:?})",
+            linker_name, linker_name
+        )))),
     }
 }
 
@@ -173,5 +197,3 @@ fn describe_env(env: &Environment) -> &'static str {
         Environment::Unknown => "Unknown",
     }
 }
-
-

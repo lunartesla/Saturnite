@@ -34,43 +34,28 @@ pub enum Environment {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum OptimizationLevel {
+    #[default]
     None,
     Less,
     Default,
     Aggressive,
 }
 
-impl Default for OptimizationLevel {
-    fn default() -> Self {
-        OptimizationLevel::None
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum DebugInfo {
     Yes,
+    #[default]
     No,
 }
 
-impl Default for DebugInfo {
-    fn default() -> Self {
-        DebugInfo::No
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Copy)]
+#[derive(Clone, Debug, PartialEq, Eq, Copy, Default)]
 pub enum OutputKind {
     Ir,
     Object,
+    #[default]
     Exe,
-}
-
-impl Default for OutputKind {
-    fn default() -> Self {
-        OutputKind::Exe
-    }
 }
 
 #[derive(Debug)]
@@ -91,7 +76,11 @@ impl TargetConfig {
     pub fn host() -> TargetResult<Self> {
         Self::initialize_native_target()?;
         let triple = TargetMachine::get_default_triple();
-        let triple_str = triple.as_str().to_str().map(|s| s.to_string()).unwrap_or_default();
+        let triple_str = triple
+            .as_str()
+            .to_str()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         let parsed = Self::parse_triple(&triple_str);
         Ok(Self {
             triple,
@@ -112,11 +101,12 @@ impl TargetConfig {
         let triple = TargetTriple::create(triple_str);
 
         // Validate that the target actually exists in this LLVM build
-        Target::from_triple(&triple)
-            .map_err(|e| TargetError::target_lookup_failed(
+        Target::from_triple(&triple).map_err(|e| {
+            TargetError::target_lookup_failed(
                 triple_str.to_string(),
-                format!("unknown target triple: {}", e)
-            ))?;
+                format!("unknown target triple: {}", e),
+            )
+        })?;
 
         let parsed = Self::parse_triple(triple_str);
         Ok(Self {
@@ -135,11 +125,10 @@ impl TargetConfig {
 
     pub fn initialize_native_target() -> TargetResult<()> {
         let config = InitializationConfig::default();
-        Target::initialize_native(&config)
-            .map_err(|e| TargetError {
-                message: format!("failed to initialize native LLVM target: {}", e),
-                triple: None,
-            })?;
+        Target::initialize_native(&config).map_err(|e| TargetError {
+            message: format!("failed to initialize native LLVM target: {}", e),
+            triple: None,
+        })?;
         Ok(())
     }
 
@@ -161,13 +150,13 @@ impl TargetConfig {
 
         // OS is found by scanning parts for known OS keywords (handles the
         // optional `unknown` vendor field that may sit between arch and os).
-        let os = if parts.iter().any(|p| *p == "windows" || *p == "winnt") {
+        let os = if parts.contains(&"windows") || parts.contains(&"winnt") {
             OperatingSystem::Windows
-        } else if parts.iter().any(|p| *p == "linux") {
+        } else if parts.contains(&"linux") {
             OperatingSystem::Linux
-        } else if parts.iter().any(|p| *p == "darwin") {
+        } else if parts.contains(&"darwin") {
             OperatingSystem::Darwin
-        } else if parts.iter().any(|p| *p == "freebsd") {
+        } else if parts.contains(&"freebsd") {
             OperatingSystem::FreeBSD
         } else {
             OperatingSystem::Unknown
@@ -260,7 +249,12 @@ impl TargetConfig {
                 RelocMode::Default,
                 CodeModel::Default,
             )
-            .ok_or_else(|| TargetError::target_machine_failed(self.triple_str(), "failed to create target machine".to_string()))
+            .ok_or_else(|| {
+                TargetError::target_machine_failed(
+                    self.triple_str(),
+                    "failed to create target machine".to_string(),
+                )
+            })
     }
 
     pub fn default_file_type(&self) -> FileType {

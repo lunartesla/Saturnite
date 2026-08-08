@@ -3,10 +3,10 @@ use crate::error::{CompilerError, CompilerResult};
 use inkwell::builder::Builder as IRBuilder;
 use inkwell::context::Context as LLVMContext;
 use inkwell::module::Module;
-use inkwell::types::BasicTypeEnum;
 use inkwell::types::BasicType;
-use inkwell::IntPredicate;
+use inkwell::types::BasicTypeEnum;
 use inkwell::values::{BasicMetadataValueEnum, BasicValue, BasicValueEnum, PointerValue};
+use inkwell::IntPredicate;
 use std::collections::HashMap;
 
 /// A variable in a function scope.
@@ -25,18 +25,16 @@ pub struct CodeGenContext<'ctx> {
     pub context: &'ctx LLVMContext,
     pub module: Module<'ctx>,
     pub builder: IRBuilder<'ctx>,
-    src: String,
 }
 
 impl<'ctx> CodeGenContext<'ctx> {
-    pub fn new(context: &'ctx LLVMContext, src: &str) -> Self {
+    pub fn new(context: &'ctx LLVMContext) -> Self {
         let module = context.create_module("saturnite");
         let builder = context.create_builder();
         Self {
             context,
             module,
             builder,
-            src: src.to_string(),
         }
     }
 
@@ -70,13 +68,12 @@ impl<'ctx> CodeGenContext<'ctx> {
         let mut scope = FunctionScope::new();
 
         for (i, (name, _)) in func.params.iter().enumerate() {
-            let param = function_value
-                .get_nth_param(i as u32)
-                .ok_or_else(|| CompilerError::codegen(format!(
-                        "parameter {} not found for function {}",
-                        i, func.name
-                    )))?
-                .into();
+            let param = function_value.get_nth_param(i as u32).ok_or_else(|| {
+                CompilerError::codegen(format!(
+                    "parameter {} not found for function {}",
+                    i, func.name
+                ))
+            })?;
             scope.insert_immutable(name.clone(), param);
         }
 
@@ -116,20 +113,21 @@ impl<'ctx> CodeGenContext<'ctx> {
         Ok(())
     }
 
-    pub fn gen_stmt(
-        &mut self,
-        stmt: &Stmt,
-        scope: &mut FunctionScope<'ctx>,
-    ) -> CompilerResult<()> {
+    pub fn gen_stmt(&mut self, stmt: &Stmt, scope: &mut FunctionScope<'ctx>) -> CompilerResult<()> {
         match stmt {
-            Stmt::Let { name, mutable, value, .. } => {
+            Stmt::Let {
+                name,
+                mutable,
+                value,
+                ..
+            } => {
                 let val = self.gen_expr(value, scope)?;
                 if *mutable {
                     // Allocate stack slot for mutable variable
-                    let alloca = self.builder.build_alloca(
-                        val.get_type(),
-                        name.as_str(),
-                    ).unwrap();
+                    let alloca = self
+                        .builder
+                        .build_alloca(val.get_type(), name.as_str())
+                        .unwrap();
                     self.builder.build_store(alloca, val).unwrap();
                     scope.insert_mutable(name.clone(), val, alloca);
                 } else {
@@ -179,10 +177,7 @@ impl<'ctx> CodeGenContext<'ctx> {
                 .as_basic_value_enum()),
 
             Expr::StrLit(s, _) => {
-                let ptr = self
-                    .builder
-                    .build_global_string_ptr(s, "str")
-                    .unwrap();
+                let ptr = self.builder.build_global_string_ptr(s, "str").unwrap();
                 let int_val = self
                     .builder
                     .build_ptr_to_int(
@@ -200,25 +195,19 @@ impl<'ctx> CodeGenContext<'ctx> {
                 .const_int(*b as u64, false)
                 .as_basic_value_enum()),
 
-            Expr::Unit(_) => Ok(self
-                .context
-                .i64_type()
-                .const_zero()
-                .as_basic_value_enum()),
+            Expr::Unit(_) => Ok(self.context.i64_type().const_zero().as_basic_value_enum()),
 
             Expr::Var(name, _) => {
-                let var = scope
-                    .variables
-                    .get(name)
-                    .ok_or_else(|| CompilerError::codegen(format!("undefined variable: {}", name)))?;
+                let var = scope.variables.get(name).ok_or_else(|| {
+                    CompilerError::codegen(format!("undefined variable: {}", name))
+                })?;
 
                 if let Some(alloca) = var.alloca {
                     // Load the current value from the stack slot
-                    let loaded = self.builder.build_load(
-                        var.ssa_value.get_type(),
-                        alloca,
-                        &format!("load_{}", name),
-                    ).unwrap();
+                    let loaded = self
+                        .builder
+                        .build_load(var.ssa_value.get_type(), alloca, &format!("load_{}", name))
+                        .unwrap();
                     let loaded_val = loaded.as_basic_value_enum();
                     // Update the cached SSA value in the variable
                     // (needed so subsequent reads in the same block get the right value)
@@ -236,29 +225,17 @@ impl<'ctx> CodeGenContext<'ctx> {
                 match op {
                     BinOp::Add => Ok(self
                         .builder
-                        .build_int_add(
-                            lhs_val.into_int_value(),
-                            rhs_val.into_int_value(),
-                            "add",
-                        )
+                        .build_int_add(lhs_val.into_int_value(), rhs_val.into_int_value(), "add")
                         .unwrap()
                         .as_basic_value_enum()),
                     BinOp::Sub => Ok(self
                         .builder
-                        .build_int_sub(
-                            lhs_val.into_int_value(),
-                            rhs_val.into_int_value(),
-                            "sub",
-                        )
+                        .build_int_sub(lhs_val.into_int_value(), rhs_val.into_int_value(), "sub")
                         .unwrap()
                         .as_basic_value_enum()),
                     BinOp::Mul => Ok(self
                         .builder
-                        .build_int_mul(
-                            lhs_val.into_int_value(),
-                            rhs_val.into_int_value(),
-                            "mul",
-                        )
+                        .build_int_mul(lhs_val.into_int_value(), rhs_val.into_int_value(), "mul")
                         .unwrap()
                         .as_basic_value_enum()),
                     BinOp::Div => Ok(self
@@ -341,20 +318,12 @@ impl<'ctx> CodeGenContext<'ctx> {
                         .as_basic_value_enum()),
                     BinOp::And => Ok(self
                         .builder
-                        .build_and(
-                            lhs_val.into_int_value(),
-                            rhs_val.into_int_value(),
-                            "and",
-                        )
+                        .build_and(lhs_val.into_int_value(), rhs_val.into_int_value(), "and")
                         .unwrap()
                         .as_basic_value_enum()),
                     BinOp::Or => Ok(self
                         .builder
-                        .build_or(
-                            lhs_val.into_int_value(),
-                            rhs_val.into_int_value(),
-                            "or",
-                        )
+                        .build_or(lhs_val.into_int_value(), rhs_val.into_int_value(), "or")
                         .unwrap()
                         .as_basic_value_enum()),
                 }
@@ -389,26 +358,32 @@ impl<'ctx> CodeGenContext<'ctx> {
                         var.ssa_value = val;
                     }
                 } else {
-                    return Err(CompilerError::codegen(format!("undefined variable: {}", target)));
+                    return Err(CompilerError::codegen(format!(
+                        "undefined variable: {}",
+                        target
+                    )));
                 }
 
                 Ok(val)
             }
 
-            Expr::AugAssign { target, op, value, .. } => {
-                let var = scope
-                    .variables
-                    .get(target)
-                    .cloned()
-                    .ok_or_else(|| CompilerError::codegen(format!("undefined variable: {}", target)))?;
+            Expr::AugAssign {
+                target, op, value, ..
+            } => {
+                let var = scope.variables.get(target).cloned().ok_or_else(|| {
+                    CompilerError::codegen(format!("undefined variable: {}", target))
+                })?;
 
                 let old_val = if let Some(alloca) = var.alloca {
                     // Load current value from the mutable slot
-                    self.builder.build_load(
-                        var.ssa_value.get_type(),
-                        alloca,
-                        &format!("aug_load_{}", target),
-                    ).unwrap().as_basic_value_enum()
+                    self.builder
+                        .build_load(
+                            var.ssa_value.get_type(),
+                            alloca,
+                            &format!("aug_load_{}", target),
+                        )
+                        .unwrap()
+                        .as_basic_value_enum()
                 } else {
                     var.ssa_value
                 };
@@ -449,31 +424,26 @@ impl<'ctx> CodeGenContext<'ctx> {
             }
 
             Expr::Call { func, args, .. } => {
-                let function = self
-                    .module
-                    .get_function(func)
-                    .ok_or_else(|| CompilerError::codegen(format!("undefined function: {}", func)))?;
+                let function = self.module.get_function(func).ok_or_else(|| {
+                    CompilerError::codegen(format!("undefined function: {}", func))
+                })?;
 
                 let mut arg_vals: Vec<BasicMetadataValueEnum> = Vec::new();
                 for arg in args {
                     arg_vals.push(self.gen_expr(arg, scope)?.into());
                 }
 
-                let call = self.builder.build_call(function, &arg_vals, "call").unwrap();
+                let call = self
+                    .builder
+                    .build_call(function, &arg_vals, "call")
+                    .unwrap();
                 let result = call.try_as_basic_value();
                 if result.is_basic() {
                     Ok(result.basic().unwrap_or_else(|| {
-                        self.context
-                            .i64_type()
-                            .const_zero()
-                            .as_basic_value_enum()
+                        self.context.i64_type().const_zero().as_basic_value_enum()
                     }))
                 } else {
-                    Ok(self
-                        .context
-                        .i64_type()
-                        .const_zero()
-                        .as_basic_value_enum())
+                    Ok(self.context.i64_type().const_zero().as_basic_value_enum())
                 }
             }
 
@@ -493,13 +463,15 @@ impl<'ctx> CodeGenContext<'ctx> {
 
                 // Build the chain of condition blocks
                 // Structure: if_cond -> [then, elif1_cond] -> elif1_body -> [elif2_cond, ...] -> else -> end
-                let mut cond_val = self.gen_expr(condition, scope)?;
-                let cond_bool = self.builder.build_int_cast(
-                    cond_val.into_int_value(),
-                    self.context.bool_type(),
-                    "if_cond",
-                )
-                .unwrap();
+                let cond_val = self.gen_expr(condition, scope)?;
+                let cond_bool = self
+                    .builder
+                    .build_int_cast(
+                        cond_val.into_int_value(),
+                        self.context.bool_type(),
+                        "if_cond",
+                    )
+                    .unwrap();
 
                 let then_bb = self.context.append_basic_block(current_func, "if_then");
                 let end_bb = self.context.append_basic_block(current_func, "if_end");
@@ -533,10 +505,12 @@ impl<'ctx> CodeGenContext<'ctx> {
                     let mut elif_body_bbs: Vec<_> = Vec::with_capacity(elif_branches.len());
                     for (i, _) in elif_branches.iter().enumerate() {
                         elif_cond_bbs.push(
-                            self.context.append_basic_block(current_func, &format!("elif{}_cond", i)),
+                            self.context
+                                .append_basic_block(current_func, &format!("elif{}_cond", i)),
                         );
                         elif_body_bbs.push(
-                            self.context.append_basic_block(current_func, &format!("elif{}_body", i)),
+                            self.context
+                                .append_basic_block(current_func, &format!("elif{}_body", i)),
                         );
                     }
                     let else_bb = self.context.append_basic_block(current_func, "if_else");
@@ -559,12 +533,14 @@ impl<'ctx> CodeGenContext<'ctx> {
 
                         self.builder.position_at_end(elif_cond_bb);
                         let elif_val = self.gen_expr(cond_expr, scope)?;
-                        let elif_bool = self.builder.build_int_cast(
-                            elif_val.into_int_value(),
-                            self.context.bool_type(),
-                            &format!("elif{}_cond", elif_idx),
-                        )
-                        .unwrap();
+                        let elif_bool = self
+                            .builder
+                            .build_int_cast(
+                                elif_val.into_int_value(),
+                                self.context.bool_type(),
+                                &format!("elif{}_cond", elif_idx),
+                            )
+                            .unwrap();
 
                         let next_bb = if elif_idx + 1 < elif_cond_bbs.len() {
                             elif_cond_bbs[elif_idx + 1]
@@ -594,14 +570,12 @@ impl<'ctx> CodeGenContext<'ctx> {
                 }
 
                 self.builder.position_at_end(end_bb);
-                Ok(self
-                    .context
-                    .i64_type()
-                    .const_zero()
-                    .as_basic_value_enum())
+                Ok(self.context.i64_type().const_zero().as_basic_value_enum())
             }
 
-            Expr::For { var, iter, body, .. } => {
+            Expr::For {
+                var, iter, body, ..
+            } => {
                 let iter_expr = self.gen_expr(iter, scope)?;
 
                 let current_func = self
@@ -618,23 +592,27 @@ impl<'ctx> CodeGenContext<'ctx> {
                 // For loop iterates over a Range expression
                 // We use a local variable for the loop counter, allocated on the stack
                 let i64_type = self.context.i64_type();
-                let loop_var_ptr = self.builder.build_alloca(
-                    i64_type,
-                    var.as_str(),
-                ).unwrap();
+                let loop_var_ptr = self.builder.build_alloca(i64_type, var.as_str()).unwrap();
 
                 // Initialize loop counter to 0; will be updated per iteration
                 // For ranges, we evaluate start and end from the Range expression
                 // iter_expr is the start value (from Range codegen),
                 // but we need both start and end. We re-evaluate the Range expr.
-                let (start_val, end_val) = match iter.as_ref() {
-                    crate::ast::Expr::Range { start, end, is_inclusive, .. } => {
+                let (start_val, end_val, is_inclusive) = match iter.as_ref() {
+                    crate::ast::Expr::Range {
+                        start,
+                        end,
+                        is_inclusive,
+                        ..
+                    } => {
                         let s = self.gen_expr(start, scope)?;
                         let e = self.gen_expr(end, scope)?;
-                        (s.into_int_value(), e.into_int_value())
+                        (s.into_int_value(), e.into_int_value(), *is_inclusive)
                     }
                     _ => {
-                        return Err(CompilerError::codegen("for loop requires a range expression"));
+                        return Err(CompilerError::codegen(
+                            "for loop requires a range expression",
+                        ));
                     }
                 };
 
@@ -648,61 +626,60 @@ impl<'ctx> CodeGenContext<'ctx> {
 
                 // Condition block
                 self.builder.position_at_end(cond_bb);
-                let current_val = self.builder.build_load(
-                    i64_type,
-                    loop_var_ptr,
-                    "for_load",
-                ).unwrap().into_int_value();
+                let current_val = self
+                    .builder
+                    .build_load(i64_type, loop_var_ptr, "for_load")
+                    .unwrap()
+                    .into_int_value();
 
-                // Compare current < end (or <= for inclusive)
-                let cmp = self.builder.build_int_compare(
-                    inkwell::IntPredicate::SLT,
-                    current_val,
-                    end_val,
-                    "for_cond",
-                ).unwrap();
+                // Compare current < end (SLT) for exclusive ranges,
+                // or current <= end (SLE) for inclusive ranges (`...`).
+                let predicate = if is_inclusive {
+                    IntPredicate::SLE
+                } else {
+                    IntPredicate::SLT
+                };
+                let cmp = self
+                    .builder
+                    .build_int_compare(predicate, current_val, end_val, "for_cond")
+                    .unwrap();
 
-                self.builder.build_conditional_branch(cmp, body_bb, end_bb).unwrap();
+                self.builder
+                    .build_conditional_branch(cmp, body_bb, end_bb)
+                    .unwrap();
 
                 // Body block
                 self.builder.position_at_end(body_bb);
                 // Load current value and store in scope for variable access
                 // Store as a mutable variable so mutations inside the body persist
-                let current_for_scope = self.builder.build_load(
-                    i64_type,
-                    loop_var_ptr,
-                    "for_var",
-                ).unwrap().as_basic_value_enum();
-                scope.insert_mutable(
-                    var.clone(),
-                    current_for_scope,
-                    loop_var_ptr,
-                );
+                let current_for_scope = self
+                    .builder
+                    .build_load(i64_type, loop_var_ptr, "for_var")
+                    .unwrap()
+                    .as_basic_value_enum();
+                scope.insert_mutable(var.clone(), current_for_scope, loop_var_ptr);
 
                 for s in body {
                     self.gen_stmt(s, scope)?;
                 }
 
                 // Increment loop variable
-                let next_val = self.builder.build_int_add(
-                    current_val,
-                    i64_type.const_int(1, false),
-                    "for_next",
-                ).unwrap();
+                let next_val = self
+                    .builder
+                    .build_int_add(current_val, i64_type.const_int(1, false), "for_next")
+                    .unwrap();
                 self.builder.build_store(loop_var_ptr, next_val).unwrap();
 
                 self.builder.build_unconditional_branch(cond_bb).unwrap();
 
                 self.builder.position_at_end(end_bb);
 
-                Ok(self
-                    .context
-                    .i64_type()
-                    .const_zero()
-                    .as_basic_value_enum())
+                Ok(self.context.i64_type().const_zero().as_basic_value_enum())
             }
 
-            Expr::While { condition, body, .. } => {
+            Expr::While {
+                condition, body, ..
+            } => {
                 let current_func = self
                     .builder
                     .get_insert_block()
@@ -718,12 +695,14 @@ impl<'ctx> CodeGenContext<'ctx> {
                 self.builder.position_at_end(cond_bb);
 
                 let cond_val = self.gen_expr(condition, scope)?;
-                let cond_bool = self.builder.build_int_cast(
-                    cond_val.into_int_value(),
-                    self.context.bool_type(),
-                    "while_cond",
-                )
-                .unwrap();
+                let cond_bool = self
+                    .builder
+                    .build_int_cast(
+                        cond_val.into_int_value(),
+                        self.context.bool_type(),
+                        "while_cond",
+                    )
+                    .unwrap();
 
                 self.builder
                     .build_conditional_branch(cond_bool, body_bb, end_bb)
@@ -736,11 +715,7 @@ impl<'ctx> CodeGenContext<'ctx> {
                 self.builder.build_unconditional_branch(cond_bb).unwrap();
 
                 self.builder.position_at_end(end_bb);
-                Ok(self
-                    .context
-                    .i64_type()
-                    .const_zero()
-                    .as_basic_value_enum())
+                Ok(self.context.i64_type().const_zero().as_basic_value_enum())
             }
 
             Expr::Range {
@@ -757,7 +732,6 @@ impl<'ctx> CodeGenContext<'ctx> {
             }
         }
     }
-
 }
 
 pub struct FunctionScope<'ctx> {
@@ -773,18 +747,29 @@ impl<'ctx> FunctionScope<'ctx> {
 
     /// Insert an immutable variable (no alloca slot).
     pub fn insert_immutable(&mut self, name: String, value: BasicValueEnum<'ctx>) {
-        self.variables.insert(name, Variable {
-            ssa_value: value,
-            alloca: None,
-        });
+        self.variables.insert(
+            name,
+            Variable {
+                ssa_value: value,
+                alloca: None,
+            },
+        );
     }
 
     /// Insert a mutable variable with an alloca slot.
-    pub fn insert_mutable(&mut self, name: String, value: BasicValueEnum<'ctx>, alloca: PointerValue<'ctx>) {
-        self.variables.insert(name, Variable {
-            ssa_value: value,
-            alloca: Some(alloca),
-        });
+    pub fn insert_mutable(
+        &mut self,
+        name: String,
+        value: BasicValueEnum<'ctx>,
+        alloca: PointerValue<'ctx>,
+    ) {
+        self.variables.insert(
+            name,
+            Variable {
+                ssa_value: value,
+                alloca: Some(alloca),
+            },
+        );
     }
 
     /// Get a variable's current value. If it has an alloca, loads from memory first.

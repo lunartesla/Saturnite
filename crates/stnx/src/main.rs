@@ -2,6 +2,8 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use stnx::codegen;
 use stnx::target::{DebugInfo, OptimizationLevel, OutputKind, TargetConfig};
+// `CompilerError` carries the variants that `render_diagnostic` pattern-matches on.
+use stnx::CompilerError;
 
 /// Saturnite programming language compiler
 #[derive(Parser)]
@@ -14,16 +16,11 @@ struct Cli {
 }
 
 /// Build profile: debug or release
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum Profile {
+    #[default]
     Debug,
     Release,
-}
-
-impl Default for Profile {
-    fn default() -> Self {
-        Profile::Debug
-    }
 }
 
 impl Profile {
@@ -90,6 +87,14 @@ enum Commands {
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
+
+        /// Emit object file only; skip the linking step
+        #[arg(long)]
+        no_link: bool,
+
+        /// Keep intermediate object files (do not delete after linking)
+        #[arg(long)]
+        save_temps: bool,
     },
 
     /// Check a source file for type and semantic errors without generating code
@@ -116,6 +121,10 @@ enum Commands {
         /// Release build
         #[arg(long, conflicts_with = "debug")]
         release: bool,
+
+        /// Cross-compilation target triple (affects codegen)
+        #[arg(long, value_name = "TRIPLE")]
+        target: Option<String>,
     },
 
     /// Print diagnostics about the compiler environment
@@ -139,6 +148,8 @@ fn main() -> anyhow::Result<()> {
             opt_level,
             json,
             verbose,
+            no_link,
+            save_temps,
         } => {
             // --print-target short-circuits before we need a file.
             if print_target {
@@ -159,16 +170,22 @@ fn main() -> anyhow::Result<()> {
 
             // Exactly one input file is required unless --print-target was set.
             let input = input.ok_or_else(|| {
-                anyhow::anyhow!("an input file is required. Usage: saturnite build <FILE> [OPTIONS]")
+                anyhow::anyhow!(
+                    "an input file is required. Usage: saturnite build <FILE> [OPTIONS]"
+                )
             })?;
 
             // Validate that at most one emit mode is selected.
-            let emit_count = emit_ir.is_some() as u8
-                + emit_object.is_some() as u8
-                + emit_exe.is_some() as u8;
+            let emit_count =
+                emit_ir.is_some() as u8 + emit_object.is_some() as u8 + emit_exe.is_some() as u8;
             if emit_count > 1 {
                 return Err(anyhow::anyhow!(
                     "at most one of --emit-ir, --emit-object, --emit-exe may be specified"
+                ));
+            }
+            if no_link && (emit_ir.is_some() || emit_exe.is_some()) {
+                return Err(anyhow::anyhow!(
+                    "--no-link can only be used with --emit-object or default (exe) output"
                 ));
             }
 
@@ -190,7 +207,11 @@ fn main() -> anyhow::Result<()> {
                 Some(1) => config.set_opt_level(OptimizationLevel::Less),
                 Some(2) => config.set_opt_level(OptimizationLevel::Default),
                 Some(3) => config.set_opt_level(OptimizationLevel::Aggressive),
-                Some(_) => return Err(anyhow::anyhow!("optimization level must be between 0 and 3")),
+                Some(_) => {
+                    return Err(anyhow::anyhow!(
+                        "optimization level must be between 0 and 3"
+                    ))
+                }
                 None => {
                     if profile.is_release() {
                         config.set_opt_level(OptimizationLevel::Aggressive);
@@ -203,7 +224,16 @@ fn main() -> anyhow::Result<()> {
             }
 
             // Determine output path and emit mode
-            let (emit_path, output_kind) = resolve_output(&input, &output, &profile, emit_ir, emit_object, emit_exe, &target);
+            let (emit_path, output_kind) = resolve_output(
+                &input,
+                &output,
+                &profile,
+                emit_ir,
+                emit_object,
+                emit_exe,
+                no_link,
+                &target,
+            );
 
             if verbose {
                 eprintln!("target: {}", config.triple_str());
@@ -219,12 +249,44 @@ fn main() -> anyhow::Result<()> {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| anyhow::anyhow!("Lex error: {}", e))?;
 
-            let program = stnx::parser::parse(&src, tokens)
-                .map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
-            stnx::semantic::analyze(&program)
-                .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
+            let program = stnx::parser::parse(&src, tokens).map_err(render_diagnostic)?;
+            stnx::semantic::analyze(&program).map_err(render_diagnostic)?;
 
-            config.set_output_kind(output_kind.clone());
+            config.set_output_kind(output_kind);
+
+            // Cross-compilation guard: the Saturnite runtime is compiled via
+            // build.rs from C source targeting the *host* platform only. If the
+            // user requests a target that differs from the host, the resulting
+            // binary would be linked against an incompatible runtime object, so
+            // we fail clearly instead of producing a broken executable.
+            if let Some(ref requested) = target {
+                let host_triple = codegen::host_triple()
+                    .map_err(|e| anyhow::anyhow!("Failed to determine host triple: {}", e))?;
+                if requested != &host_triple {
+                    return Err(anyhow::anyhow!(
+                        "Cross-compilation to '{}' is not yet supported in Saturnite 0.2.\n\
+                         The runtime is compiled for the host target only.\n\
+                         Requested target: {}\n\
+                         Host target:      {}",
+                        requested,
+                        requested,
+                        host_triple
+                    ));
+                }
+            }
+
+            // Ensure the parent directory of the output path exists.
+            if let Some(parent) = emit_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to create output directory '{}': {}",
+                            parent.display(),
+                            e
+                        )
+                    })?;
+                }
+            }
 
             let start = std::time::Instant::now();
 
@@ -232,18 +294,25 @@ fn main() -> anyhow::Result<()> {
                 OutputKind::Ir => {
                     let ir = codegen::generate_ir(&program)
                         .map_err(|e| anyhow::anyhow!("IR generation failed: {}", e))?;
-                    std::fs::write(&emit_path, ir)
-                        .map_err(|e| anyhow::anyhow!("Failed to write IR to {}: {}", emit_path.display(), e))?;
+                    std::fs::write(&emit_path, ir).map_err(|e| {
+                        anyhow::anyhow!("Failed to write IR to {}: {}", emit_path.display(), e)
+                    })?;
                 }
                 _ => {
-                    codegen::compile_with_target(&program, emit_path.to_str().unwrap(), config)
-                        .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
+                    codegen::compile_with_target_ext(
+                        &program,
+                        emit_path.to_str().unwrap(),
+                        config,
+                        save_temps,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
                 }
             }
 
             let elapsed = start.elapsed();
 
             if json {
+                let size_bytes = std::fs::metadata(&emit_path).ok().map(|m| m.len());
                 let artifact = ArtifactInfo {
                     output_path: emit_path.to_string_lossy().to_string(),
                     kind: match output_kind {
@@ -252,15 +321,15 @@ fn main() -> anyhow::Result<()> {
                         OutputKind::Exe => "executable",
                     },
                     target: {
-                        let t = codegen::host_triple().unwrap_or_default();
                         if let Some(ref triple) = target {
                             triple.clone()
                         } else {
-                            t
+                            codegen::host_triple().unwrap_or_default()
                         }
                     },
                     profile: profile.as_str().to_string(),
                     elapsed_ms: elapsed.as_millis() as u64,
+                    size_bytes,
                 };
                 let report = BuildReport {
                     success: true,
@@ -284,7 +353,12 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
 
-        Commands::Run { input, debug, release } => {
+        Commands::Run {
+            input,
+            debug,
+            release,
+            target,
+        } => {
             let profile = if release {
                 Profile::Release
             } else if debug {
@@ -293,14 +367,12 @@ fn main() -> anyhow::Result<()> {
                 Profile::default()
             };
 
-            let tmp_output = std::env::temp_dir()
-                .join(format!("saturnite_run_{}_{}", std::process::id(), profile.as_str()));
-            let _ = build_run_file(
-                &input,
-                &tmp_output,
-                None,
-                profile,
-            )?;
+            let tmp_output = std::env::temp_dir().join(format!(
+                "saturnite_run_{}_{}",
+                std::process::id(),
+                profile.as_str()
+            ));
+            let _ = build_run_file(&input, &tmp_output, target.as_deref(), profile)?;
             let status = std::process::Command::new(&tmp_output)
                 .status()
                 .map_err(|e| anyhow::anyhow!("failed to execute: {}", e))?;
@@ -319,13 +391,15 @@ fn main() -> anyhow::Result<()> {
 // Output path resolution
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_output(
-    input: &PathBuf,
+    input: &std::path::Path,
     output: &Option<PathBuf>,
     profile: &Profile,
     emit_ir: Option<PathBuf>,
     emit_object: Option<PathBuf>,
     emit_exe: Option<PathBuf>,
+    no_link: bool,
     _target: &Option<String>,
 ) -> (PathBuf, OutputKind) {
     let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
@@ -337,7 +411,16 @@ fn resolve_output(
     } else if let Some(path) = emit_exe {
         (path, OutputKind::Exe)
     } else if let Some(path) = output {
-        (path.clone(), OutputKind::Exe)
+        // --no-link with -o: emit an object file to the specified path.
+        if no_link {
+            (path.clone(), OutputKind::Object)
+        } else {
+            (path.clone(), OutputKind::Exe)
+        }
+    } else if no_link {
+        // --no-link: emit object file to target/<profile>/<name>.o
+        let target_dir = PathBuf::from("target").join(profile.as_str());
+        (target_dir.join(format!("{}.o", stem)), OutputKind::Object)
     } else {
         // Default: target/<profile>/<name>
         let target_dir = PathBuf::from("target").join(profile.as_str());
@@ -350,7 +433,7 @@ fn resolve_output(
 // ---------------------------------------------------------------------------
 
 fn build_run_file(
-    input: &PathBuf,
+    input: &std::path::Path,
     output: &std::path::Path,
     target_triple: Option<&str>,
     profile: Profile,
@@ -364,10 +447,9 @@ fn build_run_file(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("Lex error: {}", e))?;
 
-    let program = stnx::parser::parse(&src, tokens)
-        .map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
-    stnx::semantic::analyze(&program)
-        .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
+    let program =
+        stnx::parser::parse(&src, tokens).map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
+    stnx::semantic::analyze(&program).map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
 
     let mut config = if let Some(triple) = target_triple {
         TargetConfig::from_triple(triple)
@@ -385,6 +467,23 @@ fn build_run_file(
         config.set_debug_info(DebugInfo::Yes);
     }
 
+    // Cross-compilation guard: the runtime is host-only (see Build command).
+    if let Some(requested) = target_triple {
+        let host_triple = codegen::host_triple()
+            .map_err(|e| anyhow::anyhow!("Failed to determine host triple: {}", e))?;
+        if requested != host_triple {
+            return Err(anyhow::anyhow!(
+                "Cross-compilation to '{}' is not yet supported in Saturnite 0.2.\n\
+                 The runtime is compiled for the host target only.\n\
+                 Requested target: {}\n\
+                 Host target:      {}",
+                requested,
+                requested,
+                host_triple
+            ));
+        }
+    }
+
     config.set_output_kind(OutputKind::Exe);
 
     codegen::compile_with_target(&program, output.to_str().unwrap(), config)
@@ -393,7 +492,7 @@ fn build_run_file(
     Ok(output.to_path_buf())
 }
 
-fn check_file(input: &PathBuf, _target_triple: Option<&str>) -> anyhow::Result<()> {
+fn check_file(input: &std::path::Path, _target_triple: Option<&str>) -> anyhow::Result<()> {
     let src = std::fs::read_to_string(input)
         .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", input.display(), e))?;
 
@@ -403,27 +502,23 @@ fn check_file(input: &PathBuf, _target_triple: Option<&str>) -> anyhow::Result<(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("Lex error: {}", e))?;
 
-    let program = stnx::parser::parse(&src, tokens)
-        .map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
-    stnx::semantic::analyze(&program)
-        .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
+    let program =
+        stnx::parser::parse(&src, tokens).map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
+    stnx::semantic::analyze(&program).map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
 
     Ok(())
 }
 
 fn run_doctor() -> anyhow::Result<()> {
-    codegen::run_diagnostics()
-        .map_err(|e| anyhow::anyhow!("diagnostics failed: {}", e))?;
+    codegen::run_diagnostics().map_err(|e| anyhow::anyhow!("diagnostics failed: {}", e))?;
     println!();
 
     // Show linker availability
     match TargetConfig::host() {
-        Ok(config) => {
-            match codegen::check_linker(&config) {
-                Ok(()) => println!("Linker: available"),
-                Err(e) => println!("WARNING: Linker not available: {}", e),
-            }
-        }
+        Ok(config) => match codegen::check_linker(&config) {
+            Ok(()) => println!("Linker: available"),
+            Err(e) => println!("WARNING: Linker not available: {}", e),
+        },
         Err(e) => {
             println!("WARNING: Could not check linker: {}", e);
         }
@@ -454,6 +549,7 @@ struct ArtifactInfo {
     target: String,
     profile: String,
     elapsed_ms: u64,
+    size_bytes: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -461,4 +557,27 @@ struct BuildReport {
     success: bool,
     artifacts: Vec<ArtifactInfo>,
     errors: Vec<String>,
+}
+
+/// Render a compiler error through miette if it carries source-span information,
+/// falling back to plain Display otherwise.
+fn render_diagnostic(e: CompilerError) -> anyhow::Error {
+    use miette::GraphicalReportHandler;
+
+    // Render through miette for variants whose inner type implements `Diagnostic`
+    // (carries source code + span). Other variants fall back to plain Display.
+    let report: String = match &e {
+        CompilerError::Lexer(lex_err) => {
+            let mut buf = String::new();
+            let _ = GraphicalReportHandler::new().render_report(&mut buf, lex_err);
+            buf
+        }
+        CompilerError::Parse(parse_err) => {
+            let mut buf = String::new();
+            let _ = GraphicalReportHandler::new().render_report(&mut buf, parse_err);
+            buf
+        }
+        _ => e.to_string(),
+    };
+    anyhow::anyhow!("{}", report)
 }

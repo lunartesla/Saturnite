@@ -1,14 +1,15 @@
-use stnx::lexer::Lexer;
-use stnx::parser;
-use stnx::semantic::analyze;
-use stnx::codegen::generate_ir;
+//! Tests IR-only generation (no linking, no file output).
+
+mod common;
+
+use common::ir_only;
 
 #[test]
 fn test_ir_generation_only() {
-    let src = "fn main() -> i64 { return 42 }";
-    let tokens: Vec<_> = Lexer::new(src).collect::<Result<Vec<_>, _>>().unwrap();
-    let program = parser::parse(src, tokens).unwrap();
-    analyze(&program).unwrap();
-    let ir = generate_ir(&program).expect("IR generation should succeed");
+    let ir = ir_only("fn main() -> i64 { return 42 }");
+    assert!(
+        ir.contains("define i64 @main"),
+        "IR should contain main function definition"
+    );
     println!("IR: {}", ir);
 }

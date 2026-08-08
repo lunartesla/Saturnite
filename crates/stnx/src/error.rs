@@ -34,24 +34,6 @@ pub struct ParseError {
 }
 
 #[derive(Error, Debug)]
-#[error("{message}")]
-pub struct SemanticError {
-    pub message: String,
-}
-
-#[derive(Error, Debug)]
-#[error("{message}")]
-pub struct TypeError {
-    pub message: String,
-}
-
-#[derive(Error, Debug)]
-#[error("{message}")]
-pub struct CodegenError {
-    pub message: String,
-}
-
-#[derive(Error, Debug)]
 pub struct TargetError {
     pub message: String,
     pub triple: Option<String>,
@@ -120,8 +102,8 @@ impl LinkError {
 pub enum CompilerError {
     #[error("lexer error")]
     Lexer(#[from] LexError),
-    #[error("parse error")]
-    Parse(String),
+    #[error("{0}")]
+    Parse(#[from] ParseError),
     #[error("semantic error: {0}")]
     Semantic(String),
     #[error("type error: {0}")]

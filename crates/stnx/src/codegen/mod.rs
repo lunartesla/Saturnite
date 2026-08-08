@@ -50,7 +50,7 @@ impl CodeGenerator {
 
     pub fn generate_ir_string(program: &Program) -> CompilerResult<String> {
         let context = LLVMContext::create();
-        let mut ctx = CodeGenContext::new(&context, "");
+        let mut ctx = CodeGenContext::new(&context);
         ctx.declare_builtin_functions();
 
         for func in &program.functions {
@@ -66,7 +66,7 @@ impl CodeGenerator {
     }
 
     pub fn compile(&self, program: &Program, output_path: &str) -> CompilerResult<()> {
-        self.emit(program, output_path, OutputKind::Exe)
+        self.emit(program, output_path, OutputKind::Exe, false)
     }
 
     pub fn emit(
@@ -74,9 +74,10 @@ impl CodeGenerator {
         program: &Program,
         output_path: &str,
         output_kind: OutputKind,
+        save_temps: bool,
     ) -> CompilerResult<()> {
         let context = LLVMContext::create();
-        let mut ctx = CodeGenContext::new(&context, "");
+        let mut ctx = CodeGenContext::new(&context);
 
         ctx.declare_builtin_functions();
 
@@ -94,6 +95,20 @@ impl CodeGenerator {
 
         let output_path = Path::new(output_path);
 
+        // Ensure the output directory exists so emitting to a nested path like
+        // `target/debug/example.o` succeeds even on a clean tree.
+        if let Some(parent) = output_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    CompilerError::codegen(format!(
+                        "failed to create output directory '{}': {}",
+                        parent.display(),
+                        e
+                    ))
+                })?;
+            }
+        }
+
         // Run optimization passes if configured (requires a target machine)
         if *self.target_config.opt_level() != OptimizationLevel::None {
             let target_machine = self
@@ -109,7 +124,9 @@ impl CodeGenerator {
             let options = PassBuilderOptions::create();
             ctx.module
                 .run_passes(opt_passes, &target_machine, options)
-                .map_err(|e| CompilerError::codegen(format!("optimization passes failed: {}", e)))?;
+                .map_err(|e| {
+                    CompilerError::codegen(format!("optimization passes failed: {}", e))
+                })?;
         }
 
         match output_kind {
@@ -127,9 +144,12 @@ impl CodeGenerator {
                 emitter.emit_object(&obj_path)?;
 
                 let lk = Linker::new(&self.target_config);
-                lk.link(&obj_path, output_path).map_err(CompilerError::Link)?;
+                lk.link(&obj_path, output_path)
+                    .map_err(CompilerError::Link)?;
 
-                let _ = std::fs::remove_file(&obj_path);
+                if !save_temps {
+                    let _ = std::fs::remove_file(&obj_path);
+                }
             }
         }
 
@@ -156,9 +176,18 @@ pub fn compile_with_target(
     output_path: &str,
     target_config: TargetConfig,
 ) -> CompilerResult<()> {
+    compile_with_target_ext(program, output_path, target_config, false)
+}
+
+pub fn compile_with_target_ext(
+    program: &Program,
+    output_path: &str,
+    target_config: TargetConfig,
+    save_temps: bool,
+) -> CompilerResult<()> {
     let gen = CodeGenerator::new(target_config);
-    let mode = gen.target_config().output_kind().clone();
-    gen.emit(program, output_path, mode)
+    let mode = *gen.target_config().output_kind();
+    gen.emit(program, output_path, mode, save_temps)
 }
 
 pub fn check_linker(target_config: &TargetConfig) -> CompilerResult<()> {
@@ -205,16 +234,14 @@ pub fn run_diagnostics() -> CompilerResult<()> {
     }
 
     match TargetConfig::host() {
-        Ok(config) => {
-            match check_linker(&config) {
-                Ok(()) => {
-                    println!("Linker: available");
-                }
-                Err(e) => {
-                    println!("WARNING: Linker not available: {}", e);
-                }
+        Ok(config) => match check_linker(&config) {
+            Ok(()) => {
+                println!("Linker: available");
             }
-        }
+            Err(e) => {
+                println!("WARNING: Linker not available: {}", e);
+            }
+        },
         Err(e) => {
             println!("WARNING: Could not check linker: {}", e);
         }

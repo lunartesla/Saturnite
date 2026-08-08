@@ -114,3 +114,28 @@ fn test_function_arg_type_mismatch() {
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("arg type mismatch"));
 }
+
+#[test]
+fn test_assign_to_immutable_variable_rejected() {
+    // Bug #1 (Phase 1): assignment to an immutable variable must be a semantic error.
+    let src = "fn main() -> i64 { let x = 1 x = 2 return x }";
+    let result = analyze_src(src);
+    assert!(
+        result.is_err(),
+        "mutating an immutable variable should fail"
+    );
+    assert!(
+        result.unwrap_err().contains("immutable"),
+        "error should mention immutability"
+    );
+}
+
+#[test]
+fn test_assign_to_mutable_variable_allowed() {
+    // The counterpart: `let mut x` allows reassignment.
+    let src = "fn main() -> i64 { let mut x = 1 x = 2 return x }";
+    assert!(
+        analyze_src(src).is_ok(),
+        "mutating a mutable variable should succeed"
+    );
+}
