@@ -1,0 +1,20 @@
+[package]
+name = "stnx"
+edition = "2021"
+version = "0.1.0"
+build = "build.rs"
+
+[dependencies]
+logos = "0.16"
+chumsky = { version = "0.13", features = ["memoization"] }
+inkwell = { version = "0.9", features = ["llvm21-1-prefer-dynamic"] }
+miette = { version = "7", features = ["fancy"] }
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+anyhow = "1"
+
+[build-dependencies]
+cc = "1"
