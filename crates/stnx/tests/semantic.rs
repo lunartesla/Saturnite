@@ -1,13 +1,14 @@
 use stnx::lexer::Lexer;
 use stnx::parser;
-use stnx::semantic::analyze;
+use stnx::semantic::analyze_and_lower;
 
 fn analyze_src(src: &str) -> Result<(), String> {
     let tokens: Vec<_> = Lexer::new(src)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("Lex error: {}", e))?;
     let program = parser::parse(src, tokens).map_err(|e| format!("Parse error: {}", e))?;
-    analyze(&program).map_err(|e| format!("Semantic error: {}", e))
+    analyze_and_lower(&program).map_err(|e| format!("Semantic error: {}", e))?;
+    Ok(())
 }
 
 #[test]
@@ -138,4 +139,95 @@ fn test_assign_to_mutable_variable_allowed() {
         analyze_src(src).is_ok(),
         "mutating a mutable variable should succeed"
     );
+}
+
+#[test]
+fn test_struct_construction_type_check() {
+    let src =
+        "fn main() -> i64 { struct Point { x: i64, y: i64 } let p = Point { x: 10, y: 20 } 0 }";
+    assert!(
+        analyze_src(src).is_ok(),
+        "struct construction with correct types should pass"
+    );
+}
+
+#[test]
+fn test_struct_field_type_mismatch() {
+    let src =
+        "fn main() -> i64 { struct Point { x: i64, y: i64 } let p = Point { x: true, y: 20 } 0 }";
+    let result = analyze_src(src);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("expects"));
+}
+
+#[test]
+fn test_undefined_struct_literal() {
+    let src = "fn main() -> i64 { let p = Point { x: 10, y: 20 } 0 }";
+    let result = analyze_src(src);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("undefined struct"));
+}
+
+#[test]
+fn test_undefined_struct_field() {
+    let src =
+        "fn main() -> i64 { struct Point { x: i64, y: i64 } let p = Point { x: 10, z: 20 } 0 }";
+    let result = analyze_src(src);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("no field"));
+}
+
+#[test]
+fn test_field_access_on_non_struct() {
+    let src = "fn main() -> i64 { let x = 42 x.foo }";
+    let result = analyze_src(src);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("non-struct"));
+}
+
+#[test]
+fn test_undefined_field_access() {
+    let src =
+        "fn main() -> i64 { struct Point { x: i64, y: i64 } let p = Point { x: 10, y: 20 } p.z }";
+    let result = analyze_src(src);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("no field"));
+}
+
+#[test]
+fn test_enum_construction_type_check() {
+    let src = "fn main() -> i64 { enum Color { Red, Green, Blue } let c = Color::Red 0 }";
+    assert!(analyze_src(src).is_ok(), "enum construction should pass");
+}
+
+#[test]
+fn test_undefined_enum_constructor() {
+    let src = "fn main() -> i64 { let c = Color::Red 0 }";
+    let result = analyze_src(src);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("undefined enum"));
+}
+
+#[test]
+fn test_undefined_enum_variant() {
+    let src = "fn main() -> i64 { enum Color { Red, Green, Blue } let c = Color::Purple 0 }";
+    let result = analyze_src(src);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("no variant"));
+}
+
+#[test]
+fn test_struct_with_enum_field_type() {
+    let src = "fn main() -> i64 { enum Status { Active, Inactive } struct Item { s: Status, n: i64 } let i = Item { s: Status::Active, n: 5 } i.n }";
+    assert!(
+        analyze_src(src).is_ok(),
+        "struct with enum-typed field should pass"
+    );
+}
+
+#[test]
+fn test_struct_field_type_mismatch_with_enum() {
+    let src = "fn main() -> i64 { enum Status { Active, Inactive } struct Item { s: Status, n: i64 } let i = Item { s: 5, n: 5 } 0 }";
+    let result = analyze_src(src);
+    assert!(result.is_err());
 }

@@ -215,6 +215,154 @@ fn test_println_multiple() {
 // Object file emission
 
 #[test]
+fn test_struct_construction_and_field_access() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         struct Point { x: i64, y: i64 } \
+         let p = Point { x: 10, y: 20 } \
+         p.x }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 10);
+}
+
+#[test]
+fn test_struct_field_access_y() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         struct Point { x: i64, y: i64 } \
+         let p = Point { x: 10, y: 20 } \
+         p.y }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 20);
+}
+
+#[test]
+fn test_struct_println_field_access() {
+    let bin = compile_src(
+        "fn main() -> unit { \
+         struct Point { x: i64, y: i64 } \
+         let p = Point { x: 10, y: 20 } \
+         println(p.x) \
+         println(p.y) }",
+    );
+    let (_code, stdout) = bin.run();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], "10");
+    assert_eq!(lines[1], "20");
+}
+
+#[test]
+fn test_struct_with_function() {
+    let bin = compile_src(
+        "fn make_point() -> i64 { \
+         struct Point { x: i64, y: i64 } \
+         let p = Point { x: 42, y: 99 } \
+         p.x } \
+         fn main() -> i64 { make_point() }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 42);
+}
+
+#[test]
+fn test_enum_constructor_runtime() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         enum Color { Red, Green, Blue } \
+         let c = Color::Red \
+         let d = Color::Blue \
+         c + d }",
+    );
+    let (code, _) = bin.run();
+    // Red = 0, Blue = 2, so 0 + 2 = 2
+    assert_eq!(code, 2);
+}
+
+#[test]
+fn test_enum_println() {
+    let bin = compile_src(
+        "fn main() -> unit { \
+         enum Color { Red, Green, Blue } \
+         let c = Color::Green \
+         println(c) }",
+    );
+    let (_code, stdout) = bin.run();
+    assert_eq!(stdout.trim(), "1");
+}
+
+#[test]
+fn test_nested_struct_field_access() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         struct Point { x: i64, y: i64 } \
+         struct Pair { a: Point, b: i64 } \
+         let p = Pair { a: Point { x: 5, y: 6 }, b: 7 } \
+         p.a.x }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 5);
+}
+
+#[test]
+fn test_nested_struct_second_field() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         struct Point { x: i64, y: i64 } \
+         struct Pair { a: Point, b: i64 } \
+         let p = Pair { a: Point { x: 5, y: 6 }, b: 7 } \
+         p.a.y }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 6);
+}
+
+#[test]
+fn test_nested_struct_b_field() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         struct Point { x: i64, y: i64 } \
+         struct Pair { a: Point, b: i64 } \
+         let p = Pair { a: Point { x: 5, y: 6 }, b: 7 } \
+         p.b }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 7);
+}
+
+#[test]
+fn test_struct_with_enum_field_runtime() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         enum Status { Active, Inactive } \
+         struct Item { s: Status, n: i64 } \
+         let i = Item { s: Status::Active, n: 42 } \
+         i.n }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 42);
+}
+
+#[test]
+fn test_struct_with_enum_field_runtime_second() {
+    let bin = compile_src(
+        "fn main() -> unit { \
+         enum Status { Active, Inactive } \
+         struct Item { s: Status, n: i64 } \
+         let i = Item { s: Status::Inactive, n: 99 } \
+         println(i.s) \
+         println(i.n) }",
+    );
+    let (_code, stdout) = bin.run();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], "1"); // Inactive = 1
+    assert_eq!(lines[1], "99");
+}
+
+#[test]
 fn test_emit_object_file() {
     let artifact = compile_to_object("fn main() -> i64 { return 42 }");
     assert!(artifact.path().exists(), "object file should be created");

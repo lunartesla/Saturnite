@@ -3,7 +3,7 @@
 //! This module orchestrates LLVM IR generation, object emission, and linking.
 //! It exposes three primary public types alongside convenience functions:
 //!
-//! - [`CodeGenerator`]: Generates an LLVM module from a parsed [`Program`](crate::ast::Program).
+//! - [`CodeGenerator`]: Generates an LLVM module from a typed [`HirProgram`].
 //! - [`ObjectEmitter`]: Emits an object file (or IR) from an LLVM module.
 //! - [`Linker`]: Links object files into a final executable using a platform-appropriate linker.
 //!
@@ -25,8 +25,8 @@ pub use crate::target::{
     TargetConfig,
 };
 
-use crate::ast::Program;
 use crate::error::{CompilerError, CompilerResult};
+use crate::hir::HirProgram;
 use inkwell::context::Context as LLVMContext;
 use inkwell::passes::PassBuilderOptions;
 use std::path::Path;
@@ -48,30 +48,30 @@ impl CodeGenerator {
         &self.target_config
     }
 
-    pub fn generate_ir_string(program: &Program) -> CompilerResult<String> {
+    pub fn generate_ir_string(program: &HirProgram) -> CompilerResult<String> {
         let context = LLVMContext::create();
         let mut ctx = CodeGenContext::new(&context);
         ctx.declare_builtin_functions();
 
         for func in &program.functions {
-            ctx.declare_function(func)?;
+            ctx.declare_function(func, &program.symbols)?;
         }
 
         for func in &program.functions {
-            ctx.generate_function(func)?;
+            ctx.generate_function(func, program)?;
         }
 
         let ir = ctx.module.print_to_string();
         Ok(ir.to_string())
     }
 
-    pub fn compile(&self, program: &Program, output_path: &str) -> CompilerResult<()> {
+    pub fn compile(&self, program: &HirProgram, output_path: &str) -> CompilerResult<()> {
         self.emit(program, output_path, OutputKind::Exe, false)
     }
 
     pub fn emit(
         &self,
-        program: &Program,
+        program: &HirProgram,
         output_path: &str,
         output_kind: OutputKind,
         save_temps: bool,
@@ -82,11 +82,11 @@ impl CodeGenerator {
         ctx.declare_builtin_functions();
 
         for func in &program.functions {
-            ctx.declare_function(func)?;
+            ctx.declare_function(func, &program.symbols)?;
         }
 
         for func in &program.functions {
-            ctx.generate_function(func)?;
+            ctx.generate_function(func, program)?;
         }
 
         // Set target triple
@@ -161,18 +161,18 @@ impl CodeGenerator {
 // Convenience free functions
 // ---------------------------------------------------------------------------
 
-pub fn generate_ir(program: &Program) -> CompilerResult<String> {
+pub fn generate_ir(program: &HirProgram) -> CompilerResult<String> {
     CodeGenerator::generate_ir_string(program)
 }
 
-pub fn compile_to_executable(program: &Program, output_path: &str) -> CompilerResult<()> {
+pub fn compile_to_executable(program: &HirProgram, output_path: &str) -> CompilerResult<()> {
     let config = TargetConfig::host()?;
     let gen = CodeGenerator::new(config);
     gen.compile(program, output_path)
 }
 
 pub fn compile_with_target(
-    program: &Program,
+    program: &HirProgram,
     output_path: &str,
     target_config: TargetConfig,
 ) -> CompilerResult<()> {
@@ -180,7 +180,7 @@ pub fn compile_with_target(
 }
 
 pub fn compile_with_target_ext(
-    program: &Program,
+    program: &HirProgram,
     output_path: &str,
     target_config: TargetConfig,
     save_temps: bool,

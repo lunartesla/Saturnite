@@ -4,7 +4,7 @@
 use stnx::error::{CompilerError, ParseError};
 use stnx::lexer::Lexer;
 use stnx::parser;
-use stnx::semantic::analyze;
+use stnx::semantic::analyze_and_lower;
 
 /// Helper: lex -> parse -> analyze, returning the raw CompilerError.
 fn compile_error(src: &str) -> CompilerError {
@@ -12,7 +12,7 @@ fn compile_error(src: &str) -> CompilerError {
         .collect::<Result<Vec<_>, _>>()
         .expect("lexing should succeed up to parse");
     match parser::parse(src, tokens) {
-        Ok(program) => match analyze(&program) {
+        Ok(program) => match analyze_and_lower(&program) {
             Ok(_) => panic!("expected an error but compilation succeeded"),
             Err(e) => e,
         },

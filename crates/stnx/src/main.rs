@@ -129,6 +129,21 @@ enum Commands {
 
     /// Print diagnostics about the compiler environment
     Doctor,
+
+    /// Create a new Saturnite project with scaffolding
+    Init {
+        /// Directory name for the new project (will be created if it doesn't exist)
+        #[arg(value_name = "NAME", required = false)]
+        name: Option<String>,
+
+        /// Create the project in the current directory instead of a subdirectory
+        #[arg(short, long, default_value_t = false)]
+        in_place: bool,
+
+        /// Package version string (default: 0.1.0)
+        #[arg(short, long, value_name = "VERS")]
+        pkg_version: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -250,7 +265,7 @@ fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("Lex error: {}", e))?;
 
             let program = stnx::parser::parse(&src, tokens).map_err(render_diagnostic)?;
-            stnx::semantic::analyze(&program).map_err(render_diagnostic)?;
+            let hir = stnx::semantic::analyze_and_lower(&program).map_err(render_diagnostic)?;
 
             config.set_output_kind(output_kind);
 
@@ -292,7 +307,7 @@ fn main() -> anyhow::Result<()> {
 
             match output_kind {
                 OutputKind::Ir => {
-                    let ir = codegen::generate_ir(&program)
+                    let ir = codegen::generate_ir(&hir)
                         .map_err(|e| anyhow::anyhow!("IR generation failed: {}", e))?;
                     std::fs::write(&emit_path, ir).map_err(|e| {
                         anyhow::anyhow!("Failed to write IR to {}: {}", emit_path.display(), e)
@@ -300,7 +315,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 _ => {
                     codegen::compile_with_target_ext(
-                        &program,
+                        &hir,
                         emit_path.to_str().unwrap(),
                         config,
                         save_temps,
@@ -384,6 +399,15 @@ fn main() -> anyhow::Result<()> {
             run_doctor()?;
             Ok(())
         }
+
+        Commands::Init {
+            name,
+            in_place,
+            pkg_version,
+        } => {
+            init_project(name, in_place, pkg_version)?;
+            Ok(())
+        }
     }
 }
 
@@ -449,7 +473,8 @@ fn build_run_file(
 
     let program =
         stnx::parser::parse(&src, tokens).map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
-    stnx::semantic::analyze(&program).map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
+    let hir = stnx::semantic::analyze_and_lower(&program)
+        .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
 
     let mut config = if let Some(triple) = target_triple {
         TargetConfig::from_triple(triple)
@@ -486,7 +511,7 @@ fn build_run_file(
 
     config.set_output_kind(OutputKind::Exe);
 
-    codegen::compile_with_target(&program, output.to_str().unwrap(), config)
+    codegen::compile_with_target(&hir, output.to_str().unwrap(), config)
         .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
 
     Ok(output.to_path_buf())
@@ -505,6 +530,67 @@ fn check_file(input: &std::path::Path, _target_triple: Option<&str>) -> anyhow::
     let program =
         stnx::parser::parse(&src, tokens).map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
     stnx::semantic::analyze(&program).map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
+
+    Ok(())
+}
+
+/// Scaffold a new Saturnite project: creates `saturn.toml`, `src/` directory,
+/// and a minimal `src/main.stnx` entry point.
+fn init_project(
+    name: Option<String>,
+    in_place: bool,
+    pkg_version: Option<String>,
+) -> anyhow::Result<()> {
+    let project_name = name.unwrap_or_else(|| "myproject".to_string());
+    let version = pkg_version.unwrap_or_else(|| "0.1.0".to_string());
+
+    let project_dir = if in_place {
+        std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("Failed to get current directory: {}", e))?
+    } else {
+        std::path::PathBuf::from(&project_name)
+    };
+
+    if project_dir.exists() && !in_place {
+        return Err(anyhow::anyhow!(
+            "Directory '{}' already exists. Use --in-place to initialize in the current directory.",
+            project_dir.display()
+        ));
+    }
+
+    // Create directories
+    let src_dir = project_dir.join("src");
+    std::fs::create_dir_all(&src_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to create project directory '{}': {}",
+            project_dir.display(),
+            e
+        )
+    })?;
+
+    // Write saturn.toml
+    let toml_content = format!(
+        "[package]\nname = \"{}\"\nversion = \"{}\"\nedition = \"2026\"\n\n[dependencies]\n# saturnite-stdlib = \"0.1\"\n",
+        project_name, version
+    );
+    std::fs::write(project_dir.join("saturn.toml"), toml_content)
+        .map_err(|e| anyhow::anyhow!("Failed to write saturn.toml: {}", e))?;
+
+    // Write default src/main.stnx
+    let main_content = "// Generated by `saturn init`.\n//\n// A simple Saturnite program:\n\nfn main() -> i64 {\n    println(42)\n    return 0\n}\n";
+    std::fs::write(src_dir.join("main.stnx"), main_content)
+        .map_err(|e| anyhow::anyhow!("Failed to write src/main.stnx: {}", e))?;
+
+    let display_dir = if in_place { "." } else { &project_name };
+
+    println!("Created project '{}'", display_dir);
+    println!("  |-- saturn.toml");
+    println!("  |-- src/");
+    println!("  |   |-- main.stnx");
+    println!();
+    println!("To build:   saturnite build src/main.stnx");
+    println!("To run:     saturnite run src/main.stnx");
+    println!("To check:   saturnite check src/main.stnx");
 
     Ok(())
 }

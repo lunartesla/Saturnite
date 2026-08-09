@@ -90,3 +90,42 @@ fn test_valid_program_lexes() {
     let result = lex(src);
     assert!(result.is_ok(), "Valid program should lex successfully");
 }
+
+#[test]
+fn test_dot_token() {
+    let tokens = lex(".").unwrap();
+    assert_eq!(tokens, vec![TokenKind::Dot]);
+}
+
+#[test]
+fn test_double_colon_token() {
+    let tokens = lex("::").unwrap();
+    assert_eq!(tokens, vec![TokenKind::DoubleColon]);
+}
+
+#[test]
+fn test_struct_keyword_token() {
+    let tokens = lex("struct").unwrap();
+    assert_eq!(tokens, vec![TokenKind::Struct]);
+}
+
+#[test]
+fn test_enum_keyword_token() {
+    let tokens = lex("enum").unwrap();
+    assert_eq!(tokens, vec![TokenKind::Enum]);
+}
+
+#[test]
+fn test_dot_not_confused_with_dotdot() {
+    // Single dots should not be consumed as part of DotDot
+    let src = "a.b";
+    let tokens = lex(src).unwrap();
+    assert_eq!(
+        tokens,
+        vec![
+            TokenKind::Ident("a".to_string()),
+            TokenKind::Dot,
+            TokenKind::Ident("b".to_string())
+        ]
+    );
+}

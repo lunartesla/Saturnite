@@ -8,15 +8,18 @@
 //!
 //! - [`lexer`] — tokenizes source text into [`Token`](lexer::Token)s.
 //! - [`parser`] — parses tokens into an [`ast::Program`] AST.
-//! - [`semantic`] — performs semantic analysis (type checking, scope).
+//! - [`semantic`] — semantic analysis (delegates to HIR lowering).
 //! - [`codegen`] — generates LLVM IR, emits object files, and links executables.
 //! - [`target`] — target configuration (triple, architecture, OS, etc.).
 //! - [`error`] — structured error types for every compilation stage.
 //! - [`ast`] — AST node definitions.
+//! - [`config`] — `saturn.toml` project configuration representation.
 
 pub mod ast;
 pub mod codegen;
+pub mod config;
 pub mod error;
+pub mod hir;
 pub mod lexer;
 pub mod parser;
 pub mod semantic;
@@ -25,6 +28,17 @@ pub mod target;
 // --- AST re-exports ---
 
 pub use ast::Program;
+
+// --- HIR re-exports ---
+//
+// The HIR is the compiler's single authoritative semantic representation,
+// produced by the AST→HIR lowering pass (see [`hir::lower`]).
+// Codegen consumes `HirProgram` directly — not raw AST.
+
+pub use hir::{
+    DefId, HirExpr, HirExprKind, HirFunction, HirLower, HirProgram, HirStmt, HirStmtKind, HirType,
+    SymbolId, SymbolInterner,
+};
 
 // --- Code generation re-exports ---
 //
@@ -53,3 +67,9 @@ pub use target::{
 pub use error::{
     CompilerError, CompilerResult, LexError, LinkError, ParseError, TargetError, TargetResult,
 };
+
+// --- Config re-exports ---
+//
+// `saturn.toml` configuration types and parsing logic.
+
+pub use config::{DependencySpec, Package, SaturnConfig};

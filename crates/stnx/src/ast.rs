@@ -9,6 +9,12 @@ pub enum Type {
     Bool,
     Str,
     Unit,
+    /// A named struct type, referenced by name. The name is resolved
+    /// to a `SymbolId` during HIR lowering. For the AST, the name is
+    /// an unresolved `String` (what the programmer wrote).
+    Struct(String),
+    /// A named enum type, referenced by name.
+    Enum(String),
 }
 
 // --- AST Nodes ---
@@ -39,6 +45,18 @@ pub enum Stmt {
     Expr(Expr, Range<usize>),
     Return(Option<Expr>, Range<usize>),
     Println(Expr, Range<usize>),
+    /// A struct definition: `struct Point { x: i64, y: i64 }`
+    StructDef {
+        name: String,
+        fields: Vec<(String, Type)>,
+        span: Range<usize>,
+    },
+    /// An enum definition: `enum Result { Ok, Error }`
+    EnumDef {
+        name: String,
+        variants: Vec<String>,
+        span: Range<usize>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +116,24 @@ pub enum Expr {
         start: Box<Expr>,
         end: Box<Expr>,
         is_inclusive: bool,
+        span: Range<usize>,
+    },
+    /// A struct literal: `Point { x: 10, y: 20 }`
+    StructLiteral {
+        name: String,
+        fields: Vec<(String, Expr)>,
+        span: Range<usize>,
+    },
+    /// Field access: `p.x`
+    FieldAccess {
+        expr: Box<Expr>,
+        field: String,
+        span: Range<usize>,
+    },
+    /// Enum variant construction: `Result::Ok`
+    EnumConstructor {
+        name: String,
+        variant: String,
         span: Range<usize>,
     },
 }

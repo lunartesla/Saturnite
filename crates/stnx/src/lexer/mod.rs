@@ -44,6 +44,10 @@ pub enum LexicalToken {
     False,
     #[token("println")]
     Println,
+    #[token("struct")]
+    Struct,
+    #[token("enum")]
+    Enum,
 
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
@@ -100,6 +104,10 @@ pub enum LexicalToken {
     DotDot,
     #[token("...")]
     DotDotEllipsis,
+    #[token(".")]
+    Dot,
+    #[token("::")]
+    DoubleColon,
 
     #[token("(")]
     LParen,
@@ -186,6 +194,8 @@ fn convert(lt: LexicalToken) -> TokenKind {
         LexicalToken::True => TokenKind::True,
         LexicalToken::False => TokenKind::False,
         LexicalToken::Println => TokenKind::Println,
+        LexicalToken::Struct => TokenKind::Struct,
+        LexicalToken::Enum => TokenKind::Enum,
         LexicalToken::Ident(s) => TokenKind::Ident(s),
         LexicalToken::Integer(s) => match s.parse::<i64>() {
             Ok(n) => TokenKind::Integer(n),
@@ -217,6 +227,8 @@ fn convert(lt: LexicalToken) -> TokenKind {
         LexicalToken::Bang => TokenKind::Bang,
         LexicalToken::DotDot => TokenKind::DotDot,
         LexicalToken::DotDotEllipsis => TokenKind::DotDotEllipsis,
+        LexicalToken::Dot => TokenKind::Dot,
+        LexicalToken::DoubleColon => TokenKind::DoubleColon,
         LexicalToken::LParen => TokenKind::LParen,
         LexicalToken::RParen => TokenKind::RParen,
         LexicalToken::LBrace => TokenKind::LBrace,

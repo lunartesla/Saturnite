@@ -14,7 +14,7 @@ use std::process::Command;
 use stnx::codegen;
 use stnx::lexer::Lexer;
 use stnx::parser;
-use stnx::semantic::analyze;
+use stnx::semantic::analyze_and_lower;
 use stnx::target::{OutputKind, TargetConfig};
 use tempfile::TempDir;
 
@@ -53,11 +53,11 @@ pub fn compile_src(src: &str) -> Artifact {
         .collect::<Result<Vec<_>, _>>()
         .expect("lexing failed");
     let program = parser::parse(src, tokens).expect("parsing failed");
-    analyze(&program).expect("semantic analysis failed");
+    let hir = analyze_and_lower(&program).expect("semantic analysis failed");
 
     let mut config = TargetConfig::host().expect("target init failed");
     config.set_output_kind(OutputKind::Exe);
-    codegen::compile_with_target(&program, exe_path.to_str().unwrap(), config)
+    codegen::compile_with_target(&hir, exe_path.to_str().unwrap(), config)
         .expect("codegen/linking failed");
 
     Artifact {
@@ -75,12 +75,11 @@ pub fn compile_to_object(src: &str) -> Artifact {
         .collect::<Result<Vec<_>, _>>()
         .expect("lexing failed");
     let program = parser::parse(src, tokens).expect("parsing failed");
-    analyze(&program).expect("semantic analysis failed");
+    let hir = analyze_and_lower(&program).expect("semantic analysis failed");
 
     let mut config = TargetConfig::host().expect("target init failed");
     config.set_output_kind(OutputKind::Object);
-    codegen::compile_with_target(&program, obj_path.to_str().unwrap(), config)
-        .expect("codegen failed");
+    codegen::compile_with_target(&hir, obj_path.to_str().unwrap(), config).expect("codegen failed");
 
     Artifact {
         path: obj_path,
@@ -94,8 +93,8 @@ pub fn ir_only(src: &str) -> String {
         .collect::<Result<Vec<_>, _>>()
         .expect("lexing failed");
     let program = parser::parse(src, tokens).expect("parsing failed");
-    analyze(&program).expect("semantic analysis failed");
-    codegen::generate_ir(&program).expect("IR generation failed")
+    let hir = analyze_and_lower(&program).expect("semantic analysis failed");
+    codegen::generate_ir(&hir).expect("IR generation failed")
 }
 
 /// Full analysis that may fail — used by diagnostics / negative tests.
@@ -107,7 +106,8 @@ pub fn analyze_src(src: &str) -> AnalysisResult {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("Lex error: {}", e))?;
     let program = parser::parse(src, tokens).map_err(|e| format!("Parse error: {}", e))?;
-    analyze(&program).map_err(|e| format!("Semantic error: {}", e))
+    analyze_and_lower(&program).map_err(|e| format!("Semantic error: {}", e))?;
+    Ok(())
 }
 
 /// Read a file to a string, panicking with context on failure.

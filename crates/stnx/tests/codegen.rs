@@ -1,14 +1,16 @@
+use stnx::hir::HirProgram;
 use stnx::lexer::Lexer;
 use stnx::parser;
-use stnx::semantic::analyze;
+use stnx::semantic::analyze_and_lower;
 
 fn compile_src(src: &str) -> Result<String, String> {
     let tokens: Vec<_> = Lexer::new(src)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("Lex error: {}", e))?;
     let program = parser::parse(src, tokens).map_err(|e| format!("Parse error: {}", e))?;
-    analyze(&program).map_err(|e| format!("Semantic error: {}", e))?;
-    stnx::codegen::generate_ir(&program).map_err(|e| format!("Codegen error: {}", e))
+    let hir: HirProgram =
+        analyze_and_lower(&program).map_err(|e| format!("Semantic error: {}", e))?;
+    stnx::codegen::generate_ir(&hir).map_err(|e| format!("Codegen error: {}", e))
 }
 
 #[test]
@@ -125,4 +127,46 @@ fn test_string_literal_compiles() {
     let ir = compile_src(src).unwrap();
     // Should compile without panicking
     assert!(ir.contains("define i64 @main"));
+}
+
+#[test]
+fn test_struct_literal_codegen() {
+    let src =
+        "fn main() -> i64 { struct Point { x: i64, y: i64 } let p = Point { x: 10, y: 20 } p.x }";
+    let ir = compile_src(src).unwrap();
+    assert!(
+        ir.contains("define i64 @main"),
+        "struct construction should generate main"
+    );
+}
+
+#[test]
+fn test_field_access_codegen() {
+    let src =
+        "fn main() -> i64 { struct Point { x: i64, y: i64 } let p = Point { x: 10, y: 20 } p.y }";
+    let ir = compile_src(src).unwrap();
+    assert!(
+        ir.contains("define i64 @main"),
+        "field access should generate code"
+    );
+}
+
+#[test]
+fn test_struct_with_nested_field_access() {
+    let src = "fn main() -> i64 { struct Point { x: i64, y: i64 } struct Pair { a: Point, b: i64 } let p = Pair { a: Point { x: 5, y: 6 }, b: 7 } p.a.x }";
+    let ir = compile_src(src).unwrap();
+    assert!(
+        ir.contains("define i64 @main"),
+        "nested struct field access should compile"
+    );
+}
+
+#[test]
+fn test_enum_constructor_codegen() {
+    let src = "fn main() -> i64 { enum Color { Red, Green, Blue } let c = Color::Green 0 }";
+    let ir = compile_src(src).unwrap();
+    assert!(
+        ir.contains("define i64 @main"),
+        "enum construction should generate code"
+    );
 }

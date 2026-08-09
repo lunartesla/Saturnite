@@ -115,7 +115,8 @@ fn type_ann<'a>() -> impl Parser<'a, &'a [Token], Type, ParserExtra<'a>> {
             .or(kw("f64").to(Type::F64))
             .or(kw("bool").to(Type::Bool))
             .or(kw("str").to(Type::Str))
-            .or(kw("unit").to(Type::Unit)),
+            .or(kw("unit").to(Type::Unit))
+            .or(t_ident().map(|(name, _)| Type::Struct(name))),
     )
 }
 
@@ -127,7 +128,8 @@ fn ret_type<'a>() -> impl Parser<'a, &'a [Token], Type, ParserExtra<'a>> {
                 .or(kw("f64").to(Type::F64))
                 .or(kw("bool").to(Type::Bool))
                 .or(kw("str").to(Type::Str))
-                .or(kw("unit").to(Type::Unit)),
+                .or(kw("unit").to(Type::Unit))
+                .or(t_ident().map(|(name, _)| Type::Struct(name))),
         )
         .or_not()
         .map(|opt: Option<Type>| opt.unwrap_or(Type::Unit))
@@ -189,6 +191,45 @@ fn stmt<'a>(
             Stmt::Println(e, span)
         });
 
+    // Struct definition: `struct Name { field1: type1, field2: type2 }`
+    let struct_def = kw("struct")
+        .ignore_then(t_ident())
+        .then(
+            lbrace()
+                .ignore_then(
+                    t_ident()
+                        .map(|(name, _)| name)
+                        .then(type_ann())
+                        .separated_by(comma())
+                        .collect::<Vec<_>>(),
+                )
+                .then_ignore(rbrace()),
+        )
+        .map(|((name, name_span), fields)| Stmt::StructDef {
+            name,
+            fields,
+            span: name_span,
+        });
+
+    // Enum definition: `enum Name { Variant1, Variant2 }`
+    let enum_def = kw("enum")
+        .ignore_then(t_ident())
+        .then(
+            lbrace()
+                .ignore_then(
+                    t_ident()
+                        .map(|(name, _)| name)
+                        .separated_by(comma())
+                        .collect::<Vec<_>>(),
+                )
+                .then_ignore(rbrace()),
+        )
+        .map(|((name, name_span), variants)| Stmt::EnumDef {
+            name,
+            variants,
+            span: name_span,
+        });
+
     let expr_stmt = expr.map(|e| {
         let span = stmt_span(&e);
         Stmt::Expr(e, span)
@@ -197,6 +238,8 @@ fn stmt<'a>(
     let_stmt
         .or(return_stmt)
         .or(println_stmt)
+        .or(struct_def)
+        .or(enum_def)
         .or(expr_stmt)
         .boxed()
 }
@@ -233,6 +276,30 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
                 .map(|s| Expr::Bool(true, s))
                 .or(kw_span("false").map(|s| Expr::Bool(false, s))))
             .or(lbrace_span().then_ignore(rbrace()).map(Expr::Unit))
+            .or(t_ident()
+                .then(
+                    lbrace()
+                        .ignore_then(
+                            t_ident()
+                                .map(|(name, _)| name)
+                                .then(colon().ignore_then(expr.clone()))
+                                .separated_by(comma())
+                                .collect::<Vec<_>>(),
+                        )
+                        .then_ignore(rbrace()),
+                )
+                .map(|((name, name_span), fields)| Expr::StructLiteral {
+                    name,
+                    fields,
+                    span: name_span,
+                }))
+            .or(t_ident().then(double_colon().ignore_then(t_ident())).map(
+                |((name, name_span), (variant, _))| Expr::EnumConstructor {
+                    name,
+                    variant,
+                    span: name_span,
+                },
+            ))
             .or(t_ident()
                 .then(
                     lparen()
@@ -494,11 +561,30 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
         // Control flow expressions are tried first (they start with keywords
         // that don't match primary), then assignment (starts with ident),
         // then the basic expression chain (logical OR is the outermost binary layer)
-        if_expr
+        // Postfix: field access (a.b, a.b.c, func().field, etc.)
+        let base_expr = if_expr
             .or(for_expr.clone())
             .or(while_expr.clone())
             .or(assign_expr.clone())
             .or(range_expr.clone())
+            .memoized()
+            .boxed();
+
+        base_expr
+            .clone()
+            .then(dot().ignore_then(t_ident()).repeated().collect::<Vec<_>>())
+            .map(|(base, accesses)| {
+                let mut expr = base;
+                for (field_name, field_span) in accesses {
+                    let expr_span = stmt_span(&expr);
+                    expr = Expr::FieldAccess {
+                        expr: Box::new(expr),
+                        field: field_name,
+                        span: expr_span.start..field_span.end,
+                    };
+                }
+                expr
+            })
             .memoized()
             .boxed()
     })
@@ -652,6 +738,8 @@ fn kw_span<'a>(k: &'a str) -> Boxed<'a, 'a, &'a [Token], Range<usize>, ParserExt
                     | (TokenKind::True, "true")
                     | (TokenKind::False, "false")
                     | (TokenKind::Println, "println")
+                    | (TokenKind::Struct, "struct")
+                    | (TokenKind::Enum, "enum")
             )
         })
         .map(|t| t.span.clone())
@@ -687,6 +775,8 @@ fn is_keyword(s: &str) -> bool {
             | "true"
             | "false"
             | "println"
+            | "struct"
+            | "enum"
     )
 }
 
@@ -741,6 +831,18 @@ fn rarrow<'a>() -> impl Parser<'a, &'a [Token], (), ParserExtra<'a>> {
 fn colon<'a>() -> impl Parser<'a, &'a [Token], (), ParserExtra<'a>> {
     any::<&[Token], _>()
         .filter(|t: &Token| t.kind == TokenKind::Colon)
+        .ignored()
+}
+
+fn dot<'a>() -> impl Parser<'a, &'a [Token], (), ParserExtra<'a>> {
+    any::<&[Token], _>()
+        .filter(|t: &Token| t.kind == TokenKind::Dot)
+        .ignored()
+}
+
+fn double_colon<'a>() -> impl Parser<'a, &'a [Token], (), ParserExtra<'a>> {
+    any::<&[Token], _>()
+        .filter(|t: &Token| t.kind == TokenKind::DoubleColon)
         .ignored()
 }
 
@@ -890,7 +992,10 @@ fn stmt_span(e: &Expr) -> Range<usize> {
         | Expr::If { span, .. }
         | Expr::For { span, .. }
         | Expr::While { span, .. }
-        | Expr::Range { span, .. } => span.clone(),
+        | Expr::Range { span, .. }
+        | Expr::StructLiteral { span, .. }
+        | Expr::FieldAccess { span, .. }
+        | Expr::EnumConstructor { span, .. } => span.clone(),
     }
 }
 
@@ -900,7 +1005,9 @@ fn stmt_span_expr(s: &Stmt) -> Range<usize> {
         Stmt::Let { span, .. }
         | Stmt::Expr(_, span)
         | Stmt::Return(_, span)
-        | Stmt::Println(_, span) => span.clone(),
+        | Stmt::Println(_, span)
+        | Stmt::StructDef { span, .. }
+        | Stmt::EnumDef { span, .. } => span.clone(),
     }
 }
 

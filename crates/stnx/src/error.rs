@@ -119,6 +119,10 @@ pub enum CompilerError {
     #[error("process error: {0}")]
     Process(String),
 
+    // Configuration / parse errors for `saturn.toml`
+    #[error("config error: {0}")]
+    Config(String),
+
     // Structured codegen errors with richer context
     #[error("IR emission error: {message}")]
     IrEmissionError { message: String },
@@ -135,6 +139,10 @@ impl CompilerError {
 
     pub fn codegen(message: impl Into<String>) -> Self {
         CompilerError::Codegen(message.into())
+    }
+
+    pub fn config(message: impl Into<String>) -> Self {
+        CompilerError::Config(message.into())
     }
 }
 
