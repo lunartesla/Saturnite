@@ -6,19 +6,21 @@
 //! referred to by a [`SymbolId`]. Top-level definitions (functions, later
 //! structs) get a [`DefId`].
 
+use serde::{Deserialize, Serialize};
+
 /// A stable identifier for an interned string (variable name, function name,
 /// string literal, etc.).
 ///
 /// `SymbolId`s are cheap to copy, hash, and compare — codegen uses them as
 /// `HashMap` keys instead of `String` lookups.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SymbolId(pub u32);
 
 /// A stable identifier for a top-level definition (function, later struct).
 ///
 /// `DefId`s are assigned during HIR lowering: each function in
 /// [`HirProgram::functions`] corresponds to one `DefId` (its array index).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DefId(pub u32);
 
 /// A simple, allocation-efficient string interner.
@@ -26,7 +28,7 @@ pub struct DefId(pub u32);
 /// Strings are stored once; `intern()` returns a `SymbolId` that can be
 /// used as a `HashMap` key or array index. This replaces the `HashMap<String, V>`
 /// pattern used in 0.2's `Scope` and `FunctionScope`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SymbolInterner {
     strings: Vec<String>,
     indices: std::collections::HashMap<String, SymbolId>,

@@ -25,7 +25,7 @@ pub struct HirFunction {
 }
 
 /// A lowered struct definition: name + typed fields.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StructDef {
     pub def_id: DefId,
     pub name: SymbolId,
@@ -35,7 +35,7 @@ pub struct StructDef {
 
 /// A lowered enum definition: name + variant names.
 /// Each variant is represented as an `i64` tag at the LLVM level.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EnumDef {
     pub def_id: DefId,
     pub name: SymbolId,
