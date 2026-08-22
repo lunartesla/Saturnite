@@ -183,3 +183,31 @@ fn test_enum_constructor_codegen() {
         "enum construction should generate code"
     );
 }
+
+#[test]
+fn test_bool_function_signature() {
+    // Regression test: functions returning `bool` must be declared with
+    // `i1` return type in LLVM IR, not `i64`.  Previously all functions
+    // were declared with `i64` regardless of their actual return type,
+    // causing undefined behaviour at call sites.
+    let src = "fn is_even(n: i64) -> bool { return n % 2 == 0 } fn main() -> i64 { return 0 }";
+    let ir = compile_src(src).unwrap();
+    assert!(
+        ir.contains("define i1 @is_even"),
+        "Bool-returning function should be declared with i1 return type, got: {}",
+        ir
+    );
+}
+
+#[test]
+fn test_f64_function_return_signature() {
+    // Regression test: functions returning `f64` must be declared with
+    // `double` return type in LLVM IR, not `i64`.
+    let src = "fn half(n: f64) -> f64 { return n } fn main() -> i64 { return 0 }";
+    let ir = compile_src(src).unwrap();
+    assert!(
+        ir.contains("define double @half"),
+        "F64-returning function should be declared with double return type, got: {}",
+        ir
+    );
+}

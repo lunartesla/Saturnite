@@ -49,6 +49,45 @@ impl<'ctx> MirCodeGenContext<'ctx> {
         }
     }
 
+    /// Build the LLVM `FunctionType` for a MIR function, using the function's
+    /// actual `return_type` (including `void` for `Unit`) rather than always
+    /// defaulting to `i64`.
+    ///
+    /// Previously the return type was hardcoded as `i64`, which produced
+    /// invalid LLVM IR for functions returning `bool` (`i1`) or `f64` — the
+    /// function signature said `i64` but the `ret` instruction emitted the real
+    /// type, causing undefined behaviour at call sites (stack corruption,
+    /// segfaults, hangs).
+    fn make_fn_type(
+        &self,
+        func: &MirFunction,
+        prog: &MirProgram,
+    ) -> inkwell::types::FunctionType<'ctx> {
+        let param_types: Vec<BasicTypeEnum<'ctx>> = func
+            .params
+            .iter()
+            .map(|(_, ty)| mir_type_to_llvm(self.context, prog, ty))
+            .collect();
+        if matches!(func.return_type, HirType::Unit) {
+            self.context.void_type().fn_type(
+                &param_types
+                    .iter()
+                    .map(|t| t.as_basic_type_enum().into())
+                    .collect::<Vec<_>>(),
+                false,
+            )
+        } else {
+            let ret_ty = mir_type_to_llvm(self.context, prog, &func.return_type);
+            ret_ty.fn_type(
+                &param_types
+                    .iter()
+                    .map(|t| t.as_basic_type_enum().into())
+                    .collect::<Vec<_>>(),
+                false,
+            )
+        }
+    }
+
     /// Declare builtin functions (e.g. `println_i64`) in the module.
     pub fn declare_builtin_functions(&mut self) {
         let i64_ty = self.context.i64_type();
@@ -66,18 +105,7 @@ impl<'ctx> MirCodeGenContext<'ctx> {
                 .symbols
                 .lookup(func.name)
                 .ok_or_else(|| CompilerError::codegen("missing symbol for function name"))?;
-            let param_types: Vec<BasicTypeEnum<'ctx>> = func
-                .params
-                .iter()
-                .map(|(_, ty)| mir_type_to_llvm(self.context, prog, ty))
-                .collect();
-            let fn_ty = self.context.i64_type().fn_type(
-                &param_types
-                    .iter()
-                    .map(|t| t.as_basic_type_enum().into())
-                    .collect::<Vec<_>>(),
-                false,
-            );
+            let fn_ty = self.make_fn_type(func, prog);
             self.module.add_function(name, fn_ty, None);
         }
         Ok(())
@@ -95,18 +123,7 @@ impl<'ctx> MirCodeGenContext<'ctx> {
             .ok_or_else(|| CompilerError::codegen("missing symbol for function name"))?;
 
         let function_value = self.module.get_function(name).unwrap_or_else(|| {
-            let param_types: Vec<BasicTypeEnum<'ctx>> = func
-                .params
-                .iter()
-                .map(|(_, ty)| mir_type_to_llvm(self.context, prog, ty))
-                .collect();
-            let fn_ty = self.context.i64_type().fn_type(
-                &param_types
-                    .iter()
-                    .map(|t| t.as_basic_type_enum().into())
-                    .collect::<Vec<_>>(),
-                false,
-            );
+            let fn_ty = self.make_fn_type(func, prog);
             self.module.add_function(name, fn_ty, None)
         });
 

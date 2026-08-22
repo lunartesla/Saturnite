@@ -7,6 +7,9 @@ use stnx::ast::Program;
 use stnx::hir::lower::lower;
 use stnx::lexer::Lexer;
 use stnx::mir::lower::lower_program;
+use stnx::mir::MirBinOp;
+use stnx::mir::MirRvalue;
+use stnx::mir::MirStmtKind;
 use stnx::mir::MirTerminator;
 use stnx::parser;
 
@@ -170,4 +173,141 @@ fn test_mir_ir_generation_still_works() {
     // Ensure the existing HIR-based codegen path still works alongside MIR.
     let ir = ir_only("fn main() -> i64 { return 42 }");
     assert!(ir.contains("define i64 @main"));
+}
+
+#[test]
+fn test_smoke_test_mir_structure() {
+    use common::to_mir;
+    use stnx::hir::HirType;
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let path = std::path::Path::new(&manifest_dir).join("../../examples/smoke_test.stnx");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("failed to read {}", path.display()));
+    let mir = to_mir(&src);
+
+    // --- 6 functions ---
+    assert_eq!(mir.functions.len(), 6, "smoke test should have 6 functions");
+
+    let names: std::collections::HashSet<&str> = mir
+        .functions
+        .iter()
+        .filter_map(|f| mir.symbols.lookup(f.name))
+        .collect();
+    for expected in [
+        "factorial",
+        "is_even",
+        "sum_even_squares",
+        "sum_range",
+        "classify",
+        "main",
+    ] {
+        assert!(names.contains(expected), "missing function: {expected}");
+    }
+
+    // --- is_even returns bool ---
+    let is_even = function(&mir, "is_even");
+    assert_eq!(
+        is_even.return_type,
+        HirType::Bool,
+        "is_even should return bool"
+    );
+
+    // --- factorial has recursive Call ---
+    let factorial = function(&mir, "factorial");
+    let has_call = factorial
+        .blocks
+        .iter()
+        .any(|b| matches!(b.terminator, MirTerminator::Call { .. }));
+    assert!(
+        has_call,
+        "factorial should have a Call terminator (recursion)"
+    );
+
+    // --- while loop in sum_even_squares ---
+    let sum_even_squares = function(&mir, "sum_even_squares");
+    assert!(
+        sum_even_squares.blocks.len() >= 4,
+        "sum_even_squares should have >= 4 blocks (while loop), got {}",
+        sum_even_squares.blocks.len()
+    );
+
+    // --- for loop in sum_range ---
+    let sum_range = function(&mir, "sum_range");
+    assert!(
+        sum_range.blocks.len() >= 4,
+        "sum_range should have >= 4 blocks (for loop), got {}",
+        sum_range.blocks.len()
+    );
+
+    // --- if/elif/else in classify ---
+    let classify = function(&mir, "classify");
+    assert!(
+        classify.blocks.len() >= 4,
+        "classify should have >= 4 blocks (if/elif/else), got {}",
+        classify.blocks.len()
+    );
+
+    // --- main has Call terminators (function calls + printlns) ---
+    let main_fn = function(&mir, "main");
+    let call_count = main_fn
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.terminator, MirTerminator::Call { .. }))
+        .count();
+    assert!(
+        call_count >= 5,
+        "main should have >= 5 Call terminators, got {call_count}"
+    );
+
+    // --- arithmetic: Add, Mul, Mod ---
+    let has_add = has_binop(&mir, MirBinOp::Add);
+    let has_mul = has_binop(&mir, MirBinOp::Mul);
+    let has_mod = has_binop(&mir, MirBinOp::Mod);
+    assert!(has_add, "MIR should contain an Add binary op");
+    assert!(has_mul, "MIR should contain a Mul binary op");
+    assert!(has_mod, "MIR should contain a Mod binary op");
+
+    // --- SwitchInt (conditional branch) ---
+    let has_switch = mir.functions.iter().any(|f| {
+        f.blocks
+            .iter()
+            .any(|b| matches!(b.terminator, MirTerminator::SwitchInt { .. }))
+    });
+    assert!(has_switch, "MIR should contain SwitchInt terminators");
+
+    // --- Return terminators ---
+    let has_return = mir.functions.iter().any(|f| {
+        f.blocks
+            .iter()
+            .any(|b| matches!(b.terminator, MirTerminator::Return(_)))
+    });
+    assert!(has_return, "MIR should contain Return terminators");
+
+    // --- locals exist in every function ---
+    for f in &mir.functions {
+        assert!(
+            !f.locals.is_empty(),
+            "function {:?} should have at least one local",
+            mir.symbols.lookup(f.name)
+        );
+    }
+}
+
+/// Check whether any block in any function of `prog` contains a binary
+/// operation with the given operator.
+fn has_binop(prog: &stnx::mir::MirProgram, op: MirBinOp) -> bool {
+    prog.functions.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.stmts.iter().any(|s| {
+                matches!(
+                    &s.kind,
+                                        MirStmtKind::Assign {
+                        rvalue: MirRvalue::Binary { op: o, .. },
+                        ..
+                    } if *o == op
+                )
+            })
+        })
+    })
 }

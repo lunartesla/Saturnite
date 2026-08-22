@@ -477,3 +477,48 @@ fn test_invalid_target_configuration() {
         "invalid target triple should produce an error"
     );
 }
+
+// Regression tests for function-return-type mismatch bug:
+// MIR codegen previously hardcoded `i64` as the LLVM return type for ALL
+// functions, regardless of the MIR function's actual `return_type`.  This
+// produced invalid LLVM IR for functions returning `bool` (`i1`) or `f64`
+// (`double`): the function signature said `i64` but the `ret` instruction
+// emitted the real type, causing stack corruption / UB at call sites.
+
+#[test]
+fn test_bool_function_call_from_main() {
+    let bin = compile_src(
+        "fn is_even(n: i64) -> bool { return n % 2 == 0 } fn main() -> i64 { if is_even(4) { return 1 } return 0 }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 1, "is_even(4) should be true");
+}
+
+#[test]
+fn test_bool_function_call_false_branch() {
+    let bin = compile_src(
+        "fn is_even(n: i64) -> bool { return n % 2 == 0 } fn main() -> i64 { if is_even(7) { return 1 } return 0 }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 0, "is_even(7) should be false");
+}
+
+#[test]
+fn test_bool_function_in_loop() {
+    let bin = compile_src(
+        "fn is_odd(n: i64) -> bool { return n % 2 == 1 } fn main() -> i64 { let mut sum = 0 for i in 0..10 { if is_odd(i) { sum = sum + i } } return sum }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 25, "sum of odd numbers 0..10 should be 25");
+}
+
+#[test]
+fn test_f64_function_call() {
+    // Regression test: f64-returning functions were previously declared
+    // with `i64` return type in LLVM IR.  This test verifies the function
+    // declares with `double` and runs without crashing.
+    // (f64 arithmetic in gen_binop is a separate, pre-existing bug.)
+    let bin = compile_src("fn half(n: f64) -> f64 { return n } fn main() -> i64 { return 0 }");
+    let (code, _) = bin.run();
+    assert_eq!(code, 0, "f64 function should compile and run");
+}

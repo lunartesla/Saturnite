@@ -1,0 +1,54 @@
+fn factorial(n: i64) -> i64 {
+    if n <= 1 {
+        return 1
+    }
+    return n * factorial(n - 1)
+}
+
+fn is_even(n: i64) -> bool {
+    return n % 2 == 0
+}
+
+fn sum_even_squares(limit: i64) -> i64 {
+    let mut sum = 0
+    let mut i = 0
+    while i < limit {
+        if is_even(i) {
+            sum = sum + i * i
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+fn sum_range(start: i64, end: i64) -> i64 {
+    let mut sum = 0
+    for i in start..end {
+        sum = sum + i
+    }
+    return sum
+}
+
+fn classify(n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    } elif n < 0 {
+        return -1
+    } else {
+        return 1
+    }
+}
+
+fn main() -> i64 {
+    let fact5 = factorial(5)
+    let even_sum = sum_range(0, 10)
+    let squares = sum_even_squares(10)
+    let sign = classify(0)
+    let total = fact5 + even_sum + squares + sign
+    println(fact5)
+    println(even_sum)
+    println(squares)
+    println(sign)
+    println(total)
+    return total
+}
