@@ -8,6 +8,8 @@ recursion, and ranges.
 > **Note:** Saturnite is a work-in-progress language.  See
 > [docs/SATURNITE_0_3_ARCHITECTURE_REVIEW.md](docs/SATURNITE_0_3_ARCHITECTURE_REVIEW.md)
 > for the roadmap toward richer language features.
+> See [docs/SATURNITE_0_4_ARCHITECTURE.md](docs/SATURNITE_0_4_ARCHITECTURE.md)
+> for the current MIR-based compiler architecture.
 
 ## Quick start
 
@@ -48,7 +50,10 @@ Saturnite source
   Parser         (chumsky 0.13, produces a spanned AST)
    |
    v
-  Semantic anal. (type checking, mutability enforcement, scope resolution)
+  Semantic anal. (AST → HIR: type checking, mutability, scope resolution)
+   |
+   v
+  MIR            (HIR → MIR: typed CFG with locals, basic blocks, terminators)
    |
    v
   LLVM IR        (inkwell 0.9 -> LLVM 21)
@@ -68,8 +73,11 @@ Saturnite source
 | Lexer              | `src/lexer/`                    | Token + byte span                                    |
 | Parser             | `src/parser/`                   | chumsky 0.13, SimpleSpan                             |
 | AST                | `src/ast.rs`                    | Every node carries a `Range<usize>` span             |
-| Semantic analysis  | `src/semantic.rs`               | Scope-based, mutability-checked                      |
-| Code generation    | `src/codegen/`                  | CodeGenerator, ObjectEmitter, Linker                 |
+| Semantic analysis  | `src/semantic.rs`               | AST → HIR: scope-based, mutability-checked           |
+| MIR                | `src/mir/`                      | HIR → MIR: typed CFG (lower, verify, optimize)       |
+| Code generation    | `src/mir/codegen.rs`            | MIR → LLVM IR (the sole production codegen path)      |
+| Object emission    | `src/codegen/emitter.rs`        | ObjectEmitter: writes .o / .ll via TargetMachine      |
+| Linking            | `src/codegen/linker.rs`         | Linker: system linker invocation                     |
 | Target config      | `src/target.rs`                 | Triple validation, optimization & debug levels       |
 | Errors             | `src/error.rs`                  | thiserror + miette Diagnostic                         |
 | CLI                | `src/main.rs`                    | build / check / run / doctor                         |
@@ -79,8 +87,8 @@ Saturnite source
 
 Mutable variables use stack allocation (`alloca` / `store` / `load`) so that
 assignments persist across basic-block boundaries (e.g. inside loops).  This
-is the correct 0.2 semantics and remains compatible with a future HIR/MIR
-pipeline where values can be promoted back into SSA form.
+is the correct 0.2 semantics, and MIR promotes locals into typed `alloca`-backed
+slots while preserving mutability semantics across the HIR → MIR → LLVM pipeline.
 
 ## CLI reference
 

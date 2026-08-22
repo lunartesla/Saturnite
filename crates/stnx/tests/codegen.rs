@@ -10,7 +10,20 @@ fn compile_src(src: &str) -> Result<String, String> {
     let program = parser::parse(src, tokens).map_err(|e| format!("Parse error: {}", e))?;
     let hir: HirProgram =
         analyze_and_lower(&program).map_err(|e| format!("Semantic error: {}", e))?;
-    stnx::codegen::generate_ir(&hir).map_err(|e| format!("Codegen error: {}", e))
+
+    let mir =
+        stnx::mir::lower::lower_program(&hir).map_err(|e| format!("MIR lowering error: {}", e))?;
+
+    if let Err(errs) = mir.verify() {
+        return Err(format!(
+            "MIR verification failed: {}",
+            errs.iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    stnx::mir::codegen::generate_ir_from_mir(&mir).map_err(|e| format!("Codegen error: {}", e))
 }
 
 #[test]

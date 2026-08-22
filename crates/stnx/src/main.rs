@@ -1,6 +1,9 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use stnx::codegen;
+use stnx::mir::codegen::{compile_from_mir_ext, generate_ir_from_mir};
+use stnx::mir::lower::lower_program;
+use stnx::mir::opt::optimize;
 use stnx::target::{DebugInfo, OptimizationLevel, OutputKind, TargetConfig};
 // `CompilerError` carries the variants that `render_diagnostic` pattern-matches on.
 use stnx::CompilerError;
@@ -267,6 +270,22 @@ fn main() -> anyhow::Result<()> {
             let program = stnx::parser::parse(&src, tokens).map_err(render_diagnostic)?;
             let hir = stnx::semantic::analyze_and_lower(&program).map_err(render_diagnostic)?;
 
+            // Lower HIR → MIR (the single production codegen seam).
+            let mut mir =
+                lower_program(&hir).map_err(|e| anyhow::anyhow!("MIR lowering failed: {}", e))?;
+
+            // Verify the MIR CFG before handing it to LLVM.
+            if let Err(errs) = mir.verify() {
+                let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
+                return Err(anyhow::anyhow!(
+                    "MIR verification failed: {}",
+                    msgs.join(", ")
+                ));
+            }
+
+            // Apply any MIR-level optimizations that exist.
+            optimize(&mut mir);
+
             config.set_output_kind(output_kind);
 
             // Cross-compilation guard: the Saturnite runtime is compiled via
@@ -307,20 +326,15 @@ fn main() -> anyhow::Result<()> {
 
             match output_kind {
                 OutputKind::Ir => {
-                    let ir = codegen::generate_ir(&hir)
+                    let ir = generate_ir_from_mir(&mir)
                         .map_err(|e| anyhow::anyhow!("IR generation failed: {}", e))?;
                     std::fs::write(&emit_path, ir).map_err(|e| {
                         anyhow::anyhow!("Failed to write IR to {}: {}", emit_path.display(), e)
                     })?;
                 }
                 _ => {
-                    codegen::compile_with_target_ext(
-                        &hir,
-                        emit_path.to_str().unwrap(),
-                        config,
-                        save_temps,
-                    )
-                    .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
+                    compile_from_mir_ext(&mir, emit_path.to_str().unwrap(), config, save_temps)
+                        .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
                 }
             }
 
@@ -476,6 +490,19 @@ fn build_run_file(
     let hir = stnx::semantic::analyze_and_lower(&program)
         .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
 
+    // Lower HIR → MIR (the single production codegen seam).
+    let mut mir = lower_program(&hir).map_err(|e| anyhow::anyhow!("MIR lowering failed: {}", e))?;
+
+    if let Err(errs) = mir.verify() {
+        let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
+        return Err(anyhow::anyhow!(
+            "MIR verification failed: {}",
+            msgs.join(", ")
+        ));
+    }
+
+    optimize(&mut mir);
+
     let mut config = if let Some(triple) = target_triple {
         TargetConfig::from_triple(triple)
             .map_err(|e| anyhow::anyhow!("Invalid target '{}': {}", triple, e))?
@@ -511,7 +538,7 @@ fn build_run_file(
 
     config.set_output_kind(OutputKind::Exe);
 
-    codegen::compile_with_target(&hir, output.to_str().unwrap(), config)
+    compile_from_mir_ext(&mir, output.to_str().unwrap(), config, false)
         .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
 
     Ok(output.to_path_buf())

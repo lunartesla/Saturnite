@@ -19,8 +19,8 @@ use crate::hir::stmt::{HirStmt, HirStmtKind};
 use crate::hir::symbol::{DefId, SymbolId};
 use crate::hir::types::HirType;
 use crate::mir::{
-    BlockId, LocalId, MirBasicBlock, MirBinOp, MirConst, MirFunction, MirLocal,
-    MirOperand, MirProgram, MirRvalue, MirStmt, MirStmtKind, MirTerminator, MirType,
+    BlockId, LocalId, MirBasicBlock, MirBinOp, MirConst, MirFunction, MirLocal, MirOperand,
+    MirProgram, MirRvalue, MirStmt, MirStmtKind, MirTerminator, MirType,
 };
 
 /// `DefId` sentinel for the builtin `println` function.
@@ -89,7 +89,12 @@ impl<'hir> MirLower<'hir> {
 
     fn new_local(&mut self, ty: MirType, name: SymbolId, mutable: bool) -> LocalId {
         let id = LocalId(self.locals.len() as u32);
-        self.locals.push(MirLocal { id, ty, name, mutable });
+        self.locals.push(MirLocal {
+            id,
+            ty,
+            name,
+            mutable,
+        });
         id
     }
 
@@ -116,7 +121,10 @@ impl<'hir> MirLower<'hir> {
     fn switch_to(&mut self, block_id: BlockId) {
         self.current = block_id.0 as usize;
         debug_assert!(
-            matches!(self.blocks[self.current].terminator, MirTerminator::Unreachable),
+            matches!(
+                self.blocks[self.current].terminator,
+                MirTerminator::Unreachable
+            ),
             "switch_to: block {:?} is already terminated",
             block_id
         );
@@ -146,7 +154,7 @@ impl<'hir> MirLower<'hir> {
         }
     }
 
-        fn lookup_var(&self, sym: SymbolId) -> Option<LocalId> {
+    fn lookup_var(&self, sym: SymbolId) -> Option<LocalId> {
         self.var_map.get(&sym).copied()
     }
 
@@ -215,20 +223,39 @@ impl<'hir> MirLower<'hir> {
 
     fn lower_stmt(&mut self, stmt: &HirStmt) -> CompilerResult<()> {
         match &stmt.kind {
-            HirStmtKind::Let { name, mutable, ty, value } => {
+            HirStmtKind::Let {
+                name,
+                mutable,
+                ty,
+                value,
+            } => {
                 let local_ty: MirType = ty.unwrap_or(value.ty);
                 let local = self.new_local(local_ty, *name, *mutable);
-                self.var_map.insert(*name, local);
+                // Evaluate the initializer BEFORE updating var_map so that a
+                // shadowing `let x = x + 1` correctly reads the *previous* local.
                 let val = self.lower_expr(value)?;
-                self.emit(MirStmtKind::LocalDecl { local, ty: local_ty, mutable: *mutable });
-                self.emit(MirStmtKind::Assign { local, rvalue: MirRvalue::Use(val) });
+                self.var_map.insert(*name, local);
+                self.emit(MirStmtKind::LocalDecl {
+                    local,
+                    ty: local_ty,
+                    mutable: *mutable,
+                });
+                self.emit(MirStmtKind::Assign {
+                    local,
+                    rvalue: MirRvalue::Use(val),
+                });
                 Ok(())
             }
-            HirStmtKind::Expr(e) => { self.lower_expr(e)?; Ok(()) }
+            HirStmtKind::Expr(e) => {
+                self.lower_expr(e)?;
+                Ok(())
+            }
             HirStmtKind::Return(opt_expr) => {
                 let operand = if let Some(e) = opt_expr {
                     Some(self.lower_expr(e)?)
-                } else { None };
+                } else {
+                    None
+                };
                 if !self.current_closed() {
                     self.finish(MirTerminator::Return(operand));
                 }
@@ -238,16 +265,21 @@ impl<'hir> MirLower<'hir> {
                 let val = self.lower_expr(e)?;
                 let dest = self.new_local(MirType::I64, self.temp_symbol, false);
                 self.emit(MirStmtKind::LocalDecl {
-                    local: dest, ty: MirType::I64, mutable: false,
+                    local: dest,
+                    ty: MirType::I64,
+                    mutable: false,
                 });
                 let next = self.create_block(format!("println_cont_{}", self.blocks.len()));
                 self.finish(MirTerminator::Call {
-                    func: PRINTLN_DEF_ID, args: vec![val], destination: dest, next,
+                    func: PRINTLN_DEF_ID,
+                    args: vec![val],
+                    destination: dest,
+                    next,
                 });
                 self.switch_to(next);
                 Ok(())
             }
-                        HirStmtKind::StructDef { .. } | HirStmtKind::EnumDef { .. } => Ok(()),
+            HirStmtKind::StructDef { .. } | HirStmtKind::EnumDef { .. } => Ok(()),
         }
     }
 
@@ -257,15 +289,18 @@ impl<'hir> MirLower<'hir> {
         match &expr.kind {
             HirExprKind::Integer(n) => Ok(MirOperand::Const(MirConst::I64(*n))),
             HirExprKind::Float(f) => Ok(MirOperand::Const(MirConst::F64(*f))),
-                        HirExprKind::Bool(b) => Ok(MirOperand::Const(MirConst::Bool(*b))),
+            HirExprKind::Bool(b) => Ok(MirOperand::Const(MirConst::Bool(*b))),
 
             HirExprKind::StrLit(sym) => {
                 let local = self.new_local(MirType::Str, self.temp_symbol, false);
                 self.emit(MirStmtKind::LocalDecl {
-                    local, ty: MirType::Str, mutable: false,
+                    local,
+                    ty: MirType::Str,
+                    mutable: false,
                 });
                 self.emit(MirStmtKind::Assign {
-                    local, rvalue: MirRvalue::StrLit(*sym),
+                    local,
+                    rvalue: MirRvalue::StrLit(*sym),
                 });
                 Ok(MirOperand::Local(local))
             }
@@ -315,12 +350,16 @@ impl<'hir> MirLower<'hir> {
                 let r = self.lower_expr(rhs)?;
                 let result_local = self.new_local(expr.ty, self.temp_symbol, false);
                 self.emit(MirStmtKind::LocalDecl {
-                    local: result_local, ty: expr.ty, mutable: false,
+                    local: result_local,
+                    ty: expr.ty,
+                    mutable: false,
                 });
                 self.emit(MirStmtKind::Assign {
                     local: result_local,
                     rvalue: MirRvalue::Binary {
-                        op: (*op).into(), lhs: l, rhs: r,
+                        op: (*op).into(),
+                        lhs: l,
+                        rhs: r,
                     },
                 });
                 Ok(MirOperand::Local(result_local))
@@ -330,20 +369,28 @@ impl<'hir> MirLower<'hir> {
                 let val = self.lower_expr(inner)?;
                 let result_local = self.new_local(expr.ty, self.temp_symbol, false);
                 self.emit(MirStmtKind::LocalDecl {
-                    local: result_local, ty: expr.ty, mutable: false,
+                    local: result_local,
+                    ty: expr.ty,
+                    mutable: false,
                 });
                 self.emit(MirStmtKind::Assign {
                     local: result_local,
-                                                            rvalue: MirRvalue::Unary { op: (*op).into(), operand: val },
+                    rvalue: MirRvalue::Unary {
+                        op: (*op).into(),
+                        operand: val,
+                    },
                 });
                 Ok(MirOperand::Local(result_local))
             }
 
-            HirExprKind::Call { func: def_id, args } => {
-                self.lower_call(*def_id, args, expr.ty)
-            }
+            HirExprKind::Call { func: def_id, args } => self.lower_call(*def_id, args, expr.ty),
 
-            HirExprKind::If { condition, then_branch, elif_branches, else_branch } => {
+            HirExprKind::If {
+                condition,
+                then_branch,
+                elif_branches,
+                else_branch,
+            } => {
                 self.lower_if(condition, then_branch, elif_branches, else_branch)?;
                 Ok(MirOperand::Const(MirConst::I64(0)))
             }
@@ -367,7 +414,9 @@ impl<'hir> MirLower<'hir> {
                 }
                 let local = self.new_local(expr.ty, self.temp_symbol, false);
                 self.emit(MirStmtKind::LocalDecl {
-                    local, ty: expr.ty, mutable: false,
+                    local,
+                    ty: expr.ty,
+                    mutable: false,
                 });
                 self.emit(MirStmtKind::Assign {
                     local,
@@ -383,7 +432,9 @@ impl<'hir> MirLower<'hir> {
                 let inner_val = self.lower_expr(inner)?;
                 let inner_local = self.new_local(inner.ty, self.temp_symbol, false);
                 self.emit(MirStmtKind::LocalDecl {
-                    local: inner_local, ty: inner.ty, mutable: false,
+                    local: inner_local,
+                    ty: inner.ty,
+                    mutable: false,
                 });
                 self.emit(MirStmtKind::Assign {
                     local: inner_local,
@@ -391,12 +442,15 @@ impl<'hir> MirLower<'hir> {
                 });
                 let result_local = self.new_local(expr.ty, self.temp_symbol, false);
                 self.emit(MirStmtKind::LocalDecl {
-                    local: result_local, ty: expr.ty, mutable: false,
+                    local: result_local,
+                    ty: expr.ty,
+                    mutable: false,
                 });
                 self.emit(MirStmtKind::Assign {
                     local: result_local,
                     rvalue: MirRvalue::FieldAccess {
-                        local: inner_local, field: *field,
+                        local: inner_local,
+                        field: *field,
                     },
                 });
                 Ok(MirOperand::Local(result_local))
@@ -462,7 +516,7 @@ impl<'hir> MirLower<'hir> {
         });
         self.switch_to(next);
 
-                Ok(MirOperand::Local(dest))
+        Ok(MirOperand::Local(dest))
     }
 
     // -- Control-flow lowering
@@ -537,21 +591,18 @@ impl<'hir> MirLower<'hir> {
         }
         self.ensure_terminated(end_bb);
 
-                self.switch_to(end_bb);
+        self.switch_to(end_bb);
         Ok(())
     }
 
     /// Lower a `for var in start..end` (or `start...end` inclusive) loop.
-    fn lower_for(
-        &mut self,
-        var: SymbolId,
-        iter: &HirExpr,
-        body: &[HirStmt],
-    ) -> CompilerResult<()> {
+    fn lower_for(&mut self, var: SymbolId, iter: &HirExpr, body: &[HirStmt]) -> CompilerResult<()> {
         let (start_expr, end_expr, is_inclusive) = match &iter.kind {
-            HirExprKind::Range { start, end, is_inclusive } => {
-                (start.as_ref(), end.as_ref(), *is_inclusive)
-            }
+            HirExprKind::Range {
+                start,
+                end,
+                is_inclusive,
+            } => (start.as_ref(), end.as_ref(), *is_inclusive),
             _ => {
                 return Err(CompilerError::semantic(
                     "for loop iterator must be a range expression".to_string(),
@@ -563,7 +614,9 @@ impl<'hir> MirLower<'hir> {
         let start_val = self.lower_expr(start_expr)?;
         let start_local = self.new_local(MirType::I64, self.temp_symbol, false);
         self.emit(MirStmtKind::LocalDecl {
-            local: start_local, ty: MirType::I64, mutable: false,
+            local: start_local,
+            ty: MirType::I64,
+            mutable: false,
         });
         self.emit(MirStmtKind::Assign {
             local: start_local,
@@ -573,7 +626,9 @@ impl<'hir> MirLower<'hir> {
         let end_val = self.lower_expr(end_expr)?;
         let end_local = self.new_local(MirType::I64, self.temp_symbol, false);
         self.emit(MirStmtKind::LocalDecl {
-            local: end_local, ty: MirType::I64, mutable: false,
+            local: end_local,
+            ty: MirType::I64,
+            mutable: false,
         });
         self.emit(MirStmtKind::Assign {
             local: end_local,
@@ -589,7 +644,9 @@ impl<'hir> MirLower<'hir> {
 
         // Init loop_var once, then goto cond.
         self.emit(MirStmtKind::LocalDecl {
-            local: loop_var, ty: MirType::I64, mutable: true,
+            local: loop_var,
+            ty: MirType::I64,
+            mutable: true,
         });
         self.emit(MirStmtKind::Assign {
             local: loop_var,
@@ -599,10 +656,16 @@ impl<'hir> MirLower<'hir> {
 
         // cond_bb: check loop_var < end_local
         self.switch_to(cond_bb);
-        let cmp_op = if is_inclusive { MirBinOp::Le } else { MirBinOp::Lt };
+        let cmp_op = if is_inclusive {
+            MirBinOp::Le
+        } else {
+            MirBinOp::Lt
+        };
         let cond_local = self.new_local(MirType::Bool, self.temp_symbol, false);
         self.emit(MirStmtKind::LocalDecl {
-            local: cond_local, ty: MirType::Bool, mutable: false,
+            local: cond_local,
+            ty: MirType::Bool,
+            mutable: false,
         });
         self.emit(MirStmtKind::Assign {
             local: cond_local,
@@ -640,11 +703,7 @@ impl<'hir> MirLower<'hir> {
     }
 
     /// Lower a `while condition` loop.
-    fn lower_while(
-        &mut self,
-        condition: &HirExpr,
-        body: &[HirStmt],
-    ) -> CompilerResult<()> {
+    fn lower_while(&mut self, condition: &HirExpr, body: &[HirStmt]) -> CompilerResult<()> {
         let cond_bb = self.create_block("while_cond");
         let body_bb = self.create_block("while_body");
         let exit_bb = self.create_block("while_exit");
@@ -670,4 +729,3 @@ impl<'hir> MirLower<'hir> {
         Ok(())
     }
 }
-

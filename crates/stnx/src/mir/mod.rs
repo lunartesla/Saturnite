@@ -29,8 +29,10 @@ use crate::hir::symbol::{DefId, SymbolId, SymbolInterner};
 use crate::hir::{EnumDef, HirType, StructDef};
 use serde::{Deserialize, Serialize};
 
+pub mod codegen;
 pub mod lower;
 pub mod opt;
+pub mod verify;
 
 /// A stable identifier for a MIR basic block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -110,8 +112,19 @@ impl MirConst {
 /// MIR binary operator — mirrors `ast::BinOp`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MirBinOp {
-    Add, Sub, Mul, Div, Mod,
-    Eq, Ne, Lt, Gt, Le, Ge, And, Or,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    And,
+    Or,
 }
 
 impl From<BinOp> for MirBinOp {
@@ -172,7 +185,11 @@ pub enum MirRvalue {
     /// Copy/clone an operand into a local.
     Use(MirOperand),
     /// Binary operation on two operands.
-    Binary { op: MirBinOp, lhs: MirOperand, rhs: MirOperand },
+    Binary {
+        op: MirBinOp,
+        lhs: MirOperand,
+        rhs: MirOperand,
+    },
     /// Unary operation.
     Unary { op: MirUnOp, operand: MirOperand },
     /// Struct construction: `Point { x: 10, y: 20 }`.
@@ -185,7 +202,10 @@ pub enum MirRvalue {
     /// Field access on a struct local: `p.x`.
     FieldAccess { local: LocalId, field: SymbolId },
     /// Enum variant constructor as an i64 tag: `Color::Red` → `0`.
-    EnumCtor { enum_def: SymbolId, variant: SymbolId },
+    EnumCtor {
+        enum_def: SymbolId,
+        variant: SymbolId,
+    },
     /// String literal → global string pointer cast to i64.
     StrLit(SymbolId),
 }
@@ -203,7 +223,11 @@ pub struct MirStmt {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MirStmtKind {
     /// Declare a local with type and mutability.
-    LocalDecl { local: LocalId, ty: MirType, mutable: bool },
+    LocalDecl {
+        local: LocalId,
+        ty: MirType,
+        mutable: bool,
+    },
     /// Assign an rvalue to a local.
     Assign { local: LocalId, rvalue: MirRvalue },
 }
@@ -317,4 +341,3 @@ impl MirProgram {
             .and_then(|f| self.symbols.lookup(f.name))
     }
 }
-

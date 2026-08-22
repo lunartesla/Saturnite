@@ -10,7 +10,7 @@
 //! user-defined types without string lookups in later stages.
 
 use crate::hir::symbol::SymbolId;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Compiler-internal type used throughout HIR and consumed by codegen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

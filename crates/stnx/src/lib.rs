@@ -9,7 +9,7 @@
 //! - [`lexer`] — tokenizes source text into [`Token`](lexer::Token)s.
 //! - [`parser`] — parses tokens into an [`ast::Program`] AST.
 //! - [`semantic`] — semantic analysis (delegates to HIR lowering).
-//! - [`codegen`] — generates LLVM IR, emits object files, and links executables.
+//! - [`codegen`] — object emission and linking seams (MIR→LLVM via [`mir::codegen`]).
 //! - [`target`] — target configuration (triple, architecture, OS, etc.).
 //! - [`error`] — structured error types for every compilation stage.
 //! - [`ast`] — AST node definitions.
@@ -43,15 +43,15 @@ pub use hir::{
 
 // --- Code generation re-exports ---
 //
-// The codegen module is split into three layers:
-//   - [`CodeGenerator`]   : high-level driver producing an LLVM module.
-//   - [`ObjectEmitter`]    : emits object files or IR text from a module.
-//   - [`Linker`]           : links object files into a final executable.
+// The codegen module exposes the object-emission and linking seams that the
+// MIR→LLVM backend (see `mir::codegen`) delegates to.
+//
+pub use codegen::{check_linker, host_triple, run_diagnostics, Linker, ObjectEmitter};
 
-pub use codegen::{
-    check_linker, compile_to_executable, compile_with_target, compile_with_target_ext, generate_ir,
-    run_diagnostics, CodeGenerator, Linker, ObjectEmitter,
-};
+// --- MIR re-exports ---
+pub use mir::codegen::{compile_from_mir, compile_from_mir_ext, generate_ir_from_mir};
+pub use mir::lower::lower_program;
+pub use mir::verify::{MirVerifyError, VerifyResult};
 
 // --- Target configuration re-exports ---
 

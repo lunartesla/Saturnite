@@ -11,8 +11,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use stnx::codegen;
 use stnx::lexer::Lexer;
+use stnx::mir::codegen::{compile_from_mir_ext, generate_ir_from_mir};
+use stnx::mir::lower::lower_program;
+use stnx::mir::opt::optimize;
 use stnx::parser;
 use stnx::semantic::analyze_and_lower;
 use stnx::target::{OutputKind, TargetConfig};
@@ -43,21 +45,17 @@ impl Artifact {
     }
 }
 
-/// Full pipeline: lex -> parse -> analyze -> codegen -> link into an executable.
+/// Full pipeline: lex -> parse -> HIR -> MIR -> verify -> optimize -> LLVM -> link.
 /// Everything happens inside an isolated temp directory.
 pub fn compile_src(src: &str) -> Artifact {
     let temp_dir = TempDir::new().expect("failed to create isolated temp dir");
     let exe_path = temp_dir.path().join("program");
 
-    let tokens: Vec<_> = Lexer::new(src)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("lexing failed");
-    let program = parser::parse(src, tokens).expect("parsing failed");
-    let hir = analyze_and_lower(&program).expect("semantic analysis failed");
+    let mir = to_mir(src);
 
     let mut config = TargetConfig::host().expect("target init failed");
     config.set_output_kind(OutputKind::Exe);
-    codegen::compile_with_target(&hir, exe_path.to_str().unwrap(), config)
+    compile_from_mir_ext(&mir, exe_path.to_str().unwrap(), config, false)
         .expect("codegen/linking failed");
 
     Artifact {
@@ -71,15 +69,11 @@ pub fn compile_to_object(src: &str) -> Artifact {
     let temp_dir = TempDir::new().expect("failed to create isolated temp dir");
     let obj_path = temp_dir.path().join("program.o");
 
-    let tokens: Vec<_> = Lexer::new(src)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("lexing failed");
-    let program = parser::parse(src, tokens).expect("parsing failed");
-    let hir = analyze_and_lower(&program).expect("semantic analysis failed");
+    let mir = to_mir(src);
 
     let mut config = TargetConfig::host().expect("target init failed");
     config.set_output_kind(OutputKind::Object);
-    codegen::compile_with_target(&hir, obj_path.to_str().unwrap(), config).expect("codegen failed");
+    compile_from_mir_ext(&mir, obj_path.to_str().unwrap(), config, false).expect("codegen failed");
 
     Artifact {
         path: obj_path,
@@ -87,14 +81,32 @@ pub fn compile_to_object(src: &str) -> Artifact {
     }
 }
 
-/// Generate LLVM IR text only (no file I/O, no linking).
+/// Generate LLVM IR text only (no file I/O, no linking), via the MIR backend.
 pub fn ir_only(src: &str) -> String {
+    let mir = to_mir(src);
+    generate_ir_from_mir(&mir).expect("IR generation failed")
+}
+
+/// Lex -> parse -> HIR -> MIR -> verify -> optimize.
+/// This is the single production seam the tests share with the compiler driver.
+pub fn to_mir(src: &str) -> stnx::mir::MirProgram {
     let tokens: Vec<_> = Lexer::new(src)
         .collect::<Result<Vec<_>, _>>()
         .expect("lexing failed");
     let program = parser::parse(src, tokens).expect("parsing failed");
     let hir = analyze_and_lower(&program).expect("semantic analysis failed");
-    codegen::generate_ir(&hir).expect("IR generation failed")
+    lower_to_mir(&hir)
+}
+
+/// Lower an already-built HIR into a verified, optimized MIR program.
+pub fn lower_to_mir(hir: &stnx::hir::HirProgram) -> stnx::mir::MirProgram {
+    let mut mir = lower_program(hir).expect("MIR lowering failed");
+    if let Err(errs) = mir.verify() {
+        let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
+        panic!("MIR verification failed: {}", msgs.join(", "));
+    }
+    optimize(&mut mir);
+    mir
 }
 
 /// Full analysis that may fail — used by diagnostics / negative tests.
