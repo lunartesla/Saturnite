@@ -6,19 +6,30 @@
 //! stages (MIR, LLVM codegen) never perform string lookups. Every HIR
 //! node carries a resolved `HirType` and a preserved source `SourceSpan`.
 
-use crate::ast::{BinOp, Expr, Function, Program, Stmt, Type, UnOp};
+use crate::ast::{BinOp, Expr, Function, Item, ItemKind, Program, Stmt, Type, UnOp, Visibility};
 use crate::error::{CompilerError, CompilerResult};
 use crate::hir::expr::{HirExpr, HirExprKind};
-use crate::hir::function::{EnumDef, HirFunction, HirProgram, StructDef};
+use crate::hir::function::{EnumDef, HirFunction, HirModDecl, HirProgram, HirUseDecl, StructDef};
 use crate::hir::stmt::{HirStmt, HirStmtKind};
-use crate::hir::symbol::{DefId, SymbolId, SymbolInterner};
+use crate::hir::symbol::{
+    DefEntry, DefId, DefKind, DefTable, SymbolId, SymbolInterner, Visibility as HirVisibility,
+};
 use crate::hir::types::HirType;
+use crate::module::{Module, ModuleGraph, ModuleId, ModuleScope};
 use miette::SourceSpan;
 use std::collections::HashMap;
 
 /// Convert a byte-offset `Range<usize>` from the AST to a `SourceSpan`.
 fn span_to_source_span(r: &std::ops::Range<usize>) -> SourceSpan {
     SourceSpan::new(r.start.into(), r.end.saturating_sub(r.start))
+}
+
+/// Convert an AST [`Visibility`] to the HIR [`HirVisibility`].
+fn ast_visibility_to_hir(vis: &Visibility) -> HirVisibility {
+    match vis {
+        Visibility::Private => HirVisibility::Private,
+        Visibility::Public => HirVisibility::Public,
+    }
 }
 
 /// A lightweight function signature for call-site checking.
@@ -133,12 +144,43 @@ impl HirLower {
         }
     }
 
+    /// Allocate a fresh `DefId` for a use/mod declaration.
+    ///
+    /// Function, struct, and enum DefIds are assigned from their respective
+    /// index spaces (functions: sequential over `program.functions`, structs:
+    /// sequential over `structs`, enums: sequential over `enums`). Use and
+    /// mod declarations need a globally-unique DefId that does not collide
+    /// with those spaces, so we intern a synthetic name and use its
+    /// `SymbolId` as the DefId.
+    fn next_def_id(&mut self) -> DefId {
+        let next = self.symbols.next_id().0;
+        let sym = self.symbols.intern(&format!("__def_{}", next));
+        DefId(sym.0)
+    }
+
     pub fn lower_program(&mut self, program: &Program) -> CompilerResult<HirProgram> {
+        // For Phase 5 (single-file programs), all items belong to the root
+        // module. The module graph is built from `mod` declarations during
+        // a pre-lowering module-loading phase; for single-file programs there
+        // is only one module (ModuleId::ROOT = ModuleId(0)).
+
         // Phase 0: collect all enum names up front so that type annotations
         // (in function signatures, struct fields, and variable declarations)
         // can resolve user-defined types that are actually enums. The parser
-        // produces Type::Struct for all user-defined type names.
+        // produces Type::Struct for all user-defined type names. We scan both
+        // top-level items and function bodies.
         let mut enum_names: HashMap<&str, ()> = HashMap::new();
+        // Scan top-level items for struct/enum definitions
+        for item in &program.items {
+            match &item.kind {
+                ItemKind::EnumDef { name, .. } => {
+                    enum_names.insert(name.as_str(), ());
+                }
+                ItemKind::StructDef { .. } => {}
+                _ => {}
+            }
+        }
+        // Scan function bodies for local struct/enum definitions
         for func in &program.functions {
             for stmt in &func.body {
                 if let Stmt::EnumDef { name, .. } = stmt {
@@ -148,48 +190,108 @@ impl HirLower {
         }
 
         // Pass 1: intern all function names and build the signature table.
+        // We iterate `program.items` so that top-level struct/enum/mod/use
+        // declarations are also captured. For backward compatibility with
+        // `program.functions` (which only contains functions), we also
+        // ensure every function in `items` is included.
         let mut function_sigs: HashMap<SymbolId, FunctionSig> = HashMap::new();
-        for (i, func) in program.functions.iter().enumerate() {
-            let name_id = self.symbols.intern(&func.name);
-            let def_id = DefId(i as u32);
-            let param_types: Vec<HirType> = func
-                .params
-                .iter()
-                .map(|(_, t)| ast_type_to_hir(t, &mut self.symbols, &enum_names))
-                .collect();
-            let return_type = ast_type_to_hir(&func.return_type, &mut self.symbols, &enum_names);
-            function_sigs.insert(
-                name_id,
-                FunctionSig {
-                    def_id,
-                    param_types,
-                    return_type,
-                },
-            );
-        }
-        // Register builtin println
-        let println_sym = self.symbols.intern("println");
-        function_sigs.insert(
-            println_sym,
-            FunctionSig {
-                def_id: PRINTLN_DEF_ID,
-                param_types: vec![HirType::I64],
-                return_type: HirType::Unit,
-            },
-        );
-        // Check for main
-        let main_sym = self.symbols.intern("main");
-        if !function_sigs.contains_key(&main_sym) {
-            return Err(CompilerError::semantic("no `main` function defined"));
-        }
-
-        // Pre-pass: scan all function bodies for struct/enum definitions and
-        // intern their names + field/variant names into the symbol table.
         let mut structs: Vec<StructDef> = Vec::new();
         let mut enums: Vec<EnumDef> = Vec::new();
+        let mut use_decls: Vec<HirUseDecl> = Vec::new();
+        let mut mod_decls: Vec<HirModDecl> = Vec::new();
 
-        // Phase 2: collect struct and enum definitions, resolving type
-        // annotations using the name sets collected in Phase 0.
+        // Collect top-level struct/enum definitions first (their DefIds are
+        // assigned sequentially in the order they appear in `items`).
+        // Structs and enums at the module level get DefIds that are distinct
+        // from function DefIds (structs use a separate index space within
+        // `structs`, enums within `enums`). The `def_table` records the kind
+        // so MIR/codegen can disambiguate.
+        for item in &program.items {
+            match &item.kind {
+                ItemKind::StructDef { name, fields, span } => {
+                    let name_id = self.symbols.intern(name);
+                    let field_syms: Vec<(SymbolId, HirType)> = fields
+                        .iter()
+                        .map(|(fname, fty)| {
+                            let fid = self.symbols.intern(fname);
+                            (fid, ast_type_to_hir(fty, &mut self.symbols, &enum_names))
+                        })
+                        .collect();
+                    let def_id = DefId(structs.len() as u32);
+                    structs.push(StructDef {
+                        def_id,
+                        name: name_id,
+                        fields: field_syms,
+                        span: span_to_source_span(span),
+                        module: ModuleId::ROOT,
+                        visibility: ast_visibility_to_hir(&item.visibility),
+                    });
+                }
+                ItemKind::EnumDef {
+                    name,
+                    variants,
+                    span,
+                } => {
+                    let name_id = self.symbols.intern(name);
+                    let variant_syms: Vec<SymbolId> =
+                        variants.iter().map(|v| self.symbols.intern(v)).collect();
+                    let def_id = DefId(enums.len() as u32);
+                    enums.push(EnumDef {
+                        def_id,
+                        name: name_id,
+                        variants: variant_syms,
+                        span: span_to_source_span(span),
+                        module: ModuleId::ROOT,
+                        visibility: ast_visibility_to_hir(&item.visibility),
+                    });
+                }
+                ItemKind::UseDecl { path, alias } => {
+                    // Build the HIR use declaration. The path segments are
+                    // interned as SymbolIds. The alias (if present) is
+                    // interned separately; otherwise the last path segment
+                    // is used as the alias.
+                    let path_syms: Vec<SymbolId> =
+                        path.iter().map(|s| self.symbols.intern(s)).collect();
+                    let alias_sym = match alias {
+                        Some(a) => self.symbols.intern(a),
+                        None => path_syms
+                            .last()
+                            .copied()
+                            .unwrap_or_else(|| self.symbols.intern("")),
+                    };
+                    // Use declarations don't occupy the function/struct/enum
+                    // DefId space; they are tracked separately in `use_decls`.
+                    // We assign a synthetic DefId for the def_table registration.
+                    let def_id = self.next_def_id();
+                    use_decls.push(HirUseDecl {
+                        def_id,
+                        path: path_syms,
+                        alias: alias_sym,
+                        module: ModuleId::ROOT,
+                        visibility: ast_visibility_to_hir(&item.visibility),
+                        span: span_to_source_span(&item.span),
+                    });
+                }
+                ItemKind::ModDecl => {
+                    let def_id = self.next_def_id();
+                    mod_decls.push(HirModDecl {
+                        def_id,
+                        name: self.symbols.intern(&item.name),
+                        module_id: None, // resolved by the module graph in Phase 6
+                        module: ModuleId::ROOT,
+                        visibility: ast_visibility_to_hir(&item.visibility),
+                        span: span_to_source_span(&item.span),
+                    });
+                }
+                ItemKind::Function(func) => {
+                    let _ = func; // handled below
+                }
+            }
+        }
+
+        // Now process top-level struct/enum definitions found inside function
+        // bodies (local definitions). These are also collected for the HIR
+        // program's `structs` and `enums` vectors.
         for func in &program.functions {
             for stmt in &func.body {
                 match stmt {
@@ -207,6 +309,8 @@ impl HirLower {
                             name: name_id,
                             fields: field_syms,
                             span: span_to_source_span(span),
+                            module: ModuleId::ROOT,
+                            visibility: HirVisibility::Private,
                         });
                     }
                     Stmt::EnumDef {
@@ -222,11 +326,53 @@ impl HirLower {
                             name: name_id,
                             variants: variant_syms,
                             span: span_to_source_span(span),
+                            module: ModuleId::ROOT,
+                            visibility: HirVisibility::Private,
                         });
                     }
                     _ => {}
                 }
             }
+        }
+
+        // Build function signatures from top-level function items.
+        let mut next_func_def_id: u32 = 0;
+        for item in &program.items {
+            if let ItemKind::Function(func) = &item.kind {
+                let name_id = self.symbols.intern(&func.name);
+                let def_id = DefId(next_func_def_id);
+                let param_types: Vec<HirType> = func
+                    .params
+                    .iter()
+                    .map(|(_, t)| ast_type_to_hir(t, &mut self.symbols, &enum_names))
+                    .collect();
+                let return_type =
+                    ast_type_to_hir(&func.return_type, &mut self.symbols, &enum_names);
+                function_sigs.insert(
+                    name_id,
+                    FunctionSig {
+                        def_id,
+                        param_types,
+                        return_type,
+                    },
+                );
+                next_func_def_id += 1;
+            }
+        }
+        // Register builtin println
+        let println_sym = self.symbols.intern("println");
+        function_sigs.insert(
+            println_sym,
+            FunctionSig {
+                def_id: PRINTLN_DEF_ID,
+                param_types: vec![HirType::I64],
+                return_type: HirType::Unit,
+            },
+        );
+        // Check for main
+        let main_sym = self.symbols.intern("main");
+        if !function_sigs.contains_key(&main_sym) {
+            return Err(CompilerError::semantic("no `main` function defined"));
         }
 
         // Build the lowering context — borrows from local variables (not from self)
@@ -237,17 +383,542 @@ impl HirLower {
             enum_names: &enum_names,
         };
 
-        // Pass 2: lower each function body
+        // Pass 2: lower each function body. We iterate `program.items` to
+        // capture visibility from the AST; the `program.functions` fallback
+        // (for backward compatibility) is used when items are empty but
+        // functions exist.
         let mut functions: Vec<HirFunction> = Vec::new();
-        for (i, func) in program.functions.iter().enumerate() {
-            functions.push(self.lower_function(func, DefId(i as u32), &ctx)?);
+        let mut def_table = DefTable::new();
+        let mut module_paths: HashMap<DefId, ModuleId> = HashMap::new();
+        let mut module_scopes: Vec<ModuleScope> = vec![ModuleScope::new()];
+        let mut use_decl_idx: u32 = 0;
+        let mut mod_decl_idx: u32 = 0;
+
+        let items = if program.items.is_empty() && !program.functions.is_empty() {
+            // Fallback: synthesize items from the legacy `functions` vector.
+            &program
+                .functions
+                .iter()
+                .map(|f| Item {
+                    name: f.name.clone(),
+                    visibility: Visibility::Private,
+                    kind: ItemKind::Function(f.clone()),
+                    span: f.span.clone(),
+                })
+                .collect::<Vec<_>>()
+        } else {
+            &program.items
+        };
+
+        let mut func_def_id: u32 = 0;
+        for item in items {
+            if let ItemKind::Function(func) = &item.kind {
+                let def_id = DefId(func_def_id);
+                let hir_func = self.lower_function(
+                    func,
+                    def_id,
+                    ModuleId::ROOT,
+                    &ctx,
+                    ast_visibility_to_hir(&item.visibility),
+                )?;
+                // Register in the def_table and module_paths
+                def_table.register(DefEntry {
+                    module: ModuleId::ROOT,
+                    local_index: func_def_id,
+                    kind: DefKind::Function,
+                });
+                module_paths.insert(def_id, ModuleId::ROOT);
+                module_scopes[0].define_item(hir_func.name, def_id);
+                functions.push(hir_func);
+                func_def_id += 1;
+            }
         }
+
+        // Register struct and enum DefIds in the def_table, module_paths,
+        // and module_scopes (so lookup_with_parent can find them).
+        for (i, s) in structs.iter().enumerate() {
+            let def_id = DefId(i as u32);
+            def_table.register(DefEntry {
+                module: ModuleId::ROOT,
+                local_index: i as u32,
+                kind: DefKind::Struct,
+            });
+            module_paths.insert(def_id, ModuleId::ROOT);
+            module_scopes[0].define_item(s.name, def_id);
+        }
+        for (i, e) in enums.iter().enumerate() {
+            let def_id = DefId(e.def_id.0);
+            def_table.register(DefEntry {
+                module: ModuleId::ROOT,
+                local_index: i as u32,
+                kind: DefKind::Enum,
+            });
+            module_paths.insert(def_id, ModuleId::ROOT);
+            module_scopes[0].define_item(e.name, def_id);
+        }
+
+        // Register use/mod declarations in def_table and module_paths
+        for ud in &use_decls {
+            let def_id = ud.def_id;
+            def_table.register(DefEntry {
+                module: ModuleId::ROOT,
+                local_index: use_decl_idx,
+                kind: DefKind::Use,
+            });
+            module_paths.insert(def_id, ModuleId::ROOT);
+            use_decl_idx += 1;
+        }
+        for md in &mod_decls {
+            let def_id = md.def_id;
+            def_table.register(DefEntry {
+                module: ModuleId::ROOT,
+                local_index: mod_decl_idx,
+                kind: DefKind::Module,
+            });
+            module_paths.insert(def_id, ModuleId::ROOT);
+            mod_decl_idx += 1;
+        }
+
+        // Build the root module entry. For single-file programs, the root
+        // module has no file path (or a synthetic one). In Phase 6, the
+        // module graph will populate this from the loader.
+        let root_module_entry = Module::new(
+            ModuleId::ROOT,
+            crate::module::ModulePath::new(),
+            std::path::PathBuf::from("<root>"),
+        );
 
         Ok(HirProgram {
             functions,
             structs,
             enums,
             symbols: std::mem::take(&mut self.symbols),
+            // Phase 5B: populate module-aware fields for single-file programs.
+            // All items belong to the root module (ModuleId::ROOT).
+            modules: vec![root_module_entry],
+            root_module: ModuleId::ROOT,
+            module_paths,
+            def_table,
+            module_scopes,
+            use_decls,
+            mod_decls,
+        })
+    }
+
+    /// Lower a program using a [`ModuleGraph`] for multi-module support.
+    ///
+    /// This is the Phase 5B entry point: it uses the graph's shared
+    /// [`SymbolInterner`] (cloned into `self.symbols` so all `SymbolId`s are
+    /// consistent), iterates every module in the graph (not just the root),
+    /// and assigns the correct [`ModuleId`] to each lowered item.
+    ///
+    /// For single-file programs (a graph with only the root module and no
+    /// `mod` declarations), this produces output identical to
+    /// [`lower_program`](Self::lower_program).
+    pub fn lower_program_with_graph(
+        &mut self,
+        program: &Program,
+        graph: &ModuleGraph,
+    ) -> CompilerResult<HirProgram> {
+        // Phase 0: unify the symbol interner with the graph's.
+        // The graph's modules already hold `SymbolId`s computed against
+        // `graph.symbol_interner`.  By cloning it into `self.symbols`, any
+        // name we intern here will produce the same `SymbolId` as the one
+        // stored in the module path segments.
+        self.symbols = graph.symbol_interner.clone();
+
+        // Phase 1: pre-collect enum names across ALL modules so that type
+        // annotations can resolve user-defined type names that are actually
+        // enums (the parser produces `Type::Struct` for all user-defined
+        // type names).
+        let mut enum_names: HashMap<&str, ()> = HashMap::new();
+        for module in &graph.modules {
+            if let Some(ast) = &module.ast {
+                for item in &ast.items {
+                    if let ItemKind::EnumDef { name, .. } = &item.kind {
+                        enum_names.insert(name.as_str(), ());
+                    }
+                }
+                for func in &ast.functions {
+                    for stmt in &func.body {
+                        if let Stmt::EnumDef { name, .. } = stmt {
+                            enum_names.insert(name.as_str(), ());
+                        }
+                    }
+                }
+            }
+        }
+        // Also include enums from the top-level `program` parameter (single-file
+        // backward compatibility).
+        for item in &program.items {
+            if let ItemKind::EnumDef { name, .. } = &item.kind {
+                enum_names.insert(name.as_str(), ());
+            }
+        }
+        for func in &program.functions {
+            for stmt in &func.body {
+                if let Stmt::EnumDef { name, .. } = stmt {
+                    enum_names.insert(name.as_str(), ());
+                }
+            }
+        }
+
+        // Phase 2: build the cross-module signature table and collect
+        // struct/enum/use/mod definitions.  We iterate every module in the
+        // graph and process its AST.  Each item is tagged with its owning
+        // ModuleId (not ROOT).
+
+        let mut function_sigs: HashMap<SymbolId, FunctionSig> = HashMap::new();
+        let mut structs: Vec<StructDef> = Vec::new();
+        let mut enums: Vec<EnumDef> = Vec::new();
+        let mut use_decls: Vec<HirUseDecl> = Vec::new();
+        let mut mod_decls: Vec<HirModDecl> = Vec::new();
+
+        // A lookup from a child module's name string to its ModuleId, so we can
+        // resolve `mod foo;` declarations.  We build this from the graph's
+        // module_index, keyed by the last path segment.
+        let mut child_module_lookup: HashMap<String, ModuleId> = HashMap::new();
+        for module in &graph.modules {
+            if let Some(name) = module.path.name(&graph.symbol_interner) {
+                child_module_lookup.insert(name.to_string(), module.id);
+            }
+        }
+
+        let mut next_func_def_id: u32 = 0;
+
+        for module in &graph.modules {
+            let module_id = module.id;
+            let ast = module.ast.as_ref();
+            // Fall back to the top-level `program` for the root module if its
+            // AST was not loaded during discovery (single-file backward compat).
+            let ast = if ast.is_none() && module.is_root() {
+                Some(program)
+            } else {
+                ast
+            };
+            let Some(ast) = ast else {
+                continue;
+            };
+
+            // Collect struct/enum/use/mod definitions from this module's items.
+            for item in &ast.items {
+                match &item.kind {
+                    ItemKind::StructDef {
+                        name, fields, span, ..
+                    } => {
+                        let name_id = self.symbols.intern(name);
+                        let field_syms: Vec<(SymbolId, HirType)> = fields
+                            .iter()
+                            .map(|(fname, fty)| {
+                                let fid = self.symbols.intern(fname);
+                                (fid, ast_type_to_hir(fty, &mut self.symbols, &enum_names))
+                            })
+                            .collect();
+                        let def_id = DefId(structs.len() as u32);
+                        structs.push(StructDef {
+                            def_id,
+                            name: name_id,
+                            fields: field_syms,
+                            span: span_to_source_span(span),
+                            module: module_id,
+                            visibility: ast_visibility_to_hir(&item.visibility),
+                        });
+                    }
+                    ItemKind::EnumDef {
+                        name,
+                        variants,
+                        span,
+                    } => {
+                        let name_id = self.symbols.intern(name);
+                        let variant_syms: Vec<SymbolId> =
+                            variants.iter().map(|v| self.symbols.intern(v)).collect();
+                        let def_id = DefId(enums.len() as u32);
+                        enums.push(EnumDef {
+                            def_id,
+                            name: name_id,
+                            variants: variant_syms,
+                            span: span_to_source_span(span),
+                            module: module_id,
+                            visibility: ast_visibility_to_hir(&item.visibility),
+                        });
+                    }
+                    ItemKind::UseDecl { path, alias } => {
+                        let path_syms: Vec<SymbolId> =
+                            path.iter().map(|s| self.symbols.intern(s)).collect();
+                        let alias_sym = match alias {
+                            Some(a) => self.symbols.intern(a),
+                            None => path_syms
+                                .last()
+                                .copied()
+                                .unwrap_or_else(|| self.symbols.intern("")),
+                        };
+                        let def_id = self.next_def_id();
+                        use_decls.push(HirUseDecl {
+                            def_id,
+                            path: path_syms,
+                            alias: alias_sym,
+                            module: module_id,
+                            visibility: ast_visibility_to_hir(&item.visibility),
+                            span: span_to_source_span(&item.span),
+                        });
+                    }
+                    ItemKind::ModDecl => {
+                        // Resolve the child module's ModuleId by looking up
+                        // the module name in the graph.
+                        let mod_id = self.next_def_id();
+                        let name_sym = self.symbols.intern(&item.name);
+                        let resolved_module_id = child_module_lookup.get(&item.name).copied();
+                        mod_decls.push(HirModDecl {
+                            def_id: mod_id,
+                            name: name_sym,
+                            module_id: resolved_module_id,
+                            module: module_id,
+                            visibility: ast_visibility_to_hir(&item.visibility),
+                            span: span_to_source_span(&item.span),
+                        });
+                    }
+                    ItemKind::Function(func) => {
+                        let _ = func; // handled in the signature pass below
+                    }
+                }
+            }
+
+            // Also collect struct/enum defs from function-local items.
+            for func in &ast.functions {
+                for stmt in &func.body {
+                    match stmt {
+                        Stmt::StructDef { name, fields, span } => {
+                            let name_id = self.symbols.intern(name);
+                            let field_syms: Vec<(SymbolId, HirType)> = fields
+                                .iter()
+                                .map(|(fname, fty)| {
+                                    let fid = self.symbols.intern(fname);
+                                    (fid, ast_type_to_hir(fty, &mut self.symbols, &enum_names))
+                                })
+                                .collect();
+                            structs.push(StructDef {
+                                def_id: DefId(structs.len() as u32),
+                                name: name_id,
+                                fields: field_syms,
+                                span: span_to_source_span(span),
+                                module: module_id,
+                                visibility: HirVisibility::Private,
+                            });
+                        }
+                        Stmt::EnumDef {
+                            name,
+                            variants,
+                            span,
+                        } => {
+                            let name_id = self.symbols.intern(name);
+                            let variant_syms: Vec<SymbolId> =
+                                variants.iter().map(|v| self.symbols.intern(v)).collect();
+                            enums.push(EnumDef {
+                                def_id: DefId(enums.len() as u32),
+                                name: name_id,
+                                variants: variant_syms,
+                                span: span_to_source_span(span),
+                                module: module_id,
+                                visibility: HirVisibility::Private,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Build function signatures from this module's top-level functions.
+            for item in &ast.items {
+                if let ItemKind::Function(func) = &item.kind {
+                    let name_id = self.symbols.intern(&func.name);
+                    let def_id = DefId(next_func_def_id);
+                    let param_types: Vec<HirType> = func
+                        .params
+                        .iter()
+                        .map(|(_, t)| ast_type_to_hir(t, &mut self.symbols, &enum_names))
+                        .collect();
+                    let return_type =
+                        ast_type_to_hir(&func.return_type, &mut self.symbols, &enum_names);
+                    function_sigs.insert(
+                        name_id,
+                        FunctionSig {
+                            def_id,
+                            param_types,
+                            return_type,
+                        },
+                    );
+                    next_func_def_id += 1;
+                }
+            }
+        }
+
+        // Register builtin println
+        let println_sym = self.symbols.intern("println");
+        function_sigs.insert(
+            println_sym,
+            FunctionSig {
+                def_id: PRINTLN_DEF_ID,
+                param_types: vec![HirType::I64],
+                return_type: HirType::Unit,
+            },
+        );
+
+        // Check for main — it must exist in at least one module (typically root).
+        let main_sym = self.symbols.intern("main");
+        if !function_sigs.contains_key(&main_sym) {
+            return Err(CompilerError::semantic("no `main` function defined"));
+        }
+
+        // Build the lowering context — borrows from local variables.
+        let ctx = LowerContext {
+            function_sigs: &function_sigs,
+            struct_defs: &structs,
+            enum_defs: &enums,
+            enum_names: &enum_names,
+        };
+
+        // Phase 3: lower each module's function bodies and register DefIds.
+        let mut functions: Vec<HirFunction> = Vec::new();
+        let mut def_table = DefTable::new();
+        let mut module_paths: HashMap<DefId, ModuleId> = HashMap::new();
+        let mut module_scopes: Vec<ModuleScope> = Vec::new();
+
+        for module in &graph.modules {
+            module_scopes.push(if module.is_root() {
+                ModuleScope::new()
+            } else {
+                ModuleScope::with_parent(module.parent.unwrap_or(ModuleId::ROOT))
+            });
+        }
+
+        // Ensure we have at least the root scope for single-file backward compat.
+        if module_scopes.is_empty() {
+            module_scopes.push(ModuleScope::new());
+        }
+
+        let mut use_decl_idx: u32 = 0;
+        let mut mod_decl_idx: u32 = 0;
+        let mut func_def_id: u32 = 0;
+
+        for module in &graph.modules {
+            let module_id = module.id;
+            let ast = module.ast.as_ref();
+            let ast = if ast.is_none() && module.is_root() {
+                Some(program)
+            } else {
+                ast
+            };
+            let Some(ast) = ast else {
+                continue;
+            };
+
+            // Resolve items for this module.
+            let items: Vec<Item> = if ast.items.is_empty() && !ast.functions.is_empty() {
+                ast.functions
+                    .iter()
+                    .map(|f| Item {
+                        name: f.name.clone(),
+                        visibility: Visibility::Private,
+                        kind: ItemKind::Function(f.clone()),
+                        span: f.span.clone(),
+                    })
+                    .collect()
+            } else {
+                ast.items.clone()
+            };
+
+            // Lower functions
+            for item in &items {
+                if let ItemKind::Function(func) = &item.kind {
+                    let def_id = DefId(func_def_id);
+                    let hir_func = self.lower_function(
+                        func,
+                        def_id,
+                        module_id,
+                        &ctx,
+                        ast_visibility_to_hir(&item.visibility),
+                    )?;
+                    def_table.register(DefEntry {
+                        module: module_id,
+                        local_index: func_def_id,
+                        kind: DefKind::Function,
+                    });
+                    module_paths.insert(def_id, module_id);
+                    module_scopes[module_id.0 as usize].define_item(hir_func.name, def_id);
+                    functions.push(hir_func);
+                    func_def_id += 1;
+                }
+            }
+        }
+
+        // Register struct, enum, use, and mod declaration DefIds in the
+        // def_table and module_paths. These are registered once (not per-module)
+        // to avoid duplicate def_table entries and module_paths overwrites.
+        // We also register them in the appropriate module's scope so that
+        // `lookup_with_parent` can find them during use-import resolution.
+        for (i, s) in structs.iter().enumerate() {
+            let def_id = DefId(i as u32);
+            def_table.register(DefEntry {
+                module: s.module,
+                local_index: i as u32,
+                kind: DefKind::Struct,
+            });
+            module_paths.insert(def_id, s.module);
+            if let Some(scope) = module_scopes.get_mut(s.module.0 as usize) {
+                scope.define_item(s.name, def_id);
+            }
+        }
+        for (i, e) in enums.iter().enumerate() {
+            let def_id = DefId(e.def_id.0);
+            def_table.register(DefEntry {
+                module: e.module,
+                local_index: i as u32,
+                kind: DefKind::Enum,
+            });
+            module_paths.insert(def_id, e.module);
+            if let Some(scope) = module_scopes.get_mut(e.module.0 as usize) {
+                scope.define_item(e.name, def_id);
+            }
+        }
+        for ud in &use_decls {
+            let def_id = ud.def_id;
+            def_table.register(DefEntry {
+                module: ud.module,
+                local_index: use_decl_idx,
+                kind: DefKind::Use,
+            });
+            module_paths.insert(def_id, ud.module);
+            use_decl_idx += 1;
+        }
+        for md in &mod_decls {
+            let def_id = md.def_id;
+            def_table.register(DefEntry {
+                module: md.module,
+                local_index: mod_decl_idx,
+                kind: DefKind::Module,
+            });
+            module_paths.insert(def_id, md.module);
+            if let Some(scope) = module_scopes.get_mut(md.module.0 as usize) {
+                scope.define_item(md.name, def_id);
+            }
+            mod_decl_idx += 1;
+        }
+
+        // Phase 4: build the module vec from the graph.
+        let modules: Vec<Module> = graph.modules.clone();
+
+        Ok(HirProgram {
+            functions,
+            structs,
+            enums,
+            symbols: std::mem::take(&mut self.symbols),
+            modules,
+            root_module: ModuleId::ROOT,
+            module_paths,
+            def_table,
+            module_scopes,
+            use_decls,
+            mod_decls,
         })
     }
 
@@ -255,7 +926,9 @@ impl HirLower {
         &mut self,
         func: &Function,
         def_id: DefId,
+        module_id: ModuleId,
         ctx: &LowerContext,
+        visibility: HirVisibility,
     ) -> CompilerResult<HirFunction> {
         let name = self.symbols.intern(&func.name);
         let return_type = ast_type_to_hir(&func.return_type, &mut self.symbols, ctx.enum_names);
@@ -278,6 +951,8 @@ impl HirLower {
             return_type,
             body,
             span: span_to_source_span(&func.span),
+            module: module_id,
+            visibility,
         })
     }
 
@@ -511,11 +1186,40 @@ impl HirLower {
                 let l = self.lower_expr(lhs, scope, return_type, ctx)?;
                 let r = self.lower_expr(rhs, scope, return_type, ctx)?;
                 match op {
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
                         if l.ty != r.ty {
                             return Err(CompilerError::semantic(format!(
                                 "binary op {:?}: type mismatch {:?} vs {:?}",
                                 op, l.ty, r.ty
+                            )));
+                        }
+                        if !matches!(l.ty, HirType::I64 | HirType::F64 | HirType::Enum(_)) {
+                            return Err(CompilerError::semantic(format!(
+                                "binary op {:?}: operand type {:?} is not numeric",
+                                op, l.ty
+                            )));
+                        }
+                        Ok(HirExpr {
+                            kind: HirExprKind::Binary {
+                                op: *op,
+                                lhs: Box::new(l.clone()),
+                                rhs: Box::new(r),
+                            },
+                            ty: l.ty,
+                            span: span_to_source_span(span),
+                        })
+                    }
+                    BinOp::Mod => {
+                        if l.ty != r.ty {
+                            return Err(CompilerError::semantic(format!(
+                                "binary op {:?}: type mismatch {:?} vs {:?}",
+                                op, l.ty, r.ty
+                            )));
+                        }
+                        if l.ty != HirType::I64 {
+                            return Err(CompilerError::semantic(format!(
+                                "binary op {:?}: modulo is only supported for i64, got {:?}",
+                                op, l.ty
                             )));
                         }
                         Ok(HirExpr {
@@ -569,14 +1273,22 @@ impl HirLower {
                             span: span_to_source_span(span),
                         })
                     }
-                    UnOp::Not => Ok(HirExpr {
-                        kind: HirExprKind::Unary {
-                            op: *op,
-                            expr: Box::new(e),
-                        },
-                        ty: HirType::Bool,
-                        span: span_to_source_span(span),
-                    }),
+                    UnOp::Not => {
+                        if e.ty != HirType::Bool {
+                            return Err(CompilerError::semantic(format!(
+                                "cannot apply ! to {:?}: only bool is supported",
+                                e.ty
+                            )));
+                        }
+                        Ok(HirExpr {
+                            kind: HirExprKind::Unary {
+                                op: *op,
+                                expr: Box::new(e),
+                            },
+                            ty: HirType::Bool,
+                            span: span_to_source_span(span),
+                        })
+                    }
                 }
             }
             Expr::Call { func, args, span } => {
@@ -870,7 +1582,950 @@ pub fn lower_unit(program: &Program) -> CompilerResult<()> {
     lower(program).map(|_| ())
 }
 
+/// Lower an `ast::Program` using a [`ModuleGraph`] for multi-module support.
+///
+/// This is the Phase 5B entry point for the multi-module pipeline. It
+/// unifies the graph's [`SymbolInterner`], iterates every module in the
+/// graph, assigns correct [`ModuleId`]s, and resolves `mod` declarations
+/// to child module IDs.
+pub fn lower_with_graph(program: &Program, graph: &ModuleGraph) -> CompilerResult<HirProgram> {
+    let mut hir_lower = HirLower::new();
+    hir_lower.lower_program_with_graph(program, graph)
+}
+
+/// Convenience: lower a program with a module graph and return `Ok(())` or
+/// the first error.
+pub fn lower_unit_with_graph(program: &Program, graph: &ModuleGraph) -> CompilerResult<()> {
+    lower_with_graph(program, graph).map(|_| ())
+}
+
+/// Resolve `use` declarations across modules.
+///
+/// After HIR lowering, `HirUseDecl` entries contain interned path segments
+/// but their target `DefId`s are not yet resolved. This function walks each
+/// `use` declaration, resolves the path through the module graph, and
+/// registers the resolved `DefId` as an import in the declaring module's
+/// `ModuleScope`.
+///
+/// Path resolution rules:
+/// - The first path segment is a module name. We find the module whose
+///   `ModulePath::name()` matches (using the shared `SymbolInterner`).
+/// - Intermediate segments are resolved by walking the target module's
+///   `ModuleScope` via `lookup_with_parent` (Rust 2018 parent-chain model).
+/// - For multi-segment paths like `foo::bar::baz`, each intermediate segment
+///   may itself refer to a re-exported item, so we chain lookups.
+pub fn resolve_modules(hir: &mut HirProgram) -> CompilerResult<()> {
+    // Phase 1: Ensure all items are registered in their module_scopes.
+    // (Normally done during lowering, but we re-register here as a safety
+    // net so that lookup_with_parent can find structs, enums, and mod
+    // declarations when resolving `use` paths.)
+    for s in &hir.structs {
+        if let Some(scope) = hir.module_scopes.get_mut(s.module.0 as usize) {
+            scope.define_item(s.name, s.def_id);
+        }
+    }
+    for e in &hir.enums {
+        if let Some(scope) = hir.module_scopes.get_mut(e.module.0 as usize) {
+            scope.define_item(e.name, e.def_id);
+        }
+    }
+    for md in &hir.mod_decls {
+        if let Some(scope) = hir.module_scopes.get_mut(md.module.0 as usize) {
+            scope.define_item(md.name, md.def_id);
+        }
+    }
+
+    // Phase 2: Resolve each `use` declaration. Collect results first to
+    // avoid borrow checker issues, then apply in a second pass.
+    let mut resolutions: Vec<(usize, SymbolId, DefId)> = Vec::new();
+
+    for (use_idx, use_decl) in hir.use_decls.iter().enumerate() {
+        if use_decl.path.is_empty() {
+            return Err(CompilerError::semantic(format!(
+                "unresolved import: empty path in use declaration at {:?}",
+                use_decl.span
+            )));
+        }
+
+        let mut path_iter = use_decl.path.iter().copied();
+        let first_segment = path_iter.next().unwrap(); // guaranteed non-empty above
+
+        // Step 1: Find the module whose path name matches the first segment.
+        let first_name = hir.symbols.lookup(first_segment).ok_or_else(|| {
+            CompilerError::semantic(format!(
+                "unresolved import: cannot look up symbol {:?}",
+                first_segment
+            ))
+        })?;
+
+        // The root module has an empty path (name returns None), so it only
+        // matches when there is a single module in the graph (single-file case).
+        let target_module = hir
+            .modules
+            .iter()
+            .find(|m| m.path.name(&hir.symbols) == Some(first_name))
+            .filter(|m| !m.is_root() || hir.modules.len() == 1);
+
+        if let Some(target_mod) = target_module {
+            // Step 2: Walk remaining path segments through the target module's scope.
+            let mut current_module_id = target_mod.id;
+            let mut resolved_def_id: Option<DefId> = None;
+
+            for segment in path_iter {
+                let segment_name = hir.symbols.lookup(segment).ok_or_else(|| {
+                    CompilerError::semantic(format!(
+                        "unresolved import: cannot look up path segment {:?}",
+                        segment
+                    ))
+                })?;
+
+                let Some(target_scope) = hir.module_scope(current_module_id) else {
+                    return Err(CompilerError::semantic(format!(
+                        "unresolved import: no scope for module {:?}",
+                        current_module_id
+                    )));
+                };
+
+                match target_scope.lookup_with_parent(&segment, &hir.module_scopes) {
+                    Some(def_id) => {
+                        resolved_def_id = Some(def_id);
+                        // For module declarations, module_of returns the *parent*
+                        // module (where the `mod` was declared). We need to follow
+                        // into the child module instead. For other items (functions,
+                        // structs, enums), module_of returns the owning module,
+                        // which is correct for continuing the search.
+                        current_module_id = if let Some(entry) = hir.def_table.lookup(def_id) {
+                            if entry.kind == DefKind::Module {
+                                // Find the HirModDecl for this def_id to get
+                                // the child module_id.
+                                if let Some(mod_decl) =
+                                    hir.mod_decls.iter().find(|md| md.def_id == def_id)
+                                {
+                                    mod_decl.module_id.unwrap_or(current_module_id)
+                                } else {
+                                    current_module_id
+                                }
+                            } else {
+                                hir.module_of(def_id).unwrap_or(current_module_id)
+                            }
+                        } else {
+                            hir.module_of(def_id).unwrap_or(current_module_id)
+                        };
+                    }
+                    None => {
+                        let mod_name = hir
+                            .module(current_module_id)
+                            .and_then(|m| m.path.name(&hir.symbols))
+                            .unwrap_or("<root>");
+                        return Err(CompilerError::semantic(format!(
+                            "unresolved import: '{}' not found in module '{}'",
+                            segment_name, mod_name
+                        )));
+                    }
+                }
+            }
+
+            // If there were no remaining segments after the module name,
+            // the path was just the module name itself. We still register
+            // the module's DefId as the import target (e.g., `use foo;` where
+            // `foo` is a mod declaration).
+            let target_def_id = resolved_def_id.ok_or_else(|| {
+                CompilerError::semantic(format!(
+                    "unresolved import: '{}' is a module, not an item. \
+                     Use 'mod {};' to declare the module instead of importing it.",
+                    first_name, first_name
+                ))
+            })?;
+
+            resolutions.push((use_idx, use_decl.alias, target_def_id));
+        } else if use_decl.path.len() == 1 {
+            // Single-segment path that didn't match any module name:
+            // treat as an item in the current module's scope.
+            let Some(current_scope) = hir.module_scope(use_decl.module) else {
+                return Err(CompilerError::semantic(format!(
+                    "unresolved import: no scope for current module {:?}",
+                    use_decl.module
+                )));
+            };
+
+            match current_scope.lookup_with_parent(&first_segment, &hir.module_scopes) {
+                Some(def_id) => {
+                    resolutions.push((use_idx, use_decl.alias, def_id));
+                }
+                None => {
+                    return Err(CompilerError::semantic(format!(
+                        "unresolved import: '{}' not found in current module",
+                        first_name
+                    )));
+                }
+            }
+        } else {
+            return Err(CompilerError::semantic(format!(
+                "unresolved import: module '{}' not found",
+                first_name
+            )));
+        }
+    }
+
+    // Phase 3: Apply all resolutions — register imports in module_scopes.
+    for (use_idx, alias, target_def_id) in &resolutions {
+        let module_id = hir.use_decls[*use_idx].module;
+        if let Some(scope) = hir.module_scopes.get_mut(module_id.0 as usize) {
+            scope.define_import(*alias, *target_def_id);
+        }
+    }
+
+    Ok(())
+}
+
 /// Convert a `Range<usize>` to a `SourceSpan`.
 pub fn range_to_span(range: &std::ops::Range<usize>) -> SourceSpan {
     span_to_source_span(range)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5B unit tests: HIR module tracking
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{Item, ItemKind, Program, Visibility as AstVisibility};
+    use crate::lexer::Lexer;
+    use crate::parser;
+
+    /// Helper: lex + parse + lower a source string.
+    fn lower_src(src: &str) -> HirProgram {
+        let tokens: Vec<_> = Lexer::new(src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let program: Program = parser::parse(src, tokens).expect("parsing should succeed");
+        lower(&program).expect("lowering should succeed")
+    }
+
+    /// Helper: construct a `Program` from raw AST items.
+    fn program_from_items(items: Vec<Item>) -> Program {
+        Program::from_items(items)
+    }
+
+    #[test]
+    fn test_hir_program_has_root_module() {
+        let hir = lower_src("fn main() -> i64 { 0 }");
+        assert_eq!(hir.root_module, ModuleId::ROOT);
+        assert_eq!(hir.modules.len(), 1);
+        assert_eq!(hir.modules[0].id, ModuleId::ROOT);
+    }
+
+    #[test]
+    fn test_hir_function_has_root_module() {
+        let hir = lower_src("fn main() -> i64 { 0 }");
+        let main = hir.function_by_name("main").expect("main function");
+        assert_eq!(main.module, ModuleId::ROOT);
+        assert_eq!(main.visibility, HirVisibility::Private);
+    }
+
+    #[test]
+    fn test_hir_program_has_module_scopes() {
+        let hir = lower_src("fn main() -> i64 { 0 }");
+        assert_eq!(hir.module_scopes.len(), 1);
+        assert_eq!(hir.module_scopes[0].parent, None);
+    }
+
+    #[test]
+    fn test_hir_def_table_has_function_entry() {
+        let hir = lower_src("fn main() -> i64 { 0 }");
+        // main gets DefId(0)
+        let entry = hir.def_entry(DefId(0)).expect("def entry for main");
+        assert_eq!(entry.module, ModuleId::ROOT);
+        assert_eq!(entry.kind, DefKind::Function);
+    }
+
+    #[test]
+    fn test_hir_module_of_function() {
+        let hir = lower_src("fn main() -> i64 { 0 }");
+        let main = hir.function_by_name("main").expect("main function");
+        let module = hir.module_of(main.def_id).expect("module for main");
+        assert_eq!(module, ModuleId::ROOT);
+    }
+
+    #[test]
+    fn test_hir_module_paths_maps_defid_to_root() {
+        let hir = lower_src("fn main() -> i64 { 0 }");
+        let main = hir.function_by_name("main").expect("main function");
+        assert!(hir.module_paths.contains_key(&main.def_id));
+        assert_eq!(*hir.module_paths.get(&main.def_id).unwrap(), ModuleId::ROOT);
+    }
+
+    #[test]
+    fn test_hir_pub_visibility_propagated() {
+        let hir = lower_src("pub fn main() -> i64 { 0 }");
+        let main = hir.function_by_name("main").expect("main function");
+        assert_eq!(main.visibility, HirVisibility::Public);
+    }
+
+    #[test]
+    fn test_hir_private_visibility_default() {
+        let hir = lower_src("fn main() -> i64 { 0 }");
+        let main = hir.function_by_name("main").expect("main function");
+        assert_eq!(main.visibility, HirVisibility::Private);
+    }
+
+    #[test]
+    fn test_hir_struct_def_module_and_visibility() {
+        let hir = lower_src("fn main() -> i64 { struct Point { x: i64 } Point { x: 42 } 0 }");
+        assert!(!hir.structs.is_empty());
+        for s in &hir.structs {
+            assert_eq!(s.module, ModuleId::ROOT);
+            assert_eq!(s.visibility, HirVisibility::Private);
+        }
+    }
+
+    #[test]
+    fn test_hir_top_level_struct_recorded() {
+        let item = Item {
+            name: "Point".to_string(),
+            visibility: AstVisibility::Private,
+            kind: ItemKind::StructDef {
+                name: "Point".to_string(),
+                fields: vec![("x".to_string(), crate::ast::Type::I64)],
+                span: 0..10,
+            },
+            span: 0..10,
+        };
+        let program = program_from_items(vec![
+            item,
+            Item {
+                name: "main".to_string(),
+                visibility: AstVisibility::Private,
+                kind: ItemKind::Function(crate::ast::Function {
+                    name: "main".to_string(),
+                    params: vec![],
+                    return_type: crate::ast::Type::Unit,
+                    body: vec![],
+                    span: 0..10,
+                }),
+                span: 0..10,
+            },
+        ]);
+        let mut hir = lower(&program).expect("lowering should succeed");
+        assert!(!hir.structs.is_empty());
+        assert_eq!(hir.structs[0].name, hir.symbols.intern("Point"));
+        assert_eq!(hir.structs[0].module, ModuleId::ROOT);
+    }
+
+    #[test]
+    fn test_hir_use_decl_recorded() {
+        let item = Item {
+            name: "".to_string(),
+            visibility: AstVisibility::Private,
+            kind: ItemKind::UseDecl {
+                path: vec!["io".to_string(), "println".to_string()],
+                alias: None,
+            },
+            span: 0..10,
+        };
+        let program = program_from_items(vec![
+            item,
+            Item {
+                name: "main".to_string(),
+                visibility: AstVisibility::Private,
+                kind: ItemKind::Function(crate::ast::Function {
+                    name: "main".to_string(),
+                    params: vec![],
+                    return_type: crate::ast::Type::I64,
+                    body: vec![],
+                    span: 0..10,
+                }),
+                span: 0..10,
+            },
+        ]);
+        let hir = lower(&program).expect("lowering should succeed");
+        assert_eq!(hir.use_decls.len(), 1);
+        let udecl = &hir.use_decls[0];
+        assert_eq!(udecl.path.len(), 2);
+        assert_eq!(udecl.module, ModuleId::ROOT);
+    }
+
+    #[test]
+    fn test_hir_mod_decl_recorded() {
+        let item = Item {
+            name: "io".to_string(),
+            visibility: AstVisibility::Private,
+            kind: ItemKind::ModDecl,
+            span: 0..10,
+        };
+        let program = program_from_items(vec![
+            item,
+            Item {
+                name: "main".to_string(),
+                visibility: AstVisibility::Private,
+                kind: ItemKind::Function(crate::ast::Function {
+                    name: "main".to_string(),
+                    params: vec![],
+                    return_type: crate::ast::Type::I64,
+                    body: vec![],
+                    span: 0..10,
+                }),
+                span: 0..10,
+            },
+        ]);
+        let mut hir = lower(&program).expect("lowering should succeed");
+        assert_eq!(hir.mod_decls.len(), 1);
+        let mdecl = &hir.mod_decls[0];
+        assert_eq!(mdecl.name, hir.symbols.intern("io"));
+        assert_eq!(mdecl.module, ModuleId::ROOT);
+        assert!(mdecl.module_id.is_none()); // not resolved yet (Phase 6)
+    }
+
+    #[test]
+    fn test_hir_multiple_functions_all_in_root() {
+        let hir = lower_src("fn foo() -> i64 { 42 } fn main() -> i64 { foo() }");
+        assert_eq!(hir.functions.len(), 2);
+        for f in &hir.functions {
+            assert_eq!(f.module, ModuleId::ROOT);
+        }
+    }
+
+    #[test]
+    fn test_hir_def_table_entries_for_functions() {
+        let hir = lower_src("fn foo() -> i64 { 42 } fn main() -> i64 { foo() }");
+        let foo = hir.function_by_name("foo").expect("foo function");
+        let main = hir.function_by_name("main").expect("main function");
+        let foo_entry = hir.def_entry(foo.def_id).expect("foo def entry");
+        let main_entry = hir.def_entry(main.def_id).expect("main def entry");
+        assert_eq!(foo_entry.kind, DefKind::Function);
+        assert_eq!(main_entry.kind, DefKind::Function);
+        assert_eq!(foo_entry.module, ModuleId::ROOT);
+        assert_eq!(main_entry.module, ModuleId::ROOT);
+    }
+
+    #[test]
+    fn test_hir_root_module_path_is_empty() {
+        let hir = lower_src("fn main() -> i64 { 0 }");
+        let root = hir.module(ModuleId::ROOT).expect("root module");
+        assert!(root.path.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Phase 5B tests: lower_program_with_graph
+    // ---------------------------------------------------------------------------
+
+    /// Helper: build a minimal single-module ModuleGraph with the given AST
+    /// attached to the root module.
+    fn graph_with_root_ast(program: &Program) -> ModuleGraph {
+        let mut graph = ModuleGraph::new();
+        let root_module = Module::new(
+            ModuleId::ROOT,
+            crate::module::ModulePath::new(),
+            std::path::PathBuf::from("<root>"),
+        );
+        graph.add_module(root_module);
+        // Attach the AST to the root module.
+        graph.modules[0].ast = Some(program.clone());
+        graph
+    }
+
+    /// Helper: build a two-module graph (root + child) with the given ASTs.
+    fn graph_with_child(
+        root_program: &Program,
+        child_name: &str,
+        child_program: &Program,
+    ) -> ModuleGraph {
+        let mut graph = ModuleGraph::new();
+
+        // Root module
+        let mut root_module = Module::new(
+            ModuleId::ROOT,
+            crate::module::ModulePath::new(),
+            std::path::PathBuf::from("<root>"),
+        );
+        // Record the mod declaration so the child is discoverable.
+        root_module.mod_declarations = vec![child_name.to_string()];
+        root_module.ast = Some(root_program.clone());
+        graph.add_module(root_module);
+
+        // Child module
+        let segment = graph.symbol_interner.intern(child_name);
+        let child_path = crate::module::ModulePath::from_segments(vec![segment]);
+        let mut child_module = Module::new(
+            ModuleId(1),
+            child_path,
+            std::path::PathBuf::from(format!("<root>/{child_name}")),
+        );
+        child_module.parent = Some(ModuleId::ROOT);
+        child_module.ast = Some(child_program.clone());
+        graph.add_module(child_module);
+
+        graph
+    }
+
+    #[test]
+    fn test_graph_lower_single_file_matches_lower_program() {
+        // For a single-file program (root-only graph), lower_program_with_graph
+        // should produce identical results to lower_program.
+        let src = "fn main() -> i64 { 0 }";
+        let tokens: Vec<_> = Lexer::new(src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let program: Program = parser::parse(src, tokens).expect("parsing should succeed");
+
+        // Standard lowering
+        let hir_standard = lower(&program).expect("standard lowering should succeed");
+
+        // Graph-based lowering with a root-only graph
+        let graph = graph_with_root_ast(&program);
+        let mut hir_lower = HirLower::new();
+        let hir_graph = hir_lower
+            .lower_program_with_graph(&program, &graph)
+            .expect("graph lowering should succeed");
+
+        // Core items should be the same
+        assert_eq!(hir_standard.functions.len(), hir_graph.functions.len());
+        assert_eq!(hir_standard.functions[0].name, hir_graph.functions[0].name);
+        assert_eq!(
+            hir_standard.functions[0].module,
+            hir_graph.functions[0].module
+        );
+
+        // Module fields should be populated
+        assert_eq!(hir_graph.modules.len(), 1);
+        assert_eq!(hir_graph.modules[0].id, ModuleId::ROOT);
+        assert_eq!(hir_graph.root_module, ModuleId::ROOT);
+    }
+
+    #[test]
+    fn test_graph_lower_populates_module_scopes() {
+        let src = "fn main() -> i64 { 0 }";
+        let tokens: Vec<_> = Lexer::new(src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let program: Program = parser::parse(src, tokens).expect("parsing should succeed");
+
+        let graph = graph_with_root_ast(&program);
+        let mut hir_lower = HirLower::new();
+        let hir = hir_lower
+            .lower_program_with_graph(&program, &graph)
+            .expect("graph lowering should succeed");
+
+        assert_eq!(hir.module_scopes.len(), 1);
+        assert_eq!(hir.module_scopes[0].parent, None);
+    }
+
+    #[test]
+    fn test_graph_lower_multi_module_assigns_correct_module_ids() {
+        let root_src = "fn main() -> i64 { 0 }";
+        let child_src = "fn helper() -> i64 { 42 }";
+
+        let root_tokens: Vec<_> = Lexer::new(root_src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let root_program: Program =
+            parser::parse(root_src, root_tokens).expect("parsing should succeed");
+
+        let child_tokens: Vec<_> = Lexer::new(child_src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let child_program: Program =
+            parser::parse(child_src, child_tokens).expect("parsing should succeed");
+
+        let graph = graph_with_child(&root_program, "io", &child_program);
+        let mut hir_lower = HirLower::new();
+        let hir = hir_lower
+            .lower_program_with_graph(&root_program, &graph)
+            .expect("multi-module lowering should succeed");
+
+        // Two modules in the graph
+        assert_eq!(hir.modules.len(), 2);
+        assert_eq!(hir.modules[0].id, ModuleId::ROOT);
+        assert_eq!(hir.modules[1].id, ModuleId(1));
+
+        // Root module has main, child module has helper
+        let main = hir.function_by_name("main").expect("main function");
+        let helper = hir.function_by_name("helper").expect("helper function");
+        assert_eq!(main.module, ModuleId::ROOT);
+        assert_eq!(helper.module, ModuleId(1));
+
+        // Module scopes: root has no parent, child's parent is ROOT
+        assert_eq!(hir.module_scopes.len(), 2);
+        assert_eq!(hir.module_scopes[0].parent, None);
+        assert_eq!(hir.module_scopes[1].parent, Some(ModuleId::ROOT));
+
+        // module_paths should map each function to its owning module
+        assert_eq!(*hir.module_paths.get(&main.def_id).unwrap(), ModuleId::ROOT);
+        assert_eq!(*hir.module_paths.get(&helper.def_id).unwrap(), ModuleId(1));
+
+        // def_table entries should have correct module IDs
+        let main_entry = hir.def_entry(main.def_id).expect("main def entry");
+        let helper_entry = hir.def_entry(helper.def_id).expect("helper def entry");
+        assert_eq!(main_entry.module, ModuleId::ROOT);
+        assert_eq!(helper_entry.module, ModuleId(1));
+    }
+
+    #[test]
+    fn test_graph_lower_resolves_mod_decl() {
+        let root_src = "mod io\nfn main() -> i64 { 0 }";
+        let child_src = "fn helper() -> i64 { 42 }";
+
+        let root_tokens: Vec<_> = Lexer::new(root_src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let root_program: Program =
+            parser::parse(root_src, root_tokens).expect("parsing should succeed");
+
+        let child_tokens: Vec<_> = Lexer::new(child_src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let child_program: Program =
+            parser::parse(child_src, child_tokens).expect("parsing should succeed");
+
+        let graph = graph_with_child(&root_program, "io", &child_program);
+        let mut hir_lower = HirLower::new();
+        let mut hir = hir_lower
+            .lower_program_with_graph(&root_program, &graph)
+            .expect("multi-module lowering should succeed");
+
+        // The mod declaration should be resolved to child ModuleId(1)
+        assert_eq!(hir.mod_decls.len(), 1);
+        let mdecl = &hir.mod_decls[0];
+        assert_eq!(mdecl.name, hir.symbols.intern("io"));
+        assert_eq!(mdecl.module, ModuleId::ROOT);
+        assert_eq!(mdecl.module_id, Some(ModuleId(1)));
+    }
+
+    #[test]
+    fn test_graph_lower_unresolved_mod_decl() {
+        // Root has a mod declaration for a module NOT in the graph.
+        let root_src = "mod missing\nfn main() -> i64 { 0 }";
+        let root_tokens: Vec<_> = Lexer::new(root_src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let root_program: Program =
+            parser::parse(root_src, root_tokens).expect("parsing should succeed");
+
+        let graph = graph_with_root_ast(&root_program);
+        let mut hir_lower = HirLower::new();
+        let mut hir = hir_lower
+            .lower_program_with_graph(&root_program, &graph)
+            .expect("lowering should succeed even with unresolved mod");
+
+        assert_eq!(hir.mod_decls.len(), 1);
+        let mdecl = &hir.mod_decls[0];
+        assert_eq!(mdecl.name, hir.symbols.intern("missing"));
+        // module_id should be None since "missing" was not found in the graph
+        assert!(mdecl.module_id.is_none());
+    }
+
+    #[test]
+    fn test_graph_lower_use_decl_in_child_module() {
+        let root_src = "fn main() -> i64 { 0 }";
+        let child_src = "use foo::bar\nfn helper() -> i64 { 42 }";
+
+        let root_tokens: Vec<_> = Lexer::new(root_src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let root_program: Program =
+            parser::parse(root_src, root_tokens).expect("parsing should succeed");
+
+        let child_tokens: Vec<_> = Lexer::new(child_src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let child_program: Program =
+            parser::parse(child_src, child_tokens).expect("parsing should succeed");
+
+        let graph = graph_with_child(&root_program, "utils", &child_program);
+        let mut hir_lower = HirLower::new();
+        let hir = hir_lower
+            .lower_program_with_graph(&root_program, &graph)
+            .expect("lowering should succeed");
+
+        assert_eq!(hir.use_decls.len(), 1);
+        let udecl = &hir.use_decls[0];
+        assert_eq!(udecl.module, ModuleId(1));
+    }
+
+    #[test]
+    fn test_analyze_and_lower_with_graph_backward_compat() {
+        // Single-file: analyze_and_lower_with_graph should work with a root-only graph
+        let src = "fn main() -> i64 { 0 }";
+        let tokens: Vec<_> = Lexer::new(src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let program: Program = parser::parse(src, tokens).expect("parsing should succeed");
+
+        let graph = graph_with_root_ast(&program);
+        let hir = crate::semantic::analyze_and_lower_with_graph(&program, &graph)
+            .expect("analyze_and_lower_with_graph should succeed");
+
+        assert_eq!(hir.modules.len(), 1);
+        assert_eq!(hir.modules[0].id, ModuleId::ROOT);
+        assert_eq!(hir.root_module, ModuleId::ROOT);
+    }
+
+    // --- resolve_modules tests ---
+
+    #[test]
+    fn test_resolve_modules_imports_function_from_child() {
+        // Root declares `mod utils` pointing to a child module that
+        // defines `fn helper() -> i64 { 42 }`.
+        // Child module does `use utils::helper`.
+        let root_src = "mod utils struct Foo { } fn main() -> i64 { 0 }";
+        let child_src = "fn helper() -> i64 { 42 }";
+
+        let root_tokens: Vec<_> = Lexer::new(root_src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let root_program: Program =
+            parser::parse(root_src, root_tokens).expect("parsing should succeed");
+
+        let child_tokens: Vec<_> = Lexer::new(child_src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let child_program: Program =
+            parser::parse(child_src, child_tokens).expect("parsing should succeed");
+
+        let graph = graph_with_child(&root_program, "utils", &child_program);
+        let mut hir = HirLower::new()
+            .lower_program_with_graph(&root_program, &graph)
+            .expect("lowering should succeed");
+        resolve_modules(&mut hir).expect("resolve_modules should succeed");
+
+        // The root module should have a mod_decl item registered for "utils".
+        let root_scope = &hir.module_scopes[0];
+        let utils_sym = hir.symbols.intern("utils");
+        // The mod declaration for "utils" should be findable via lookup_with_parent
+        let utils_def = root_scope.lookup_with_parent(&utils_sym, &hir.module_scopes);
+        assert!(
+            utils_def.is_some(),
+            "mod 'utils' should be registered in root scope"
+        );
+    }
+
+    #[test]
+    fn test_resolve_modules_unresolved_module() {
+        // A use declaration that references a module that doesn't exist.
+        // With only a single root module, `use nonexistent::item` should fail.
+        let src = "use nonexistent::item fn main() -> i64 { 0 }";
+
+        let tokens: Vec<_> = Lexer::new(src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let program: Program = parser::parse(src, tokens).expect("parsing should succeed");
+
+        let graph = graph_with_root_ast(&program);
+        let mut hir = HirLower::new()
+            .lower_program_with_graph(&program, &graph)
+            .expect("lowering should succeed");
+        let result = resolve_modules(&mut hir);
+        assert!(result.is_err(), "should fail with unresolved import");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unresolved import"),
+            "error should mention unresolved import, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_resolve_modules_single_segment_import() {
+        // Single-segment path that doesn't match a module: `use helper;`
+        // where `helper` is defined as a function in the same module.
+        let src = "fn helper() -> i64 { 42 } use helper fn main() -> i64 { helper() }";
+
+        let tokens: Vec<_> = Lexer::new(src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let program: Program = parser::parse(src, tokens).expect("parsing should succeed");
+
+        let graph = graph_with_root_ast(&program);
+        let mut hir = HirLower::new()
+            .lower_program_with_graph(&program, &graph)
+            .expect("lowering should succeed");
+        resolve_modules(&mut hir).expect("resolve_modules should succeed");
+
+        // The use declaration should have registered an import for "helper"
+        let root_scope = &hir.module_scopes[0];
+        let helper_sym = hir.symbols.intern("helper");
+        let imported = root_scope.imports.get(&helper_sym);
+        assert!(
+            imported.is_some(),
+            "helper should be registered as an import"
+        );
+    }
+
+    #[test]
+    fn test_resolve_modules_registers_struct_in_scope() {
+        // Verify that structs are registered in module_scopes by resolve_modules.
+        let src = "struct Point { x: i64, y: i64 } fn main() -> i64 { 0 }";
+
+        let tokens: Vec<_> = Lexer::new(src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let program: Program = parser::parse(src, tokens).expect("parsing should succeed");
+
+        let graph = graph_with_root_ast(&program);
+        let mut hir = HirLower::new()
+            .lower_program_with_graph(&program, &graph)
+            .expect("lowering should succeed");
+        resolve_modules(&mut hir).expect("resolve_modules should succeed");
+
+        let root_scope = &hir.module_scopes[0];
+        let point_sym = hir.symbols.intern("Point");
+        let def_id = root_scope.lookup(&point_sym);
+        assert!(
+            def_id.is_some(),
+            "struct Point should be registered in root scope"
+        );
+    }
+
+    #[test]
+    fn test_resolve_modules_registers_mod_decl_in_scope() {
+        // Verify that mod declarations are registered in module_scopes.
+        let root_src = "mod utils fn main() -> i64 { 0 }";
+        let child_src = "fn helper() -> i64 { 42 }";
+
+        let root_tokens: Vec<_> = Lexer::new(root_src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let root_program: Program =
+            parser::parse(root_src, root_tokens).expect("parsing should succeed");
+
+        let child_tokens: Vec<_> = Lexer::new(child_src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let child_program: Program =
+            parser::parse(child_src, child_tokens).expect("parsing should succeed");
+
+        let graph = graph_with_child(&root_program, "utils", &child_program);
+        let mut hir = HirLower::new()
+            .lower_program_with_graph(&root_program, &graph)
+            .expect("lowering should succeed");
+        resolve_modules(&mut hir).expect("resolve_modules should succeed");
+
+        // "utils" should be findable as a mod declaration in root scope
+        let root_scope = &hir.module_scopes[0];
+        let utils_sym = hir.symbols.intern("utils");
+        let def_id = root_scope.lookup(&utils_sym);
+        assert!(
+            def_id.is_some(),
+            "mod 'utils' should be in root scope items"
+        );
+    }
+
+    #[test]
+    fn test_resolve_modules_cross_module_use_import() {
+        // Root module: `mod utils` + `fn helper() -> i64 { 42 }`
+        // Child module (utils): `use crate::helper` (importing from parent)
+        //
+        // Actually, in this language, `use foo::bar` means "find module foo,
+        // then look up bar in foo's scope". So `use utils::helper` from the
+        // root module would look for module "utils" and then "helper" in it.
+        //
+        // For a true cross-module import, we need:
+        // Root: `mod utils` + `fn main() -> i64 { 0 }`
+        // Child (utils): `use root::main` — but "root" isn't a module name.
+        //
+        // Instead, let's test: root defines `fn helper() -> i64 { 42 }`,
+        // child does `use root::helper` where "root" is the module name.
+        // But the root module's name is "crate" (or None for empty path).
+        //
+        // Better approach: two child modules, child2 imports from child1.
+        // Root: `mod lib fn main() -> i64 { 0 }`
+        // Child1 (lib): `fn helper() -> i64 { 42 }`
+        // Child2: `use lib::helper`
+        //
+        // But graph_with_child only supports one child. Let me build a 3-module graph.
+        let root_src = "mod lib mod app fn main() -> i64 { 0 }";
+        let lib_src = "fn helper() -> i64 { 42 }";
+        let app_src = "use lib::helper fn run() -> i64 { helper() }";
+
+        let root_tokens: Vec<_> = Lexer::new(root_src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let root_program: Program =
+            parser::parse(root_src, root_tokens).expect("parsing should succeed");
+
+        let lib_tokens: Vec<_> = Lexer::new(lib_src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let lib_program: Program =
+            parser::parse(lib_src, lib_tokens).expect("parsing should succeed");
+
+        let app_tokens: Vec<_> = Lexer::new(app_src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let app_program: Program =
+            parser::parse(app_src, app_tokens).expect("parsing should succeed");
+
+        // Build a 3-module graph manually: root + lib + app
+        let mut graph = ModuleGraph::new();
+
+        // Root module
+        let mut root_mod = Module::new(
+            ModuleId::ROOT,
+            crate::module::ModulePath::new(),
+            std::path::PathBuf::from("<root>"),
+        );
+        root_mod.mod_declarations = vec!["lib".to_string(), "app".to_string()];
+        root_mod.ast = Some(root_program.clone());
+        graph.add_module(root_mod);
+
+        // lib child module
+        let lib_segment = graph.symbol_interner.intern("lib");
+        let lib_path = crate::module::ModulePath::from_segments(vec![lib_segment]);
+        let mut lib_mod = Module::new(
+            ModuleId::new(1),
+            lib_path,
+            std::path::PathBuf::from("<root>/lib"),
+        );
+        lib_mod.parent = Some(ModuleId::ROOT);
+        lib_mod.ast = Some(lib_program.clone());
+        graph.add_module(lib_mod);
+
+        // app child module
+        let app_segment = graph.symbol_interner.intern("app");
+        let app_path = crate::module::ModulePath::from_segments(vec![app_segment]);
+        let mut app_mod = Module::new(
+            ModuleId::new(2),
+            app_path,
+            std::path::PathBuf::from("<root>/app"),
+        );
+        app_mod.parent = Some(ModuleId::ROOT);
+        app_mod.ast = Some(app_program.clone());
+        graph.add_module(app_mod);
+
+        let mut hir = HirLower::new()
+            .lower_program_with_graph(&root_program, &graph)
+            .expect("lowering should succeed");
+        resolve_modules(&mut hir).expect("resolve_modules should succeed");
+
+        // The "app" module (ModuleId 2) should have an import for "helper"
+        // pointing to the same DefId as the `helper` function in the "lib" module.
+        let app_scope = &hir.module_scopes[2];
+        let helper_alias = hir.symbols.intern("helper");
+        let imported_def_id = app_scope.imports.get(&helper_alias);
+        assert!(
+            imported_def_id.is_some(),
+            "helper should be registered as an import in the app module"
+        );
+
+        // Verify the import points to the correct function in the lib module
+        let target_def_id = imported_def_id.unwrap();
+        let target_module = hir.module_of(*target_def_id);
+        assert_eq!(
+            target_module,
+            Some(ModuleId::new(1)),
+            "imported function should come from the lib module"
+        );
+
+        // Also verify the imported DefId matches the helper function's DefId
+        let helper_func = hir
+            .functions
+            .iter()
+            .find(|f| hir.symbols.lookup(f.name) == Some("helper"))
+            .expect("helper function should exist");
+        assert_eq!(
+            *target_def_id, helper_func.def_id,
+            "imported DefId should match helper's DefId"
+        );
+    }
 }

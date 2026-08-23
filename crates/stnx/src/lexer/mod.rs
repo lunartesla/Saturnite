@@ -48,6 +48,14 @@ pub enum LexicalToken {
     Struct,
     #[token("enum")]
     Enum,
+    #[token("mod")]
+    Mod,
+    #[token("use")]
+    Use,
+    #[token("pub")]
+    Pub,
+    #[token("as")]
+    As,
 
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
@@ -196,6 +204,10 @@ fn convert(lt: LexicalToken) -> TokenKind {
         LexicalToken::Println => TokenKind::Println,
         LexicalToken::Struct => TokenKind::Struct,
         LexicalToken::Enum => TokenKind::Enum,
+        LexicalToken::Mod => TokenKind::Mod,
+        LexicalToken::Use => TokenKind::Use,
+        LexicalToken::Pub => TokenKind::Pub,
+        LexicalToken::As => TokenKind::As,
         LexicalToken::Ident(s) => TokenKind::Ident(s),
         LexicalToken::Integer(s) => match s.parse::<i64>() {
             Ok(n) => TokenKind::Integer(n),
@@ -237,5 +249,104 @@ fn convert(lt: LexicalToken) -> TokenKind {
         LexicalToken::Colon => TokenKind::Colon,
         LexicalToken::RArrow => TokenKind::RArrow,
         LexicalToken::Error => TokenKind::Error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: lex a source string and collect the resulting `TokenKind`s.
+    fn lex_kinds(src: &str) -> Vec<TokenKind> {
+        Lexer::new(src)
+            .collect::<Result<Vec<Token>, _>>()
+            .map(|tokens| tokens.into_iter().map(|t| t.kind).collect())
+            .expect("lexing should succeed")
+    }
+
+    // --- mod / use / pub / as keyword tests (Phase 5A) ---
+
+    #[test]
+    fn test_mod_keyword() {
+        let tokens = lex_kinds("mod");
+        assert_eq!(tokens, vec![TokenKind::Mod]);
+    }
+
+    #[test]
+    fn test_use_keyword() {
+        let tokens = lex_kinds("use");
+        assert_eq!(tokens, vec![TokenKind::Use]);
+    }
+
+    #[test]
+    fn test_pub_keyword() {
+        let tokens = lex_kinds("pub");
+        assert_eq!(tokens, vec![TokenKind::Pub]);
+    }
+
+    #[test]
+    fn test_as_keyword_is_reserved() {
+        // `as` is reserved for future rename syntax (Phase 6). It must lex as
+        // the As keyword token, not as a plain identifier.
+        let tokens = lex_kinds("as");
+        assert_eq!(tokens, vec![TokenKind::As]);
+    }
+
+    #[test]
+    fn test_mod_decl_tokens() {
+        let tokens = lex_kinds("mod io");
+        assert_eq!(
+            tokens,
+            vec![TokenKind::Mod, TokenKind::Ident("io".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_pub_mod_tokens() {
+        let tokens = lex_kinds("pub mod io");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Pub,
+                TokenKind::Mod,
+                TokenKind::Ident("io".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_use_path_tokens() {
+        let tokens = lex_kinds("use io::println");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Use,
+                TokenKind::Ident("io".to_string()),
+                TokenKind::DoubleColon,
+                TokenKind::Println,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_all_module_keywords_are_distinct() {
+        let src = "mod use pub as";
+        let tokens = lex_kinds(src);
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Mod,
+                TokenKind::Use,
+                TokenKind::Pub,
+                TokenKind::As,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_mod_not_confused_with_identifier() {
+        // Identifier "modern" must not be split into Mod + Ident
+        let tokens = lex_kinds("modern");
+        assert_eq!(tokens, vec![TokenKind::Ident("modern".to_string())]);
     }
 }

@@ -517,8 +517,181 @@ fn test_f64_function_call() {
     // Regression test: f64-returning functions were previously declared
     // with `i64` return type in LLVM IR.  This test verifies the function
     // declares with `double` and runs without crashing.
-    // (f64 arithmetic in gen_binop is a separate, pre-existing bug.)
     let bin = compile_src("fn half(n: f64) -> f64 { return n } fn main() -> i64 { return 0 }");
     let (code, _) = bin.run();
     assert_eq!(code, 0, "f64 function should compile and run");
+}
+
+// --- Floating-point binary operation runtime tests ---
+// These programs observe floating-point results by feeding them into
+// integer comparisons and println, since the language has no f64 printing
+// facility.
+
+#[test]
+fn test_float_add_runtime() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         let a = 1.5 \
+         let b = 2.5 \
+         if a + b == 4.0 { return 1 } \
+         return 0 }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 1, "1.5 + 2.5 should equal 4.0");
+}
+
+#[test]
+fn test_float_sub_runtime() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         let a = 10.0 \
+         let b = 1.5 \
+         if a - b == 8.5 { return 1 } \
+         return 0 }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 1, "10.0 - 1.5 should equal 8.5");
+}
+
+#[test]
+fn test_float_mul_runtime() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         let a = 2.0 \
+         let b = 3.5 \
+         if a * b == 7.0 { return 1 } \
+         return 0 }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 1, "2.0 * 3.5 should equal 7.0");
+}
+
+#[test]
+fn test_float_div_runtime() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         let a = 10.0 \
+         let b = 2.0 \
+         if a / b == 5.0 { return 1 } \
+         return 0 }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 1, "10.0 / 2.0 should equal 5.0");
+}
+
+#[test]
+fn test_float_compare_eq_runtime() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         let a = 5.5 \
+         let b = 5.5 \
+         if a == b { return 1 } \
+         return 0 }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 1, "5.5 == 5.5 should be true");
+}
+
+#[test]
+fn test_float_compare_ne_runtime() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         let a = 5.5 \
+         let b = 6.5 \
+         if a != b { return 1 } \
+         return 0 }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 1, "5.5 != 6.5 should be true");
+}
+
+#[test]
+fn test_float_compare_lt_runtime() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         let a = 3.0 \
+         let b = 5.0 \
+         if a < b { return 1 } \
+         return 0 }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 1, "3.0 < 5.0 should be true");
+}
+
+#[test]
+fn test_float_compare_gt_runtime() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         let a = 5.0 \
+         let b = 3.0 \
+         if a > b { return 1 } \
+         return 0 }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 1, "5.0 > 3.0 should be true");
+}
+
+#[test]
+fn test_float_compare_le_runtime() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         let a = 5.0 \
+         let b = 5.0 \
+         if a <= b { return 1 } \
+         return 0 }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 1, "5.0 <= 5.0 should be true");
+}
+
+#[test]
+fn test_float_compare_ge_runtime() {
+    let bin = compile_src(
+        "fn main() -> i64 { \
+         let a = 5.0 \
+         let b = 5.0 \
+         if a >= b { return 1 } \
+         return 0 }",
+    );
+    let (code, _) = bin.run();
+    assert_eq!(code, 1, "5.0 >= 5.0 should be true");
+}
+
+// --- Cross-function f64 test (Phase 8) ---
+
+#[test]
+fn test_cross_function_f64_runtime() {
+    // This test guards against regressions in:
+    // - f64 function signatures
+    // - f64 return values
+    // - f64 call ABI
+    // - floating-point operations
+    // - floating-point comparison
+    let bin = compile_src(
+        "fn compute() -> f64 { \
+         let a = 10.0 \
+         let b = 2.0 \
+         return a / b } \
+         fn verify() -> bool { \
+         return compute() == 5.0 } \
+         fn main() -> i64 { \
+         if verify() { \
+         println(1) \
+         return 0 } \
+         println(0) \
+         return 1 }",
+    );
+    let (code, stdout) = bin.run();
+    assert_eq!(code, 0, "cross-function f64 test should return 0");
+    assert_eq!(stdout.trim(), "1", "verify() should be true, printing 1");
+}
+
+#[test]
+fn test_float_mixed_type_rejected() {
+    // Phase 9: mixed-type arithmetic (1 + 2.0) should be rejected by semantic analysis
+    let result = common::analyze_src("fn main() -> i64 { let x = 1 + 2.0 0 }");
+    assert!(
+        result.is_err(),
+        "Mixed int + float should be rejected by semantic analysis"
+    );
 }

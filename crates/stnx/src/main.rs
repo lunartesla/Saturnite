@@ -4,7 +4,8 @@ use stnx::codegen;
 use stnx::mir::codegen::{compile_from_mir_ext, generate_ir_from_mir};
 use stnx::mir::lower::lower_program;
 use stnx::mir::opt::optimize;
-use stnx::target::{DebugInfo, OptimizationLevel, OutputKind, TargetConfig};
+use stnx::module::Project;
+use stnx::target::{DebugInfo, OptimizationLevel, OutputKind, Profile, TargetConfig};
 // `CompilerError` carries the variants that `render_diagnostic` pattern-matches on.
 use stnx::CompilerError;
 
@@ -16,27 +17,6 @@ use stnx::CompilerError;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-}
-
-/// Build profile: debug or release
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-enum Profile {
-    #[default]
-    Debug,
-    Release,
-}
-
-impl Profile {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Profile::Debug => "debug",
-            Profile::Release => "release",
-        }
-    }
-
-    fn is_release(&self) -> bool {
-        matches!(self, Profile::Release)
-    }
 }
 
 #[derive(Subcommand)]
@@ -102,9 +82,9 @@ enum Commands {
 
     /// Check a source file for type and semantic errors without generating code
     Check {
-        /// Input source file
-        #[arg(value_name = "FILE")]
-        input: PathBuf,
+        /// Input source file (defaults to src/main.stnx)
+        #[arg(value_name = "FILE", required = false)]
+        input: Option<PathBuf>,
 
         /// Cross-compilation target triple (affects target-dependent checks)
         #[arg(long, value_name = "TRIPLE")]
@@ -113,9 +93,9 @@ enum Commands {
 
     /// Run a source file directly (build to a temp dir, then execute)
     Run {
-        /// Input source file
-        #[arg(value_name = "FILE")]
-        input: PathBuf,
+        /// Input source file (defaults to src/main.stnx)
+        #[arg(value_name = "FILE", required = false)]
+        input: Option<PathBuf>,
 
         /// Debug build
         #[arg(long, conflicts_with = "release")]
@@ -186,12 +166,25 @@ fn main() -> anyhow::Result<()> {
                 Profile::default()
             };
 
-            // Exactly one input file is required unless --print-target was set.
-            let input = input.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "an input file is required. Usage: saturnite build <FILE> [OPTIONS]"
-                )
-            })?;
+            // Resolve the entry point: when no input file is given, discover
+            // the project from the current directory and use its default entry
+            // (src/main.stnx). When a file is given, behavior is unchanged.
+            let (entry_path, package_name) = match &input {
+                Some(input) => (input.clone(), None),
+                None => {
+                    let cwd = std::env::current_dir()?;
+                    let project = Project::discover(&cwd)?;
+                    let entry = project.source_root.join("main.stnx");
+                    if !entry.is_file() {
+                        return Err(anyhow::anyhow!(
+                            "no entry point found: expected {} (create a saturn.toml project with src/main.stnx or pass a file explicitly)",
+                            entry.display()
+                        ));
+                    }
+                    let pkg = project.config.package.name.clone();
+                    (entry, Some(pkg))
+                }
+            };
 
             // Validate that at most one emit mode is selected.
             let emit_count =
@@ -207,7 +200,9 @@ fn main() -> anyhow::Result<()> {
                 ));
             }
 
-            // Build target configuration
+            // Build target configuration and apply the profile defaults
+            // (optimization level + debug-info).  An explicit `--opt-level`
+            // override is applied afterwards so it still takes precedence.
             let mut config = if let Some(triple) = &target {
                 TargetConfig::from_triple(triple)
                     .map_err(|e| anyhow::anyhow!("Invalid target '{}': {}", triple, e))?
@@ -215,8 +210,8 @@ fn main() -> anyhow::Result<()> {
                 TargetConfig::host()
                     .map_err(|e| anyhow::anyhow!("Failed to initialize native target: {}", e))?
             };
+            config.apply_profile(profile);
 
-            // Apply optimization level and debug info
             match opt_level {
                 Some(0) => {
                     config.set_opt_level(OptimizationLevel::None);
@@ -230,27 +225,19 @@ fn main() -> anyhow::Result<()> {
                         "optimization level must be between 0 and 3"
                     ))
                 }
-                None => {
-                    if profile.is_release() {
-                        config.set_opt_level(OptimizationLevel::Aggressive);
-                        config.set_debug_info(DebugInfo::No);
-                    } else {
-                        config.set_opt_level(OptimizationLevel::None);
-                        config.set_debug_info(DebugInfo::Yes);
-                    }
-                }
+                None => {} // profile defaults already applied above
             }
 
             // Determine output path and emit mode
             let (emit_path, output_kind) = resolve_output(
-                &input,
+                &entry_path,
                 &output,
                 &profile,
+                package_name.as_deref(),
                 emit_ir,
                 emit_object,
                 emit_exe,
                 no_link,
-                &target,
             );
 
             if verbose {
@@ -259,15 +246,12 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("output: {}", emit_path.display());
             }
 
-            let src = std::fs::read_to_string(&input)
-                .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", input.display(), e))?;
-
-            let tokens: Vec<_> = stnx::lexer::Lexer::new(&src)
-                .by_ref()
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| anyhow::anyhow!("Lex error: {}", e))?;
-
-            let program = stnx::parser::parse(&src, tokens).map_err(render_diagnostic)?;
+            let mut project = Project::discover(&entry_path)?;
+            let program = if input.is_some() {
+                project.load_from(&entry_path)?
+            } else {
+                project.load()?
+            };
             let hir = stnx::semantic::analyze_and_lower(&program).map_err(render_diagnostic)?;
 
             // Lower HIR → MIR (the single production codegen seam).
@@ -367,7 +351,7 @@ fn main() -> anyhow::Result<()> {
                 };
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
             } else {
-                println!("Built {} -> {}", input.display(), emit_path.display());
+                println!("Built {} -> {}", entry_path.display(), emit_path.display());
                 if verbose {
                     println!("({} ms)", elapsed.as_millis());
                 }
@@ -376,9 +360,23 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
 
-        Commands::Check { input, target } => {
-            check_file(&input, target.as_deref())?;
-            println!("No errors found in {}", input.display());
+        Commands::Check { input, target: _ } => {
+            let entry = if let Some(ref input) = input {
+                input.clone()
+            } else {
+                let cwd = std::env::current_dir()?;
+                let project = Project::discover(&cwd)?;
+                let entry = project.source_root.join("main.stnx");
+                if !entry.is_file() {
+                    return Err(anyhow::anyhow!(
+                        "no entry point found: expected {} (create a saturn.toml project with src/main.stnx or pass a file explicitly)",
+                        entry.display()
+                    ));
+                }
+                entry
+            };
+            check_file(&entry)?;
+            println!("No errors found in {}", entry.display());
             Ok(())
         }
 
@@ -396,12 +394,27 @@ fn main() -> anyhow::Result<()> {
                 Profile::default()
             };
 
+            let entry = if let Some(ref input) = input {
+                input.clone()
+            } else {
+                let cwd = std::env::current_dir()?;
+                let project = Project::discover(&cwd)?;
+                let entry = project.source_root.join("main.stnx");
+                if !entry.is_file() {
+                    return Err(anyhow::anyhow!(
+                        "no entry point found: expected {} (create a saturn.toml project with src/main.stnx or pass a file explicitly)",
+                        entry.display()
+                    ));
+                }
+                entry
+            };
+
             let tmp_output = std::env::temp_dir().join(format!(
                 "saturnite_run_{}_{}",
                 std::process::id(),
                 profile.as_str()
             ));
-            let _ = build_run_file(&input, &tmp_output, target.as_deref(), profile)?;
+            let _ = build_run_file(&entry, &tmp_output, target.as_deref(), profile)?;
             let status = std::process::Command::new(&tmp_output)
                 .status()
                 .map_err(|e| anyhow::anyhow!("failed to execute: {}", e))?;
@@ -434,13 +447,15 @@ fn resolve_output(
     input: &std::path::Path,
     output: &Option<PathBuf>,
     profile: &Profile,
+    package_name: Option<&str>,
     emit_ir: Option<PathBuf>,
     emit_object: Option<PathBuf>,
     emit_exe: Option<PathBuf>,
     no_link: bool,
-    _target: &Option<String>,
 ) -> (PathBuf, OutputKind) {
-    let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+    let stem = package_name
+        .or_else(|| input.file_stem().and_then(|s| s.to_str()))
+        .unwrap_or("out");
 
     if let Some(path) = emit_ir {
         (path, OutputKind::Ir)
@@ -476,17 +491,8 @@ fn build_run_file(
     target_triple: Option<&str>,
     profile: Profile,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let src = std::fs::read_to_string(input)
-        .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", input.display(), e))?;
-
-    let mut lexer = stnx::lexer::Lexer::new(&src);
-    let tokens: Vec<_> = lexer
-        .by_ref()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("Lex error: {}", e))?;
-
-    let program =
-        stnx::parser::parse(&src, tokens).map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
+    let mut project = Project::discover(input)?;
+    let program = project.load_from(input)?;
     let hir = stnx::semantic::analyze_and_lower(&program)
         .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
 
@@ -511,13 +517,7 @@ fn build_run_file(
             .map_err(|e| anyhow::anyhow!("Failed to initialize native target: {}", e))?
     };
 
-    if profile.is_release() {
-        config.set_opt_level(OptimizationLevel::Aggressive);
-        config.set_debug_info(DebugInfo::No);
-    } else {
-        config.set_opt_level(OptimizationLevel::None);
-        config.set_debug_info(DebugInfo::Yes);
-    }
+    config.apply_profile(profile);
 
     // Cross-compilation guard: the runtime is host-only (see Build command).
     if let Some(requested) = target_triple {
@@ -544,18 +544,9 @@ fn build_run_file(
     Ok(output.to_path_buf())
 }
 
-fn check_file(input: &std::path::Path, _target_triple: Option<&str>) -> anyhow::Result<()> {
-    let src = std::fs::read_to_string(input)
-        .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", input.display(), e))?;
-
-    let mut lexer = stnx::lexer::Lexer::new(&src);
-    let tokens: Vec<_> = lexer
-        .by_ref()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("Lex error: {}", e))?;
-
-    let program =
-        stnx::parser::parse(&src, tokens).map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
+fn check_file(input: &std::path::Path) -> anyhow::Result<()> {
+    let mut project = Project::discover(input)?;
+    let program = project.load_from(input)?;
     stnx::semantic::analyze(&program).map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
 
     Ok(())
@@ -623,19 +614,50 @@ fn init_project(
 }
 
 fn run_doctor() -> anyhow::Result<()> {
-    codegen::run_diagnostics().map_err(|e| anyhow::anyhow!("diagnostics failed: {}", e))?;
+    println!("Saturnite Compiler Diagnostics");
+    println!("==============================");
     println!();
 
-    // Show linker availability
-    match TargetConfig::host() {
-        Ok(config) => match codegen::check_linker(&config) {
-            Ok(()) => println!("Linker: available"),
-            Err(e) => println!("WARNING: Linker not available: {}", e),
-        },
+    // Show host target triple
+    match codegen::host_triple() {
+        Ok(triple) => {
+            println!("Host target triple: {}", triple);
+            println!();
+        }
         Err(e) => {
+            println!("ERROR: Failed to determine host target triple: {}", e);
+            println!();
+            return Ok(());
+        }
+    }
+
+    // Show host configuration and linker availability in a single pass
+    match TargetConfig::host() {
+        Ok(config) => {
+            println!("Host configuration:");
+            println!("  Triple:      {}", config.triple_str());
+            println!("  Architecture: {:?}", config.architecture());
+            println!("  OS:          {:?}", config.os());
+            println!("  Environment: {:?}", config.environment());
+            println!("  Opt level:   {:?}", config.opt_level());
+            println!();
+
+            match codegen::check_linker(&config) {
+                Ok(()) => println!("Linker: available"),
+                Err(e) => println!("WARNING: Linker not available: {}", e),
+            }
+        }
+        Err(e) => {
+            println!("ERROR: Failed to initialize target config: {}", e);
+            println!();
             println!("WARNING: Could not check linker: {}", e);
         }
     }
+    println!();
+
+    println!("inkwell 0.9 with LLVM 21.x (dynamic linking)");
+
+    println!();
 
     // Show runtime availability
     let out_dir = env!("OUT_DIR");

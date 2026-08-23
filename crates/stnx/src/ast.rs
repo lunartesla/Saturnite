@@ -21,7 +21,75 @@ pub enum Type {
 
 #[derive(Clone, Debug)]
 pub struct Program {
+    /// Top-level items — functions, structs, enums, modules, and uses.
+    /// This is the authoritative collection; `functions` is kept for backwards
+    /// compatibility during the Phase 5 transition.
+    pub items: Vec<Item>,
+    /// Backwards-compatible view of top-level functions.
+    /// Populated alongside `items` so existing HIR lowering continues to work
+    /// until Phase 5B migrates to iterating `items` directly.
     pub functions: Vec<Function>,
+}
+
+impl Program {
+    /// Convenience: build a `Program` from a list of items.
+    pub fn from_items(items: Vec<Item>) -> Self {
+        let functions: Vec<Function> = items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::Function(f) => Some(f.clone()),
+                _ => None,
+            })
+            .collect();
+        Program { functions, items }
+    }
+}
+
+/// A top-level program item (function, struct, enum, module, or use).
+#[derive(Clone, Debug)]
+pub struct Item {
+    /// The name of this item (the last path segment).
+    /// Empty for `use` declarations.
+    pub name: String,
+    /// Visibility of this item.
+    pub visibility: Visibility,
+    /// What kind of item this is.
+    pub kind: ItemKind,
+    /// Byte-span of the item in the source.
+    pub span: Range<usize>,
+}
+
+/// Visibility modifier for items: `pub` or private.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Visibility {
+    Private,
+    Public,
+}
+
+/// The kind of a top-level item.
+#[derive(Clone, Debug)]
+pub enum ItemKind {
+    Function(Function),
+    StructDef {
+        name: String,
+        fields: Vec<(String, Type)>,
+        span: Range<usize>,
+    },
+    EnumDef {
+        name: String,
+        variants: Vec<String>,
+        span: Range<usize>,
+    },
+    /// `mod foo` — declares a dependency on an external module file.
+    /// The module name is the item's `name`; the file is loaded later by the
+    /// module loader (Phase 4 infrastructure in `module.rs`).
+    ModDecl,
+    /// `use foo::bar` — imports `bar` into the current module's namespace.
+    /// The last path segment becomes available as a local name.
+    UseDecl {
+        path: Vec<String>,
+        alias: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug)]

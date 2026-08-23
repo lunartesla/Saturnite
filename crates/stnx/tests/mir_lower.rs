@@ -8,6 +8,7 @@ use stnx::hir::lower::lower;
 use stnx::lexer::Lexer;
 use stnx::mir::lower::lower_program;
 use stnx::mir::MirBinOp;
+use stnx::mir::MirOperand;
 use stnx::mir::MirRvalue;
 use stnx::mir::MirStmtKind;
 use stnx::mir::MirTerminator;
@@ -302,7 +303,7 @@ fn has_binop(prog: &stnx::mir::MirProgram, op: MirBinOp) -> bool {
             b.stmts.iter().any(|s| {
                 matches!(
                     &s.kind,
-                                        MirStmtKind::Assign {
+                    MirStmtKind::Assign {
                         rvalue: MirRvalue::Binary { op: o, .. },
                         ..
                     } if *o == op
@@ -310,4 +311,264 @@ fn has_binop(prog: &stnx::mir::MirProgram, op: MirBinOp) -> bool {
             })
         })
     })
+}
+
+/// Check whether a MirConst with the given value exists as a folded constant
+/// in any rvalue (Binary operand or Use(Const)) in the program.
+fn has_const_value(prog: &stnx::mir::MirProgram, expected: &stnx::mir::MirConst) -> bool {
+    prog.functions.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.stmts.iter().any(|s| {
+                if let MirStmtKind::Assign { rvalue, .. } = &s.kind {
+                    match rvalue {
+                        MirRvalue::Binary { lhs, rhs, .. } => {
+                            matches!(lhs, MirOperand::Const(c) if c == expected)
+                                || matches!(rhs, MirOperand::Const(c) if c == expected)
+                        }
+                        MirRvalue::Use(MirOperand::Const(c)) => *c == *expected,
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            })
+        })
+    })
+}
+
+// --- Constant folding tests ---
+
+#[test]
+fn test_constant_folding_i64_add() {
+    let tokens: Vec<_> = Lexer::new("fn main() -> i64 { 2 + 3 }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> i64 { 2 + 3 }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    // After folding, the binary op should be replaced by a Use(Const(I64(5)))
+    let has_binary_add = has_binop(&mir, MirBinOp::Add);
+    assert!(
+        !has_binary_add,
+        "2 + 3 should be folded, no Add binary op should remain"
+    );
+    assert!(
+        has_const_value(&mir, &stnx::mir::MirConst::I64(5)),
+        "folded result 5 should appear as a constant operand"
+    );
+}
+
+#[test]
+fn test_constant_folding_i64_sub() {
+    let tokens: Vec<_> = Lexer::new("fn main() -> i64 { 10 - 4 }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> i64 { 10 - 4 }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    assert!(!has_binop(&mir, MirBinOp::Sub));
+    assert!(has_const_value(&mir, &stnx::mir::MirConst::I64(6)));
+}
+
+#[test]
+fn test_constant_folding_i64_mul() {
+    let tokens: Vec<_> = Lexer::new("fn main() -> i64 { 3 * 4 }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> i64 { 3 * 4 }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    assert!(!has_binop(&mir, MirBinOp::Mul));
+    assert!(has_const_value(&mir, &stnx::mir::MirConst::I64(12)));
+}
+
+#[test]
+fn test_constant_folding_i64_div() {
+    let tokens: Vec<_> = Lexer::new("fn main() -> i64 { 20 / 5 }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> i64 { 20 / 5 }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    assert!(!has_binop(&mir, MirBinOp::Div));
+    assert!(has_const_value(&mir, &stnx::mir::MirConst::I64(4)));
+}
+
+#[test]
+fn test_constant_folding_i64_mod() {
+    let tokens: Vec<_> = Lexer::new("fn main() -> i64 { 20 % 6 }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> i64 { 20 % 6 }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    assert!(!has_binop(&mir, MirBinOp::Mod));
+    assert!(has_const_value(&mir, &stnx::mir::MirConst::I64(2)));
+}
+
+#[test]
+fn test_constant_folding_f64_add() {
+    let tokens: Vec<_> = Lexer::new("fn main() -> f64 { 1.5 + 2.5 }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> f64 { 1.5 + 2.5 }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    assert!(!has_binop(&mir, MirBinOp::Add));
+    assert!(has_const_value(&mir, &stnx::mir::MirConst::F64(4.0)));
+}
+
+#[test]
+fn test_constant_folding_f64_sub() {
+    let tokens: Vec<_> = Lexer::new("fn main() -> f64 { 10.0 - 4.0 }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> f64 { 10.0 - 4.0 }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    assert!(!has_binop(&mir, MirBinOp::Sub));
+    assert!(has_const_value(&mir, &stnx::mir::MirConst::F64(6.0)));
+}
+
+#[test]
+fn test_constant_folding_f64_mul() {
+    let tokens: Vec<_> = Lexer::new("fn main() -> f64 { 4.0 * 2.0 }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> f64 { 4.0 * 2.0 }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    assert!(!has_binop(&mir, MirBinOp::Mul));
+    assert!(has_const_value(&mir, &stnx::mir::MirConst::F64(8.0)));
+}
+
+#[test]
+fn test_constant_folding_f64_div() {
+    let tokens: Vec<_> = Lexer::new("fn main() -> f64 { 10.0 / 2.0 }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> f64 { 10.0 / 2.0 }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    assert!(!has_binop(&mir, MirBinOp::Div));
+    assert!(has_const_value(&mir, &stnx::mir::MirConst::F64(5.0)));
+}
+
+#[test]
+fn test_constant_folding_i64_eq() {
+    let tokens: Vec<_> = Lexer::new("fn main() -> i64 { 3 == 4 }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> i64 { 3 == 4 }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    assert!(!has_binop(&mir, MirBinOp::Eq));
+    assert!(has_const_value(&mir, &stnx::mir::MirConst::Bool(false)));
+}
+
+#[test]
+fn test_constant_folding_bool_and() {
+    let tokens: Vec<_> = Lexer::new("fn main() -> i64 { true && false }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> i64 { true && false }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    assert!(!has_binop(&mir, MirBinOp::And));
+    assert!(has_const_value(&mir, &stnx::mir::MirConst::Bool(false)));
+}
+
+#[test]
+fn test_constant_folding_bool_or() {
+    let tokens: Vec<_> = Lexer::new("fn main() -> i64 { true || false }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> i64 { true || false }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    assert!(!has_binop(&mir, MirBinOp::Or));
+    assert!(has_const_value(&mir, &stnx::mir::MirConst::Bool(true)));
+}
+
+#[test]
+fn test_constant_folding_not_bool() {
+    let tokens: Vec<_> = Lexer::new("fn main() -> i64 { !true }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> i64 { !true }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    // After folding, !true should become Const(Bool(false))
+    assert!(has_const_value(&mir, &stnx::mir::MirConst::Bool(false)));
+}
+
+#[test]
+fn test_constant_folding_neg_i64() {
+    let tokens: Vec<_> = Lexer::new("fn main() -> i64 { -42 }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> i64 { -42 }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    assert!(has_const_value(&mir, &stnx::mir::MirConst::I64(-42)));
+}
+
+#[test]
+fn test_constant_folding_not_applied_to_non_constants() {
+    // Variables should NOT be folded
+    let tokens: Vec<_> = Lexer::new("fn main() -> i64 { let a = 2 let b = 3 a + b }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> i64 { let a = 2 let b = 3 a + b }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    // The binary op with variable operands should remain
+    assert!(
+        has_binop(&mir, MirBinOp::Add),
+        "a + b with variables should not be folded"
+    );
+}
+
+#[test]
+fn test_constant_folding_i64_lt() {
+    let tokens: Vec<_> = Lexer::new("fn main() -> i64 { 3 < 4 }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> i64 { 3 < 4 }", tokens).unwrap();
+    let hir = lower(&program).unwrap();
+    let mut mir = lower_program(&hir).unwrap();
+    stnx::mir::opt::optimize(&mut mir);
+
+    assert!(!has_binop(&mir, MirBinOp::Lt));
+    assert!(has_const_value(&mir, &stnx::mir::MirConst::Bool(true)));
 }

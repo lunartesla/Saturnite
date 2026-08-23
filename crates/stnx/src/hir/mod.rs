@@ -32,8 +32,8 @@ pub mod types;
 
 // Re-export the most commonly used types at the module root.
 pub use expr::{HirExpr, HirExprKind};
-pub use function::{EnumDef, HirFunction, HirProgram, StructDef};
-pub use lower::HirLower;
+pub use function::{EnumDef, HirFunction, HirModDecl, HirProgram, HirUseDecl, StructDef};
+pub use lower::{lower_unit_with_graph, lower_with_graph, resolve_modules, HirLower};
 pub use stmt::{HirStmt, HirStmtKind};
-pub use symbol::{DefId, SymbolId, SymbolInterner};
+pub use symbol::{DefEntry, DefId, DefKind, DefTable, SymbolId, SymbolInterner, Visibility};
 pub use types::HirType;

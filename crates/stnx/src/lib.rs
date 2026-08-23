@@ -22,6 +22,7 @@ pub mod error;
 pub mod hir;
 pub mod lexer;
 pub mod mir;
+pub mod module;
 pub mod parser;
 pub mod semantic;
 pub mod target;
@@ -36,9 +37,10 @@ pub use ast::Program;
 // produced by the AST→HIR lowering pass (see [`hir::lower`]).
 // Codegen consumes `HirProgram` directly — not raw AST.
 
+pub use hir::lower::{lower_with_graph, resolve_modules};
 pub use hir::{
-    DefId, HirExpr, HirExprKind, HirFunction, HirLower, HirProgram, HirStmt, HirStmtKind, HirType,
-    SymbolId, SymbolInterner,
+    DefEntry, DefId, DefKind, DefTable, HirExpr, HirExprKind, HirFunction, HirLower, HirModDecl,
+    HirProgram, HirStmt, HirStmtKind, HirType, HirUseDecl, SymbolId, SymbolInterner, Visibility,
 };
 
 // --- Code generation re-exports ---
@@ -46,17 +48,17 @@ pub use hir::{
 // The codegen module exposes the object-emission and linking seams that the
 // MIR→LLVM backend (see `mir::codegen`) delegates to.
 //
-pub use codegen::{check_linker, host_triple, run_diagnostics, Linker, ObjectEmitter};
+pub use codegen::{check_linker, host_triple, Linker, ObjectEmitter};
 
 // --- MIR re-exports ---
-pub use mir::codegen::{compile_from_mir, compile_from_mir_ext, generate_ir_from_mir};
+pub use mir::codegen::{compile_from_mir_ext, generate_ir_from_mir};
 pub use mir::lower::lower_program;
 pub use mir::verify::{MirVerifyError, VerifyResult};
 
 // --- Target configuration re-exports ---
 
 pub use target::{
-    Architecture, DebugInfo, Environment, OperatingSystem, OptimizationLevel, OutputKind,
+    Architecture, DebugInfo, Environment, OperatingSystem, OptimizationLevel, OutputKind, Profile,
     TargetConfig,
 };
 
@@ -74,3 +76,9 @@ pub use error::{
 // `saturn.toml` configuration types and parsing logic.
 
 pub use config::{DependencySpec, Package, SaturnConfig};
+
+// --- Module system re-exports ---
+//
+// Module graph and project loading infrastructure for multi-file projects.
+
+pub use module::{Module, ModuleGraph, ModuleId, ModulePath, ModuleScope, Project};

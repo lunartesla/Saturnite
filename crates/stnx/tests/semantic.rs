@@ -231,3 +231,71 @@ fn test_struct_field_type_mismatch_with_enum() {
     let result = analyze_src(src);
     assert!(result.is_err());
 }
+
+// --- Unary NOT semantics ---
+
+#[test]
+fn test_not_on_bool_allowed() {
+    let src = "fn main() -> i64 { let x = true let y = !x 0 }";
+    assert!(analyze_src(src).is_ok(), "! on bool should be allowed");
+}
+
+#[test]
+fn test_not_on_integer_rejected() {
+    let src = "fn main() -> i64 { let y = !42 0 }";
+    let result = analyze_src(src);
+    assert!(result.is_err(), "! on i64 should be rejected");
+    assert!(
+        result.unwrap_err().contains("only bool"),
+        "error should mention only bool"
+    );
+}
+
+#[test]
+fn test_not_on_float_rejected() {
+    let src = "fn main() -> i64 { let y = !3.14 0 }";
+    let result = analyze_src(src);
+    assert!(result.is_err(), "! on f64 should be rejected");
+    assert!(
+        result.unwrap_err().contains("only bool"),
+        "error should mention only bool"
+    );
+}
+
+#[test]
+fn test_not_on_string_rejected() {
+    let src = "fn main() -> i64 { let y = !\"hello\" 0 }";
+    let result = analyze_src(src);
+    assert!(result.is_err(), "! on str should be rejected");
+}
+
+// --- Modulo semantics ---
+
+#[test]
+fn test_mod_on_int_allowed() {
+    let src = "fn main() -> i64 { let x = 7 % 3 x }";
+    assert!(analyze_src(src).is_ok(), "mod on i64 should be allowed");
+}
+
+#[test]
+fn test_mod_on_float_rejected() {
+    let src = "fn main() -> i64 { let x = 1.5 % 0.5 0 }";
+    let result = analyze_src(src);
+    assert!(
+        result.is_err(),
+        "mod on f64 should be rejected by semantic analysis"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("modulo is only supported for i64"),
+        "error should mention modulo is only for i64, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_mod_on_bool_rejected() {
+    let src = "fn main() -> i64 { let x = true % false 0 }";
+    let result = analyze_src(src);
+    assert!(result.is_err(), "mod on bool should be rejected");
+}

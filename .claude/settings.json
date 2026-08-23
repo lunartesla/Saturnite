@@ -4,6 +4,7 @@
     "atomic-agents@claude-plugins-official": true,
     "superpowers@claude-plugins-official": true,
     "commit-commands@claude-plugins-official": true,
-    "claude-code-setup@claude-plugins-official": true
+    "claude-code-setup@claude-plugins-official": true,
+    "rust-analyzer-lsp@claude-plugins-official": true
   }
 }

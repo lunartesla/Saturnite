@@ -12,6 +12,8 @@
 //! allocates a new (empty, unterminated) block.  `switch_to` changes which
 //! block is being built.  `finish` sets a terminator, closing the block.
 
+use std::collections::HashMap;
+
 use crate::error::{CompilerError, CompilerResult};
 use crate::hir::expr::{HirExpr, HirExprKind};
 use crate::hir::function::HirProgram;
@@ -30,10 +32,11 @@ const PRINTLN_DEF_ID: DefId = DefId(u32::MAX - 1);
 /// Entry point: lower a `HirProgram` into a `MirProgram`.
 pub fn lower_program(hir: &HirProgram) -> CompilerResult<MirProgram> {
     // Build a function signature table for call return-type resolution.
-    let mut sigs: Vec<(Vec<HirType>, HirType)> = Vec::with_capacity(hir.functions.len());
+    let mut sigs: HashMap<DefId, (Vec<HirType>, HirType)> =
+        HashMap::with_capacity(hir.functions.len());
     for func in &hir.functions {
         let param_types: Vec<HirType> = func.params.iter().map(|(_, t)| *t).collect();
-        sigs.push((param_types, func.return_type));
+        sigs.insert(func.def_id, (param_types, func.return_type));
     }
 
     let mut funcs = Vec::new();
@@ -54,7 +57,7 @@ pub fn lower_program(hir: &HirProgram) -> CompilerResult<MirProgram> {
 struct MirLower<'hir> {
     hir: &'hir HirProgram,
     func: &'hir crate::hir::function::HirFunction,
-    sigs: &'hir [(Vec<HirType>, HirType)],
+    sigs: &'hir HashMap<DefId, (Vec<HirType>, HirType)>,
     /// All blocks (index == BlockId.0).
     blocks: Vec<MirBasicBlock>,
     /// Index into `blocks` of the block currently being built.
@@ -71,7 +74,7 @@ impl<'hir> MirLower<'hir> {
     fn new(
         hir: &'hir HirProgram,
         func: &'hir crate::hir::function::HirFunction,
-        sigs: &'hir [(Vec<HirType>, HirType)],
+        sigs: &'hir HashMap<DefId, (Vec<HirType>, HirType)>,
     ) -> Self {
         let mut symbols = hir.symbols.clone();
         let temp_symbol = symbols.intern("");
@@ -496,7 +499,7 @@ impl<'hir> MirLower<'hir> {
 
         let ret_ty = self
             .sigs
-            .get(def_id.0 as usize)
+            .get(&def_id)
             .map(|(_, ret)| *ret)
             .unwrap_or(result_ty);
 

@@ -25,6 +25,29 @@ pub fn analyze_and_lower(program: &Program) -> CompilerResult<hir::HirProgram> {
     hir::lower::lower(program)
 }
 
+/// Analyze a program with module-graph support and return the fully lowered HIR.
+///
+/// This is the Phase 5B entry point for multi-module programs. It passes
+/// the supplied [`ModuleGraph`] to the HIR lowering pass so that:
+///
+/// - Item `ModuleId`s are assigned from the graph (not hardcoded to ROOT).
+/// - `mod` declarations (`HirModDecl`) have their `module_id` field resolved
+///   to the discovered child module.
+/// - `module_scopes`, `module_paths`, and `def_table` are populated for
+///   every module in the graph.
+///
+/// For single-file programs (a graph containing only the root module with no
+/// `mod` declarations), the output is identical to
+/// [`analyze_and_lower`].
+pub fn analyze_and_lower_with_graph(
+    program: &Program,
+    graph: &crate::module::ModuleGraph,
+) -> CompilerResult<hir::HirProgram> {
+    let mut hir = hir::lower::lower_with_graph(program, graph)?;
+    hir::lower::resolve_modules(&mut hir)?;
+    Ok(hir)
+}
+
 /// Re-export the HIR types so callers can use `stnx::semantic::Hir*`
 /// or `stnx::hir::Hir*`.
 pub use hir::*;

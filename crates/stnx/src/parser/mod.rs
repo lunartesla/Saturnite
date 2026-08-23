@@ -78,10 +78,10 @@ pub fn parse(src: &str, tokens: Vec<Token>) -> CompilerResult<Program> {
 }
 
 fn program<'a>() -> impl Parser<'a, &'a [Token], Program, ParserExtra<'a>> {
-    func()
+    item()
         .repeated()
         .collect::<Vec<_>>()
-        .map(|fns| Program { functions: fns })
+        .map(Program::from_items)
 }
 
 fn func<'a>() -> impl Parser<'a, &'a [Token], Function, ParserExtra<'a>> {
@@ -96,6 +96,183 @@ fn func<'a>() -> impl Parser<'a, &'a [Token], Function, ParserExtra<'a>> {
             return_type: ret_type,
             body,
             span: name_span,
+        })
+}
+
+/// Parse an optional `pub` visibility prefix.
+/// Returns `Visibility::Public` if `pub` is present, `Visibility::Private` otherwise.
+fn visibility<'a>() -> impl Parser<'a, &'a [Token], Visibility, ParserExtra<'a>> {
+    kw("pub")
+        .to(Visibility::Public)
+        .or_not()
+        .map(|opt| opt.unwrap_or(Visibility::Private))
+}
+
+/// Parse a top-level item: `fn`, `struct`, `enum`, `mod`, or `use`,
+/// optionally preceded by `pub`.
+///
+/// All top-level constructs are items. `mod` and `use` use no semicolons
+/// (Saturnite's no-semicolon style — items terminate at the next newline/item).
+fn item<'a>() -> impl Parser<'a, &'a [Token], Item, ParserExtra<'a>> {
+    visibility()
+        .then(
+            // function: fn name(params) -> ret { body }
+            func()
+                .map(|f| {
+                    let span = f.span.clone();
+                    let name = f.name.clone();
+                    (name, ItemKind::Function(f), span)
+                })
+                // struct definition at top level: struct Name { fields }
+                .or(struct_item().map(|(name, fields, span)| {
+                    (
+                        name.clone(),
+                        ItemKind::StructDef {
+                            name,
+                            fields,
+                            span: span.clone(),
+                        },
+                        span,
+                    )
+                }))
+                // enum definition at top level: enum Name { variants }
+                .or(enum_item().map(|(name, variants, span)| {
+                    (
+                        name.clone(),
+                        ItemKind::EnumDef {
+                            name,
+                            variants,
+                            span: span.clone(),
+                        },
+                        span,
+                    )
+                }))
+                // mod declaration: mod <ident>
+                .or(mod_decl().map(|(name, span)| (name.clone(), ItemKind::ModDecl, span)))
+                // use declaration: use <path> [as <alias>]
+                .or(use_decl().map(|(name, kind, span)| (name, kind, span))),
+        )
+        .map(|(vis, (name, kind, span))| Item {
+            name,
+            visibility: vis,
+            kind,
+            span,
+        })
+}
+
+/// Parse a top-level struct definition: `struct Name { field1: type1, field2: type2 }`
+#[allow(clippy::type_complexity)]
+fn struct_item<'a>(
+) -> impl Parser<'a, &'a [Token], (String, Vec<(String, Type)>, Range<usize>), ParserExtra<'a>> {
+    kw_span("struct")
+        .ignore_then(t_ident())
+        .then(
+            lbrace()
+                .ignore_then(
+                    t_ident()
+                        .map(|(name, _)| name)
+                        .then(type_ann())
+                        .separated_by(comma())
+                        .collect::<Vec<_>>(),
+                )
+                .then_ignore(rbrace()),
+        )
+        .map(|((name, name_span), fields)| (name, fields, name_span))
+}
+
+/// Parse a top-level enum definition: `enum Name { Variant1, Variant2 }`
+fn enum_item<'a>(
+) -> impl Parser<'a, &'a [Token], (String, Vec<String>, Range<usize>), ParserExtra<'a>> {
+    kw_span("enum")
+        .ignore_then(t_ident())
+        .then(
+            lbrace()
+                .ignore_then(
+                    t_ident()
+                        .map(|(name, _)| name)
+                        .separated_by(comma())
+                        .collect::<Vec<_>>(),
+                )
+                .then_ignore(rbrace()),
+        )
+        .map(|((name, name_span), variants)| (name, variants, name_span))
+}
+
+/// Parse a `mod <ident>` declaration (no semicolon).
+/// Returns the module name and its byte span.
+fn mod_decl<'a>() -> impl Parser<'a, &'a [Token], (String, Range<usize>), ParserExtra<'a>> {
+    kw_span("mod")
+        .ignore_then(t_ident())
+        .map(|(name, span)| (name, span))
+}
+
+/// Parse a `use foo::bar::baz` declaration (no semicolon, with optional `as alias`).
+/// Returns (name, ItemKind, span).
+fn use_decl<'a>() -> impl Parser<'a, &'a [Token], (String, ItemKind, Range<usize>), ParserExtra<'a>>
+{
+    kw_span("use")
+        .then(path_with_span())
+        .then(kw("as").ignore_then(t_ident().map(|(n, _)| n)).or_not())
+        .map(|((use_span, (parts, last_span)), alias)| {
+            let name = parts.last().cloned().unwrap_or_default();
+            let full_span = use_span.start..last_span.end;
+            (name, ItemKind::UseDecl { path: parts, alias }, full_span)
+        })
+}
+
+/// Parse a path segment — accepts an identifier OR a keyword token (e.g. `println`
+/// used in `use io::println`).  Returns (name_string, span).
+fn path_segment<'a>() -> impl Parser<'a, &'a [Token], (String, Range<usize>), ParserExtra<'a>> {
+    any::<&[Token], _>()
+        .filter(|t: &Token| {
+            matches!(&t.kind, TokenKind::Ident(s) if !is_keyword(s))
+                || matches!(
+                    &t.kind,
+                    TokenKind::Println
+                        | TokenKind::True
+                        | TokenKind::False
+                        | TokenKind::I64
+                        | TokenKind::F64
+                        | TokenKind::Bool
+                        | TokenKind::Str
+                        | TokenKind::Unit
+                )
+        })
+        .map(|t| {
+            let name = match &t.kind {
+                TokenKind::Ident(s) => s.clone(),
+                TokenKind::Println => "println".to_string(),
+                TokenKind::True => "true".to_string(),
+                TokenKind::False => "false".to_string(),
+                TokenKind::I64 => "i64".to_string(),
+                TokenKind::F64 => "f64".to_string(),
+                TokenKind::Bool => "bool".to_string(),
+                TokenKind::Str => "str".to_string(),
+                TokenKind::Unit => "unit".to_string(),
+                _ => unreachable!(),
+            };
+            (name, t.span.clone())
+        })
+}
+
+/// Parse a path with span: `ident (:: ident)*` returning (Vec<String>, span).
+fn path_with_span<'a>() -> impl Parser<'a, &'a [Token], (Vec<String>, Range<usize>), ParserExtra<'a>>
+{
+    path_segment()
+        .map(|(n, s)| (n, s))
+        .then(
+            double_colon()
+                .ignore_then(path_segment().map(|(n, s)| (n, s)))
+                .repeated()
+                .collect::<Vec<_>>(),
+        )
+        .map(|((first, first_span), rest)| {
+            let last_end = rest.last().map(|(_, s)| s.end).unwrap_or(first_span.end);
+            let mut parts = vec![first];
+            for (n, _) in rest {
+                parts.push(n);
+            }
+            (parts, first_span.start..last_end)
         })
 }
 
@@ -740,6 +917,10 @@ fn kw_span<'a>(k: &'a str) -> Boxed<'a, 'a, &'a [Token], Range<usize>, ParserExt
                     | (TokenKind::Println, "println")
                     | (TokenKind::Struct, "struct")
                     | (TokenKind::Enum, "enum")
+                    | (TokenKind::Mod, "mod")
+                    | (TokenKind::Use, "use")
+                    | (TokenKind::Pub, "pub")
+                    | (TokenKind::As, "as")
             )
         })
         .map(|t| t.span.clone())
@@ -777,6 +958,10 @@ fn is_keyword(s: &str) -> bool {
             | "println"
             | "struct"
             | "enum"
+            | "mod"
+            | "use"
+            | "pub"
+            | "as"
     )
 }
 
@@ -1022,4 +1207,250 @@ fn combine_spans(lhs: &Expr, rhs: &Expr) -> Range<usize> {
 fn combine_spans_with(span: Range<usize>, expr: &Expr) -> Range<usize> {
     let es = stmt_span(expr);
     span.start.min(es.start)..span.end.max(es.end)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5A: Parser tests for mod / use / pub syntax
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+
+    /// Helper: lex + parse a source string, returning the resulting `Program`.
+    fn parse_src(src: &str) -> Program {
+        let tokens: Vec<Token> = Lexer::new(src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        parse(src, tokens).expect("parsing should succeed")
+    }
+
+    /// Helper: lex + parse, returning the first error (or panicking if none).
+    fn parse_fail(src: &str) -> CompilerError {
+        let tokens: Vec<Token> = Lexer::new(src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        parse(src, tokens)
+            .map(|_| panic!("expected parse error for:\n{}", src))
+            .err()
+            .unwrap()
+    }
+
+    // --- mod declarations ---
+
+    #[test]
+    fn test_parse_mod_decl() {
+        let prog = parse_src("mod io\n");
+        assert_eq!(prog.items.len(), 1);
+        assert_eq!(prog.items[0].name, "io");
+        assert_eq!(prog.items[0].visibility, Visibility::Private);
+        assert!(matches!(prog.items[0].kind, ItemKind::ModDecl));
+    }
+
+    #[test]
+    fn test_parse_pub_mod_decl() {
+        let prog = parse_src("pub mod io\n");
+        assert_eq!(prog.items.len(), 1);
+        assert_eq!(prog.items[0].name, "io");
+        assert_eq!(prog.items[0].visibility, Visibility::Public);
+        assert!(matches!(prog.items[0].kind, ItemKind::ModDecl));
+    }
+
+    #[test]
+    fn test_parse_mod_decl_preserves_function_backwards_compat() {
+        // `functions` vec should still contain functions parsed at top level.
+        let prog = parse_src("mod io\nfn main() -> i64 { 0 }\n");
+        assert_eq!(prog.items.len(), 2);
+        assert_eq!(prog.functions.len(), 1);
+        assert_eq!(prog.functions[0].name, "main");
+    }
+
+    // --- use declarations ---
+
+    #[test]
+    fn test_parse_use_simple_path() {
+        let prog = parse_src("use io::println\n");
+        assert_eq!(prog.items.len(), 1);
+        assert_eq!(prog.items[0].name, "println");
+        assert_eq!(prog.items[0].visibility, Visibility::Private);
+        match &prog.items[0].kind {
+            ItemKind::UseDecl { path, alias } => {
+                assert_eq!(path, &vec!["io".to_string(), "println".to_string()]);
+                assert_eq!(*alias, None);
+            }
+            other => panic!("expected UseDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_use_deep_path() {
+        let prog = parse_src("use utils::math::add\n");
+        assert_eq!(prog.items.len(), 1);
+        match &prog.items[0].kind {
+            ItemKind::UseDecl { path, alias } => {
+                assert_eq!(
+                    path,
+                    &vec!["utils".to_string(), "math".to_string(), "add".to_string(),]
+                );
+                assert_eq!(*alias, None);
+            }
+            other => panic!("expected UseDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_pub_use_decl() {
+        let prog = parse_src("pub use io::writer\n");
+        assert_eq!(prog.items.len(), 1);
+        assert_eq!(prog.items[0].visibility, Visibility::Public);
+        match &prog.items[0].kind {
+            ItemKind::UseDecl { path, alias: _ } => {
+                assert_eq!(path, &vec!["io".to_string(), "writer".to_string()]);
+            }
+            other => panic!("expected UseDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_use_with_as_alias() {
+        // `as` is reserved but the parser supports rename for forward compatibility.
+        let prog = parse_src("use io::writer as w\n");
+        assert_eq!(prog.items.len(), 1);
+        match &prog.items[0].kind {
+            ItemKind::UseDecl { path, alias } => {
+                assert_eq!(path, &vec!["io".to_string(), "writer".to_string()]);
+                assert_eq!(alias, &Some("w".to_string()));
+                // The item name is the last path segment (the original name).
+                assert_eq!(prog.items[0].name, "writer");
+            }
+            other => panic!("expected UseDecl, got {:?}", other),
+        }
+    }
+
+    // --- pub on functions and types ---
+
+    #[test]
+    fn test_parse_pub_fn() {
+        let prog = parse_src("pub fn greet(n: i64) -> i64 { return n }\n");
+        assert_eq!(prog.items.len(), 1);
+        assert_eq!(prog.items[0].name, "greet");
+        assert_eq!(prog.items[0].visibility, Visibility::Public);
+        assert!(matches!(prog.items[0].kind, ItemKind::Function(_)));
+    }
+
+    #[test]
+    fn test_parse_pub_struct() {
+        let prog = parse_src("pub struct Point { x: i64, y: i64 }\n");
+        assert_eq!(prog.items.len(), 1);
+        assert_eq!(prog.items[0].name, "Point");
+        assert_eq!(prog.items[0].visibility, Visibility::Public);
+        match &prog.items[0].kind {
+            ItemKind::StructDef { name, fields, .. } => {
+                assert_eq!(name, "Point");
+                assert_eq!(fields.len(), 2);
+            }
+            other => panic!("expected StructDef, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_pub_enum() {
+        let prog = parse_src("pub enum Color { Red, Green, Blue }\n");
+        assert_eq!(prog.items.len(), 1);
+        assert_eq!(prog.items[0].name, "Color");
+        assert_eq!(prog.items[0].visibility, Visibility::Public);
+        match &prog.items[0].kind {
+            ItemKind::EnumDef { name, variants, .. } => {
+                assert_eq!(name, "Color");
+                assert_eq!(variants.len(), 3);
+            }
+            other => panic!("expected EnumDef, got {:?}", other),
+        }
+    }
+
+    // --- mixed programs ---
+
+    #[test]
+    fn test_parse_mixed_program() {
+        let src = "mod io\nuse io::println\npub fn greet(n: i64) -> i64 { return n }\nfn main() -> i64 { return 0 }\n";
+        let prog = parse_src(src);
+        assert_eq!(prog.items.len(), 4);
+        assert_eq!(prog.functions.len(), 2); // only fn items in the backwards-compat vec
+
+        assert_eq!(prog.items[0].name, "io");
+        assert!(matches!(prog.items[0].kind, ItemKind::ModDecl));
+
+        assert_eq!(prog.items[1].name, "println");
+        assert!(matches!(prog.items[1].kind, ItemKind::UseDecl { .. }));
+
+        assert_eq!(prog.items[2].name, "greet");
+        assert_eq!(prog.items[2].visibility, Visibility::Public);
+        assert!(matches!(prog.items[2].kind, ItemKind::Function(_)));
+
+        assert_eq!(prog.items[3].name, "main");
+        assert_eq!(prog.items[3].visibility, Visibility::Private);
+        assert!(matches!(prog.items[3].kind, ItemKind::Function(_)));
+    }
+
+    #[test]
+    fn test_parse_struct_and_enum_with_pub_and_private() {
+        let src = "pub struct Point { x: i64, y: i64 }\nenum Color { Red, Green }\n";
+        let prog = parse_src(src);
+        assert_eq!(prog.items.len(), 2);
+
+        assert_eq!(prog.items[0].name, "Point");
+        assert_eq!(prog.items[0].visibility, Visibility::Public);
+        assert!(matches!(prog.items[0].kind, ItemKind::StructDef { .. }));
+
+        assert_eq!(prog.items[1].name, "Color");
+        assert_eq!(prog.items[1].visibility, Visibility::Private);
+        assert!(matches!(prog.items[1].kind, ItemKind::EnumDef { .. }));
+    }
+
+    // --- error cases ---
+
+    #[test]
+    fn test_parse_mod_without_name_errors() {
+        let err = parse_fail("mod\n");
+        assert!(
+            err.to_string().contains("unexpected") || err.to_string().contains("expected"),
+            "expected error for `mod` without name, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_use_without_path_errors() {
+        let err = parse_fail("use\n");
+        assert!(
+            err.to_string().contains("unexpected") || err.to_string().contains("expected"),
+            "expected error for `use` without path, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_pub_alone_errors() {
+        // `pub` must be followed by an item keyword
+        let err = parse_fail("pub\n");
+        assert!(
+            err.to_string().contains("unexpected") || err.to_string().contains("expected"),
+            "expected error for `pub` without item, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_mod_inside_function_is_error() {
+        // `mod` is a top-level item only; it should NOT be valid inside a function body.
+        let tokens: Vec<Token> = Lexer::new("fn main() -> i64 { mod foo }")
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let result = parse("fn main() -> i64 { mod foo }", tokens);
+        assert!(
+            result.is_err(),
+            "mod inside a function body should be a parse error"
+        );
+    }
 }

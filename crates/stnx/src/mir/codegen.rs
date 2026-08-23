@@ -11,13 +11,14 @@ use crate::mir::{
     BlockId, LocalId, MirBinOp, MirConst, MirFunction, MirOperand, MirProgram, MirRvalue,
     MirStmtKind, MirTerminator, MirType, MirUnOp,
 };
-use crate::target::{OptimizationLevel, TargetConfig};
+use crate::target::TargetConfig;
 use inkwell::builder::Builder as IRBuilder;
 use inkwell::context::Context as LLVMContext;
 use inkwell::passes::PassBuilderOptions;
 use inkwell::types::BasicType;
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::{BasicValue, BasicValueEnum, PointerValue};
+use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel as InkwellOptLevel;
 use std::collections::HashMap;
@@ -199,11 +200,11 @@ impl<'ctx> MirCodeGenContext<'ctx> {
             MirRvalue::Binary { op, lhs, rhs } => {
                 let l = self.materialize_operand(lhs)?;
                 let r = self.materialize_operand(rhs)?;
-                Ok(self.gen_binop(*op, l, r))
+                Ok(self.gen_binop(*op, l, r)?)
             }
             MirRvalue::Unary { op, operand } => {
                 let val = self.materialize_operand(operand)?;
-                Ok(self.gen_unop(*op, val))
+                Ok(self.gen_unop(*op, val)?)
             }
             MirRvalue::StructLit { struct_def, fields } => {
                 self.gen_struct_lit(*struct_def, fields, prog)
@@ -274,91 +275,203 @@ impl<'ctx> MirCodeGenContext<'ctx> {
         op: MirBinOp,
         lhs: BasicValueEnum<'ctx>,
         rhs: BasicValueEnum<'ctx>,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        let lhs_ty = lhs.get_type();
+        if lhs_ty.is_int_type() {
+            let lhs_int = lhs.into_int_value();
+            let rhs_int = rhs.into_int_value();
+            Ok(self.gen_integer_binop(op, lhs_int, rhs_int))
+        } else if lhs_ty.is_float_type() {
+            let lhs_float = lhs.into_float_value();
+            let rhs_float = rhs.into_float_value();
+            self.gen_float_binop(op, lhs_float, rhs_float)
+        } else {
+            Err(CompilerError::codegen(format!(
+                "unsupported operand type for binop {:?}: {:?}",
+                op, lhs_ty
+            )))
+        }
+    }
+
+    fn gen_integer_binop(
+        &self,
+        op: MirBinOp,
+        lhs: inkwell::values::IntValue<'ctx>,
+        rhs: inkwell::values::IntValue<'ctx>,
     ) -> BasicValueEnum<'ctx> {
-        let lhs_int = lhs.into_int_value();
-        let rhs_int = rhs.into_int_value();
         match op {
             MirBinOp::Add => self
                 .builder
-                .build_int_add(lhs_int, rhs_int, "add")
+                .build_int_add(lhs, rhs, "add")
                 .unwrap()
                 .as_basic_value_enum(),
             MirBinOp::Sub => self
                 .builder
-                .build_int_sub(lhs_int, rhs_int, "sub")
+                .build_int_sub(lhs, rhs, "sub")
                 .unwrap()
                 .as_basic_value_enum(),
             MirBinOp::Mul => self
                 .builder
-                .build_int_mul(lhs_int, rhs_int, "mul")
+                .build_int_mul(lhs, rhs, "mul")
                 .unwrap()
                 .as_basic_value_enum(),
             MirBinOp::Div => self
                 .builder
-                .build_int_unsigned_div(lhs_int, rhs_int, "div")
+                .build_int_unsigned_div(lhs, rhs, "div")
                 .unwrap()
                 .as_basic_value_enum(),
             MirBinOp::Mod => self
                 .builder
-                .build_int_unsigned_rem(lhs_int, rhs_int, "rem")
+                .build_int_unsigned_rem(lhs, rhs, "rem")
                 .unwrap()
                 .as_basic_value_enum(),
             MirBinOp::Eq => self
                 .builder
-                .build_int_compare(IntPredicate::EQ, lhs_int, rhs_int, "eq")
+                .build_int_compare(IntPredicate::EQ, lhs, rhs, "eq")
                 .unwrap()
                 .as_basic_value_enum(),
             MirBinOp::Ne => self
                 .builder
-                .build_int_compare(IntPredicate::NE, lhs_int, rhs_int, "ne")
+                .build_int_compare(IntPredicate::NE, lhs, rhs, "ne")
                 .unwrap()
                 .as_basic_value_enum(),
             MirBinOp::Lt => self
                 .builder
-                .build_int_compare(IntPredicate::ULT, lhs_int, rhs_int, "lt")
+                .build_int_compare(IntPredicate::ULT, lhs, rhs, "lt")
                 .unwrap()
                 .as_basic_value_enum(),
             MirBinOp::Gt => self
                 .builder
-                .build_int_compare(IntPredicate::UGT, lhs_int, rhs_int, "gt")
+                .build_int_compare(IntPredicate::UGT, lhs, rhs, "gt")
                 .unwrap()
                 .as_basic_value_enum(),
             MirBinOp::Le => self
                 .builder
-                .build_int_compare(IntPredicate::ULE, lhs_int, rhs_int, "le")
+                .build_int_compare(IntPredicate::ULE, lhs, rhs, "le")
                 .unwrap()
                 .as_basic_value_enum(),
             MirBinOp::Ge => self
                 .builder
-                .build_int_compare(IntPredicate::UGE, lhs_int, rhs_int, "ge")
+                .build_int_compare(IntPredicate::UGE, lhs, rhs, "ge")
                 .unwrap()
                 .as_basic_value_enum(),
             MirBinOp::And => self
                 .builder
-                .build_and(lhs_int, rhs_int, "and")
+                .build_and(lhs, rhs, "and")
                 .unwrap()
                 .as_basic_value_enum(),
             MirBinOp::Or => self
                 .builder
-                .build_or(lhs_int, rhs_int, "or")
+                .build_or(lhs, rhs, "or")
                 .unwrap()
                 .as_basic_value_enum(),
         }
     }
 
-    fn gen_unop(&self, op: MirUnOp, val: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
-        let int_val = val.into_int_value();
+    fn gen_float_binop(
+        &self,
+        op: MirBinOp,
+        lhs: inkwell::values::FloatValue<'ctx>,
+        rhs: inkwell::values::FloatValue<'ctx>,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
         match op {
-            MirUnOp::Neg => self
+            MirBinOp::Add => Ok(self
                 .builder
-                .build_int_neg(int_val, "neg")
+                .build_float_add(lhs, rhs, "fadd")
                 .unwrap()
-                .as_basic_value_enum(),
-            MirUnOp::Not => self
+                .as_basic_value_enum()),
+            MirBinOp::Sub => Ok(self
                 .builder
-                .build_not(int_val, "not")
+                .build_float_sub(lhs, rhs, "fsub")
                 .unwrap()
-                .as_basic_value_enum(),
+                .as_basic_value_enum()),
+            MirBinOp::Mul => Ok(self
+                .builder
+                .build_float_mul(lhs, rhs, "fmul")
+                .unwrap()
+                .as_basic_value_enum()),
+            MirBinOp::Div => Ok(self
+                .builder
+                .build_float_div(lhs, rhs, "fdiv")
+                .unwrap()
+                .as_basic_value_enum()),
+            // Mod is not currently supported for floating-point types.
+            MirBinOp::Mod => Err(CompilerError::codegen(
+                "floating-point modulo is not supported",
+            )),
+            // Comparisons use ordered floating-point predicates (O-series),
+            // which return false for NaN comparisons, matching standard
+            // IEEE 754 ordered comparison semantics.
+            MirBinOp::Eq => Ok(self
+                .builder
+                .build_float_compare(FloatPredicate::OEQ, lhs, rhs, "feq")
+                .unwrap()
+                .as_basic_value_enum()),
+            MirBinOp::Ne => Ok(self
+                .builder
+                .build_float_compare(FloatPredicate::ONE, lhs, rhs, "fne")
+                .unwrap()
+                .as_basic_value_enum()),
+            MirBinOp::Lt => Ok(self
+                .builder
+                .build_float_compare(FloatPredicate::OLT, lhs, rhs, "flt")
+                .unwrap()
+                .as_basic_value_enum()),
+            MirBinOp::Gt => Ok(self
+                .builder
+                .build_float_compare(FloatPredicate::OGT, lhs, rhs, "fgt")
+                .unwrap()
+                .as_basic_value_enum()),
+            MirBinOp::Le => Ok(self
+                .builder
+                .build_float_compare(FloatPredicate::OLE, lhs, rhs, "fle")
+                .unwrap()
+                .as_basic_value_enum()),
+            MirBinOp::Ge => Ok(self
+                .builder
+                .build_float_compare(FloatPredicate::OGE, lhs, rhs, "fge")
+                .unwrap()
+                .as_basic_value_enum()),
+            // Logical and/or on floats are not valid.
+            MirBinOp::And | MirBinOp::Or => Err(CompilerError::codegen(format!(
+                "logical {:?} is not supported for floating-point operands",
+                op
+            ))),
+        }
+    }
+
+    fn gen_unop(
+        &self,
+        op: MirUnOp,
+        val: BasicValueEnum<'ctx>,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        let val_ty = val.get_type();
+        if val_ty.is_float_type() {
+            let float_val = val.into_float_value();
+            match op {
+                MirUnOp::Neg => Ok(self
+                    .builder
+                    .build_float_neg(float_val, "fneg")
+                    .unwrap()
+                    .as_basic_value_enum()),
+                MirUnOp::Not => Err(CompilerError::codegen(
+                    "unary ! is not supported for floating-point values",
+                )),
+            }
+        } else {
+            let int_val = val.into_int_value();
+            match op {
+                MirUnOp::Neg => Ok(self
+                    .builder
+                    .build_int_neg(int_val, "neg")
+                    .unwrap()
+                    .as_basic_value_enum()),
+                MirUnOp::Not => Ok(self
+                    .builder
+                    .build_not(int_val, "not")
+                    .unwrap()
+                    .as_basic_value_enum()),
+            }
         }
     }
 
@@ -679,22 +792,12 @@ pub fn compile_from_mir_ext(
     ctx.module.set_triple(triple);
 
     // Run LLVM optimizations if in release mode.
-    let opt_level = match target_config.opt_level() {
-        OptimizationLevel::None => InkwellOptLevel::None,
-        OptimizationLevel::Less => InkwellOptLevel::Less,
-        OptimizationLevel::Default => InkwellOptLevel::Default,
-        OptimizationLevel::Aggressive => InkwellOptLevel::Aggressive,
-    };
+    let opt_level = target_config.to_inkwell_opt_level();
     if opt_level != InkwellOptLevel::None {
         let target_machine = target_config
             .create_target_machine()
             .map_err(CompilerError::Target)?;
-        let opt_passes = match target_config.opt_level() {
-            OptimizationLevel::Less => "default<O1>",
-            OptimizationLevel::Default => "default<O2>",
-            OptimizationLevel::Aggressive => "default<O3>",
-            OptimizationLevel::None => "default<O0>",
-        };
+        let opt_passes = target_config.opt_pass_name();
         let opts = PassBuilderOptions::create();
         ctx.module
             .run_passes(opt_passes, &target_machine, opts)

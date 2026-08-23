@@ -211,3 +211,108 @@ fn test_f64_function_return_signature() {
         ir
     );
 }
+
+// --- Floating-point binary operation IR tests ---
+// These tests use variables (not inline constants) to prevent LLVM from
+// constant-folding the operations, ensuring the IR actually contains
+// fadd/fsub/fmul/fdiv/fcmp instructions.
+
+#[test]
+fn test_ir_float_add() {
+    let src = "fn main() -> i64 { let a = 1.5 let b = 2.5 if a + b == 4.0 { 1 } else { 0 } }";
+    let ir = compile_src(src).unwrap();
+    assert!(
+        ir.contains("fadd"),
+        "Float add should emit fadd, got: {}",
+        ir
+    );
+}
+
+#[test]
+fn test_ir_float_sub() {
+    let src = "fn main() -> i64 { let a = 10.0 let b = 1.5 if a - b == 8.5 { 1 } else { 0 } }";
+    let ir = compile_src(src).unwrap();
+    assert!(
+        ir.contains("fsub"),
+        "Float sub should emit fsub, got: {}",
+        ir
+    );
+}
+
+#[test]
+fn test_ir_float_mul() {
+    let src = "fn main() -> i64 { let a = 2.0 let b = 3.0 if a * b == 6.0 { 1 } else { 0 } }";
+    let ir = compile_src(src).unwrap();
+    assert!(
+        ir.contains("fmul"),
+        "Float mul should emit fmul, got: {}",
+        ir
+    );
+}
+
+#[test]
+fn test_ir_float_div() {
+    let src = "fn main() -> i64 { let a = 10.0 let b = 2.0 if a / b == 5.0 { 1 } else { 0 } }";
+    let ir = compile_src(src).unwrap();
+    assert!(
+        ir.contains("fdiv"),
+        "Float div should emit fdiv, got: {}",
+        ir
+    );
+}
+
+#[test]
+fn test_ir_float_comparison_eq() {
+    let src = "fn main() -> i64 { let a = 5.5 let b = 5.5 if a == b { 1 } else { 0 } }";
+    let ir = compile_src(src).unwrap();
+    assert!(
+        ir.contains("fcmp"),
+        "Float comparison should emit fcmp, got: {}",
+        ir
+    );
+}
+
+#[test]
+fn test_ir_float_comparison_ordering() {
+    // Test floating-point ordering predicates: OLT (less than), OGT (greater than), OLE, OGE
+    let src = "fn main() -> i64 { let a = 1.0 let b = 2.0 if a < b { 1 } else { 0 } }";
+    let ir = compile_src(src).unwrap();
+    assert!(
+        ir.contains("fcmp olt"),
+        "Float < should emit fcmp olt, got: {}",
+        ir
+    );
+}
+
+#[test]
+fn test_ir_float_function_call() {
+    // Test that f64 function calls work across functions and emit correct IR
+    let src = "fn compute() -> f64 { let a = 10.0 let b = 2.0 a / b } fn main() -> i64 { let r = compute() if r == 5.0 { 1 } else { 0 } }";
+    let ir = compile_src(src).unwrap();
+    assert!(
+        ir.contains("define double @compute"),
+        "compute should return double: {}",
+        ir
+    );
+    assert!(
+        ir.contains("fdiv"),
+        "Should contain fdiv in compute function: {}",
+        ir
+    );
+    assert!(
+        ir.contains("fcmp oeq"),
+        "Should contain fcmp oeq comparison in main: {}",
+        ir
+    );
+}
+
+#[test]
+fn test_ir_float_mixed_type_rejected() {
+    // Mixed-type arithmetic should be rejected by semantic analysis (type mismatch)
+    let src = "fn main() -> i64 { let x = 1 + 2.0 0 }";
+    let result = compile_src(src);
+    assert!(
+        result.is_err(),
+        "Mixed int+float should be rejected by semantic analysis"
+    );
+}
