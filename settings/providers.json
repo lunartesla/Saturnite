@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "lastUsedProvider": "poolside",
+  "modes": {},
+  "providers": {
+    "cline": {
+      "settings": {
+        "provider": "cline",
+        "model": "inclusionai/ling-3.0-flash-fin:free"
+      },
+      "updatedAt": "2026-08-27T22:06:44.656Z",
+      "tokenSource": "manual"
+    },
+    "poolside": {
+      "settings": {
+        "provider": "poolside",
+        "apiKey": "sky_HBEA0WAD.TTg5UjbSSXfio0p3S7jZKUWBuIksZ3zx",
+        "model": "poolside/laguna-s-2.1",
+        "reasoning": {
+          "enabled": true,
+          "effort": "medium"
+        }
+      },
+      "updatedAt": "2026-08-27T22:07:09.504Z",
+      "tokenSource": "manual"
+    }
+  }
+}

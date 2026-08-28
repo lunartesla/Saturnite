@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "updatedAt": 1787868403847,
+  "userId": null,
+  "flagsPayload": {
+    "featureFlags": {
+      "ext-cline-pass": true
+    },
+    "featureFlagPayloads": {}
+  }
+}
