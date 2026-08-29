@@ -252,7 +252,12 @@ fn main() -> anyhow::Result<()> {
             } else {
                 project.load()?
             };
-            let hir = stnx::semantic::analyze_and_lower(&program).map_err(render_diagnostic)?;
+            // Use the graph-aware lowering path so multi-module projects
+            // (mod decls, use decls) are correctly resolved. The
+            // single-file case is a graph with just the root module, so
+            // this works for both single- and multi-file programs.
+            let hir = stnx::semantic::analyze_and_lower_with_graph(&program, &project.graph)
+                .map_err(render_diagnostic)?;
 
             // Lower HIR → MIR (the single production codegen seam).
             let mut mir =
@@ -493,7 +498,10 @@ fn build_run_file(
 ) -> anyhow::Result<std::path::PathBuf> {
     let mut project = Project::discover(input)?;
     let program = project.load_from(input)?;
-    let hir = stnx::semantic::analyze_and_lower(&program)
+    // Use the graph-aware lowering path so multi-module projects
+    // (mod decls, use decls) are correctly resolved. The single-file
+    // case is a graph with just the root module, so this works for both.
+    let hir = stnx::semantic::analyze_and_lower_with_graph(&program, &project.graph)
         .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
 
     // Lower HIR → MIR (the single production codegen seam).
@@ -547,7 +555,10 @@ fn build_run_file(
 fn check_file(input: &std::path::Path) -> anyhow::Result<()> {
     let mut project = Project::discover(input)?;
     let program = project.load_from(input)?;
-    stnx::semantic::analyze(&program).map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
+    // Use the graph-aware lowering path so multi-module projects get the
+    // same `use` / `mod` resolution as Build and Run.
+    stnx::semantic::analyze_and_lower_with_graph(&program, &project.graph)
+        .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
 
     Ok(())
 }

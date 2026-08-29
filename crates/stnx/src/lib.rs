@@ -9,6 +9,10 @@
 //! - [`lexer`] — tokenizes source text into [`Token`](lexer::Token)s.
 //! - [`parser`] — parses tokens into an [`ast::Program`] AST.
 //! - [`semantic`] — semantic analysis (delegates to HIR lowering).
+//! - [`resolver`] — dedicated name-resolution pass (consumes HIR, runs
+//!   after lowering, before MIR).
+//! - [`resolver`] — dedicated name-resolution pass (consumes HIR, runs
+//!   after lowering, before MIR).
 //! - [`codegen`] — object emission and linking seams (MIR→LLVM via [`mir::codegen`]).
 //! - [`target`] — target configuration (triple, architecture, OS, etc.).
 //! - [`error`] — structured error types for every compilation stage.
@@ -24,6 +28,7 @@ pub mod lexer;
 pub mod mir;
 pub mod module;
 pub mod parser;
+pub mod resolver;
 pub mod semantic;
 pub mod target;
 
@@ -37,11 +42,12 @@ pub use ast::Program;
 // produced by the AST→HIR lowering pass (see [`hir::lower`]).
 // Codegen consumes `HirProgram` directly — not raw AST.
 
-pub use hir::lower::{lower_with_graph, resolve_modules};
+pub use hir::lower::lower_with_graph;
 pub use hir::{
     DefEntry, DefId, DefKind, DefTable, HirExpr, HirExprKind, HirFunction, HirLower, HirModDecl,
     HirProgram, HirStmt, HirStmtKind, HirType, HirUseDecl, SymbolId, SymbolInterner, Visibility,
 };
+pub use resolver::resolve_modules;
 
 // --- Code generation re-exports ---
 //

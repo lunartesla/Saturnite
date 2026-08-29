@@ -44,7 +44,7 @@ pub fn analyze_and_lower_with_graph(
     graph: &crate::module::ModuleGraph,
 ) -> CompilerResult<hir::HirProgram> {
     let mut hir = hir::lower::lower_with_graph(program, graph)?;
-    hir::lower::resolve_modules(&mut hir)?;
+    crate::resolver::resolve_modules(&mut hir)?;
     Ok(hir)
 }
 
