@@ -87,16 +87,34 @@ fn program<'a>() -> impl Parser<'a, &'a [Token], Program, ParserExtra<'a>> {
 fn func<'a>() -> impl Parser<'a, &'a [Token], Function, ParserExtra<'a>> {
     kw("fn")
         .ignore_then(t_ident())
+        .then(generic_params())
         .then(params())
         .then(ret_type())
         .then(block(recursive_expr()))
-        .map(|((((name, name_span), params), ret_type), body)| Function {
-            name,
-            params,
-            return_type: ret_type,
-            body,
-            span: name_span,
-        })
+        .map(
+            |(((((name, name_span), generic_params), params), ret_type), body)| Function {
+                name,
+                generic_params,
+                params,
+                return_type: ret_type,
+                body,
+                span: name_span,
+            },
+        )
+}
+
+/// Parse an optional `<T1, T2, ...>` generic parameter list after a function
+/// or type name. Returns an empty `Vec` when no angle brackets are present.
+fn generic_params<'a>() -> impl Parser<'a, &'a [Token], Vec<String>, ParserExtra<'a>> {
+    lt().ignore_then(
+        t_ident()
+            .map(|(name, _span)| name)
+            .separated_by(comma())
+            .collect::<Vec<_>>(),
+    )
+    .then_ignore(gt())
+    .or_not()
+    .map(|opt: Option<Vec<String>>| opt.unwrap_or_default())
 }
 
 /// Parse an optional `pub` visibility prefix.
@@ -124,11 +142,12 @@ fn item<'a>() -> impl Parser<'a, &'a [Token], Item, ParserExtra<'a>> {
                     (name, ItemKind::Function(f), span)
                 })
                 // struct definition at top level: struct Name { fields }
-                .or(struct_item().map(|(name, fields, span)| {
+                .or(struct_item().map(|(name, generic_params, fields, span)| {
                     (
                         name.clone(),
                         ItemKind::StructDef {
                             name,
+                            generic_params,
                             fields,
                             span: span.clone(),
                         },
@@ -136,11 +155,12 @@ fn item<'a>() -> impl Parser<'a, &'a [Token], Item, ParserExtra<'a>> {
                     )
                 }))
                 // enum definition at top level: enum Name { variants }
-                .or(enum_item().map(|(name, variants, span)| {
+                .or(enum_item().map(|(name, generic_params, variants, span)| {
                     (
                         name.clone(),
                         ItemKind::EnumDef {
                             name,
+                            generic_params,
                             variants,
                             span: span.clone(),
                         },
@@ -162,10 +182,15 @@ fn item<'a>() -> impl Parser<'a, &'a [Token], Item, ParserExtra<'a>> {
 
 /// Parse a top-level struct definition: `struct Name { field1: type1, field2: type2 }`
 #[allow(clippy::type_complexity)]
-fn struct_item<'a>(
-) -> impl Parser<'a, &'a [Token], (String, Vec<(String, Type)>, Range<usize>), ParserExtra<'a>> {
+fn struct_item<'a>() -> impl Parser<
+    'a,
+    &'a [Token],
+    (String, Vec<String>, Vec<(String, Type)>, Range<usize>),
+    ParserExtra<'a>,
+> {
     kw_span("struct")
         .ignore_then(t_ident())
+        .then(generic_params())
         .then(
             lbrace()
                 .ignore_then(
@@ -177,14 +202,18 @@ fn struct_item<'a>(
                 )
                 .then_ignore(rbrace()),
         )
-        .map(|((name, name_span), fields)| (name, fields, name_span))
+        .map(|(((name, name_span), generic_params), fields)| {
+            (name, generic_params, fields, name_span)
+        })
 }
 
 /// Parse a top-level enum definition: `enum Name { Variant1, Variant2 }`
 fn enum_item<'a>(
-) -> impl Parser<'a, &'a [Token], (String, Vec<String>, Range<usize>), ParserExtra<'a>> {
+) -> impl Parser<'a, &'a [Token], (String, Vec<String>, Vec<String>, Range<usize>), ParserExtra<'a>>
+{
     kw_span("enum")
         .ignore_then(t_ident())
+        .then(generic_params())
         .then(
             lbrace()
                 .ignore_then(
@@ -195,7 +224,9 @@ fn enum_item<'a>(
                 )
                 .then_ignore(rbrace()),
         )
-        .map(|((name, name_span), variants)| (name, variants, name_span))
+        .map(|(((name, name_span), generic_params), variants)| {
+            (name, generic_params, variants, name_span)
+        })
 }
 
 /// Parse a `mod <ident>` declaration (no semicolon).
@@ -371,6 +402,7 @@ fn stmt<'a>(
     // Struct definition: `struct Name { field1: type1, field2: type2 }`
     let struct_def = kw("struct")
         .ignore_then(t_ident())
+        .then(generic_params())
         .then(
             lbrace()
                 .ignore_then(
@@ -382,15 +414,19 @@ fn stmt<'a>(
                 )
                 .then_ignore(rbrace()),
         )
-        .map(|((name, name_span), fields)| Stmt::StructDef {
-            name,
-            fields,
-            span: name_span,
-        });
+        .map(
+            |(((name, name_span), generic_params), fields)| Stmt::StructDef {
+                name,
+                generic_params,
+                fields,
+                span: name_span,
+            },
+        );
 
     // Enum definition: `enum Name { Variant1, Variant2 }`
     let enum_def = kw("enum")
         .ignore_then(t_ident())
+        .then(generic_params())
         .then(
             lbrace()
                 .ignore_then(
@@ -401,11 +437,14 @@ fn stmt<'a>(
                 )
                 .then_ignore(rbrace()),
         )
-        .map(|((name, name_span), variants)| Stmt::EnumDef {
-            name,
-            variants,
-            span: name_span,
-        });
+        .map(
+            |(((name, name_span), generic_params), variants)| Stmt::EnumDef {
+                name,
+                generic_params,
+                variants,
+                span: name_span,
+            },
+        );
 
     let expr_stmt = expr.map(|e| {
         let span = stmt_span(&e);
@@ -454,6 +493,24 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
                 .or(kw_span("false").map(|s| Expr::Bool(false, s))))
             .or(lbrace_span().then_ignore(rbrace()).map(Expr::Unit))
             .or(t_ident()
+                // Optional turbofish for struct literals: `Box::<i64> { ... }`.
+                .then(
+                    double_colon()
+                        .ignore_then(lt())
+                        .ignore_then(
+                            kw("i64")
+                                .to(Type::I64)
+                                .or(kw("f64").to(Type::F64))
+                                .or(kw("bool").to(Type::Bool))
+                                .or(kw("str").to(Type::Str))
+                                .or(kw("unit").to(Type::Unit))
+                                .or(t_ident().map(|(name, _)| Type::Struct(name)))
+                                .separated_by(comma())
+                                .collect::<Vec<_>>(),
+                        )
+                        .then_ignore(gt())
+                        .or_not(),
+                )
                 .then(
                     lbrace()
                         .ignore_then(
@@ -465,11 +522,14 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
                         )
                         .then_ignore(rbrace()),
                 )
-                .map(|((name, name_span), fields)| Expr::StructLiteral {
-                    name,
-                    fields,
-                    span: name_span,
-                }))
+                .map(
+                    |(((name, name_span), type_args), fields)| Expr::StructLiteral {
+                        name,
+                        fields,
+                        type_args: type_args.unwrap_or_default(),
+                        span: name_span,
+                    },
+                ))
             .or(t_ident().then(double_colon().ignore_then(t_ident())).map(
                 |((name, name_span), (variant, _))| Expr::EnumConstructor {
                     name,
@@ -477,20 +537,50 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
                     span: name_span,
                 },
             ))
+            // Call or variable: `f` or `f(args)` or `f::<T>(args)`.
+            //
+            // The turbofish `::<T1, T2>` is consumed before the optional
+            // `(args)` group. We parse it as an optional segment after the
+            // identifier; if absent, `type_args` is an empty Vec.
             .or(t_ident()
+                .then(
+                    double_colon()
+                        .ignore_then(lt())
+                        .ignore_then(
+                            // A type-arg list: one or more `Type`s separated by commas.
+                            // We reuse `type_ann`-shaped identifiers via the same
+                            // inner Type productions used elsewhere.
+                            kw("i64")
+                                .to(Type::I64)
+                                .or(kw("f64").to(Type::F64))
+                                .or(kw("bool").to(Type::Bool))
+                                .or(kw("str").to(Type::Str))
+                                .or(kw("unit").to(Type::Unit))
+                                .or(t_ident().map(|(name, _)| Type::Struct(name)))
+                                .separated_by(comma())
+                                .collect::<Vec<_>>(),
+                        )
+                        .then_ignore(gt())
+                        .or_not(),
+                )
                 .then(
                     lparen()
                         .ignore_then(expr.clone().separated_by(comma()).collect::<Vec<_>>())
                         .then_ignore(rparen())
                         .or_not(),
                 )
-                .map(|((name, name_span), args)| {
+                .map(|(((name, name_span), type_args), args)| {
                     if let Some(args) = args {
                         Expr::Call {
                             func: name,
                             args,
+                            type_args: type_args.unwrap_or_default(),
                             span: name_span,
                         }
+                    } else if type_args.is_some() {
+                        // `f::<T>` without `(args)` — surface as a parse error
+                        // (a turbofish without a call is malformed).
+                        Expr::Var(name, name_span)
                     } else {
                         Expr::Var(name, name_span)
                     }

@@ -13,7 +13,7 @@ use crate::hir::symbol::SymbolId;
 use serde::{Deserialize, Serialize};
 
 /// Compiler-internal type used throughout HIR and consumed by codegen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HirType {
     I64,
     F64,
@@ -27,6 +27,18 @@ pub enum HirType {
     /// `i64` tag so codegen is straightforward; the `SymbolId` enables
     /// future pattern-matching / variant discrimination.
     Enum(SymbolId),
+    /// A free type variable — the name of a generic parameter as it appears
+    /// in the source (e.g. `T` in `fn id<T>(x: T) -> T`). Resolved at
+    /// monomorphization time by substitution. Not produced by `From<ast::Type>`.
+    Generic(SymbolId),
+    /// An applied (instantiated) generic type: `Pair<i64, bool>` is
+    /// `Apply { base: Pair, args: [I64, Bool] }`. `base` is the
+    /// `SymbolId` of the generic struct/enum. Not produced by
+    /// `From<ast::Type>` (the parser keeps generics at the item level).
+    Apply {
+        base: SymbolId,
+        args: Vec<HirType>,
+    },
 }
 
 impl HirType {
@@ -38,6 +50,32 @@ impl HirType {
     /// Whether this type is `Unit` (i.e., `()`).
     pub fn is_unit(&self) -> bool {
         matches!(self, HirType::Unit)
+    }
+
+    /// Whether this type contains a free generic parameter, either
+    /// directly (`Generic(_)`) or nested inside an `Apply`'s args.
+    /// Used to detect generic callees whose return type cannot be
+    /// concretely resolved until monomorphization.
+    pub fn contains_generic(&self) -> bool {
+        match self {
+            HirType::Generic(_) => true,
+            HirType::Apply { args, .. } => args.iter().any(|a| a.contains_generic()),
+            _ => false,
+        }
+    }
+
+    /// Substitute each `Generic(s)` according to `subst`. Used to compute
+    /// the concrete return type of a generic call given its turbofish type
+    /// arguments (e.g. `id::<i64>(x)` produces `I64` from `T`).
+    pub fn substitute(&self, subst: &std::collections::HashMap<SymbolId, HirType>) -> HirType {
+        match self {
+            HirType::Generic(sym) => subst.get(sym).cloned().unwrap_or_else(|| self.clone()),
+            HirType::Apply { base, args } => HirType::Apply {
+                base: *base,
+                args: args.iter().map(|a| a.substitute(subst)).collect(),
+            },
+            _ => self.clone(),
+        }
     }
 }
 

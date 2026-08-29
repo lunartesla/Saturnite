@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use stnx::codegen;
 use stnx::mir::codegen::{compile_from_mir_ext, generate_ir_from_mir};
-use stnx::mir::lower::lower_program;
+use stnx::mir::monomorphize::monomorphize;
 use stnx::mir::opt::optimize;
 use stnx::module::Project;
 use stnx::target::{DebugInfo, OptimizationLevel, OutputKind, Profile, TargetConfig};
@@ -260,8 +260,8 @@ fn main() -> anyhow::Result<()> {
                 .map_err(render_diagnostic)?;
 
             // Lower HIR → MIR (the single production codegen seam).
-            let mut mir =
-                lower_program(&hir).map_err(|e| anyhow::anyhow!("MIR lowering failed: {}", e))?;
+            let mut mir = monomorphize(&hir)
+                .map_err(|e| anyhow::anyhow!("monomorphization failed: {}", e))?;
 
             // Verify the MIR CFG before handing it to LLVM.
             if let Err(errs) = mir.verify() {
@@ -505,7 +505,8 @@ fn build_run_file(
         .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
 
     // Lower HIR → MIR (the single production codegen seam).
-    let mut mir = lower_program(&hir).map_err(|e| anyhow::anyhow!("MIR lowering failed: {}", e))?;
+    let mut mir =
+        monomorphize(&hir).map_err(|e| anyhow::anyhow!("monomorphization failed: {}", e))?;
 
     if let Err(errs) = mir.verify() {
         let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();

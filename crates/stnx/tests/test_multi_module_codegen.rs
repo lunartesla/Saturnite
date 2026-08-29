@@ -133,7 +133,10 @@ fn collect_calls(func: &MirFunction) -> Vec<(DefId, stnx::mir::LocalId)> {
 
 /// Find the type of a local by `LocalId` in a MIR function.
 fn local_type(func: &MirFunction, local_id: stnx::mir::LocalId) -> Option<HirType> {
-    func.locals.iter().find(|l| l.id == local_id).map(|l| l.ty)
+    func.locals
+        .iter()
+        .find(|l| l.id == local_id)
+        .map(|l| l.ty.clone())
 }
 
 /// Find a module by name in the HIR's module list.
@@ -430,7 +433,7 @@ fn value_bool() -> bool { return true }
         let actual_ty = local_type(main_mir, *dest_local_id);
         assert_eq!(
             actual_ty,
-            Some(expected_ty),
+            Some(expected_ty.clone()),
             "Call to {} should produce a destination local typed {:?}, got {:?}",
             label,
             expected_ty,

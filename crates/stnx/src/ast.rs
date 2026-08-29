@@ -72,11 +72,13 @@ pub enum ItemKind {
     Function(Function),
     StructDef {
         name: String,
+        generic_params: Vec<String>,
         fields: Vec<(String, Type)>,
         span: Range<usize>,
     },
     EnumDef {
         name: String,
+        generic_params: Vec<String>,
         variants: Vec<String>,
         span: Range<usize>,
     },
@@ -95,6 +97,9 @@ pub enum ItemKind {
 #[derive(Clone, Debug)]
 pub struct Function {
     pub name: String,
+    /// Generic parameter names (`fn id<T>(...)` → `["T"]`).
+    /// Empty for non-generic functions.
+    pub generic_params: Vec<String>,
     pub params: Vec<(String, Type)>,
     pub return_type: Type,
     pub body: Vec<Stmt>,
@@ -116,12 +121,14 @@ pub enum Stmt {
     /// A struct definition: `struct Point { x: i64, y: i64 }`
     StructDef {
         name: String,
+        generic_params: Vec<String>,
         fields: Vec<(String, Type)>,
         span: Range<usize>,
     },
     /// An enum definition: `enum Result { Ok, Error }`
     EnumDef {
         name: String,
+        generic_params: Vec<String>,
         variants: Vec<String>,
         span: Range<usize>,
     },
@@ -160,6 +167,9 @@ pub enum Expr {
     Call {
         func: String,
         args: Vec<Expr>,
+        /// Explicit type arguments supplied at the call site via turbofish
+        /// syntax (`f::<i64, bool>(x, y)`). Empty when no turbofish was used.
+        type_args: Vec<Type>,
         span: Range<usize>,
     },
     If {
@@ -190,6 +200,9 @@ pub enum Expr {
     StructLiteral {
         name: String,
         fields: Vec<(String, Expr)>,
+        /// Explicit type arguments supplied via turbofish syntax
+        /// (`Box::<i64> { value: 21 }`). Empty when no turbofish was used.
+        type_args: Vec<Type>,
         span: Range<usize>,
     },
     /// Field access: `p.x`

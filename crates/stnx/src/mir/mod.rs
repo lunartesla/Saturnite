@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod codegen;
 pub mod lower;
+pub mod monomorphize;
 pub mod opt;
 pub mod verify;
 
@@ -89,7 +90,7 @@ impl MirOperand {
             MirOperand::Local(lid) => locals
                 .iter()
                 .find(|l| l.id == *lid)
-                .map(|l| l.ty)
+                .map(|l| l.ty.clone())
                 .unwrap_or(MirType::I64),
         }
     }

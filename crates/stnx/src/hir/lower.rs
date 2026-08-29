@@ -37,6 +37,11 @@ struct FunctionSig {
     def_id: DefId,
     param_types: Vec<HirType>,
     return_type: HirType,
+    /// Interned names of the function's generic parameters, in declaration
+    /// order. Empty for non-generic functions. Used by `lower_expr` to
+    /// resolve the concrete return type of a generic call given its
+    /// turbofish type arguments.
+    generic_params: Vec<SymbolId>,
 }
 
 /// DefId sentinel for the builtin `println` function.
@@ -57,7 +62,7 @@ struct LowerContext<'a> {
 }
 
 /// A variable entry tracked during lowering.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct VarInfo {
     ty: HirType,
     mutable: bool,
@@ -88,7 +93,7 @@ impl LowerScope {
     }
     fn lookup_variable(&self, sym: &SymbolId) -> Option<VarInfo> {
         if let Some(v) = self.variables.get(sym) {
-            Some(*v)
+            Some(v.clone())
         } else {
             self.parent.as_ref().and_then(|p| p.lookup_variable(sym))
         }
@@ -97,10 +102,15 @@ impl LowerScope {
 
 /// Convert an `ast::Type` to a `HirType`, interning names.
 /// Used during Pass 1 (before struct/enum definitions are fully collected).
+/// Convert an AST [`Type`] to an [`HirType`]. When `generic_param_names`
+/// is `Some`, a `Type::Struct(name)` whose name matches a generic
+/// parameter is resolved to `HirType::Generic(...)` instead of being
+/// treated as a user-defined struct.
 fn ast_type_to_hir(
     ty: &Type,
     symbols: &mut SymbolInterner,
     enum_names: &HashMap<&str, ()>,
+    generic_param_names: Option<&[SymbolId]>,
 ) -> HirType {
     match ty {
         Type::I64 => HirType::I64,
@@ -110,6 +120,14 @@ fn ast_type_to_hir(
         Type::Unit => HirType::Unit,
         Type::Struct(name) => {
             let sym = symbols.intern(name);
+            // Generic parameter match takes precedence over user-defined
+            // types because the parser produces `Type::Struct` for every
+            // identifier-shaped type name, including generic params.
+            if let Some(gparams) = generic_param_names {
+                if gparams.contains(&sym) {
+                    return HirType::Generic(sym);
+                }
+            }
             // The parser produces Type::Struct for all user-defined type
             // references. If the name is actually an enum, resolve it as
             // HirType::Enum instead.
@@ -208,19 +226,37 @@ impl HirLower {
         // so MIR/codegen can disambiguate.
         for item in &program.items {
             match &item.kind {
-                ItemKind::StructDef { name, fields, span } => {
+                ItemKind::StructDef {
+                    name,
+                    generic_params,
+                    fields,
+                    span,
+                } => {
                     let name_id = self.symbols.intern(name);
+                    let generic_param_syms: Vec<SymbolId> = generic_params
+                        .iter()
+                        .map(|p| self.symbols.intern(p))
+                        .collect();
                     let field_syms: Vec<(SymbolId, HirType)> = fields
                         .iter()
                         .map(|(fname, fty)| {
                             let fid = self.symbols.intern(fname);
-                            (fid, ast_type_to_hir(fty, &mut self.symbols, &enum_names))
+                            (
+                                fid,
+                                ast_type_to_hir(
+                                    fty,
+                                    &mut self.symbols,
+                                    &enum_names,
+                                    Some(&generic_param_syms),
+                                ),
+                            )
                         })
                         .collect();
                     let def_id = DefId(structs.len() as u32);
                     structs.push(StructDef {
                         def_id,
                         name: name_id,
+                        generic_params: generic_param_syms,
                         fields: field_syms,
                         span: span_to_source_span(span),
                         module: ModuleId::ROOT,
@@ -229,16 +265,22 @@ impl HirLower {
                 }
                 ItemKind::EnumDef {
                     name,
+                    generic_params,
                     variants,
                     span,
                 } => {
                     let name_id = self.symbols.intern(name);
                     let variant_syms: Vec<SymbolId> =
                         variants.iter().map(|v| self.symbols.intern(v)).collect();
+                    let generic_param_syms: Vec<SymbolId> = generic_params
+                        .iter()
+                        .map(|p| self.symbols.intern(p))
+                        .collect();
                     let def_id = DefId(enums.len() as u32);
                     enums.push(EnumDef {
                         def_id,
                         name: name_id,
+                        generic_params: generic_param_syms,
                         variants: variant_syms,
                         span: span_to_source_span(span),
                         module: ModuleId::ROOT,
@@ -295,18 +337,36 @@ impl HirLower {
         for func in &program.functions {
             for stmt in &func.body {
                 match stmt {
-                    Stmt::StructDef { name, fields, span } => {
+                    Stmt::StructDef {
+                        name,
+                        generic_params,
+                        fields,
+                        span,
+                    } => {
                         let name_id = self.symbols.intern(name);
+                        let generic_param_syms: Vec<SymbolId> = generic_params
+                            .iter()
+                            .map(|p| self.symbols.intern(p))
+                            .collect();
                         let field_syms: Vec<(SymbolId, HirType)> = fields
                             .iter()
                             .map(|(fname, fty)| {
                                 let fid = self.symbols.intern(fname);
-                                (fid, ast_type_to_hir(fty, &mut self.symbols, &enum_names))
+                                (
+                                    fid,
+                                    ast_type_to_hir(
+                                        fty,
+                                        &mut self.symbols,
+                                        &enum_names,
+                                        Some(&generic_param_syms),
+                                    ),
+                                )
                             })
                             .collect();
                         structs.push(StructDef {
                             def_id: DefId(structs.len() as u32),
                             name: name_id,
+                            generic_params: generic_param_syms,
                             fields: field_syms,
                             span: span_to_source_span(span),
                             module: ModuleId::ROOT,
@@ -315,15 +375,21 @@ impl HirLower {
                     }
                     Stmt::EnumDef {
                         name,
+                        generic_params,
                         variants,
                         span,
                     } => {
                         let name_id = self.symbols.intern(name);
                         let variant_syms: Vec<SymbolId> =
                             variants.iter().map(|v| self.symbols.intern(v)).collect();
+                        let generic_param_syms: Vec<SymbolId> = generic_params
+                            .iter()
+                            .map(|p| self.symbols.intern(p))
+                            .collect();
                         enums.push(EnumDef {
                             def_id: DefId(enums.len() as u32),
                             name: name_id,
+                            generic_params: generic_param_syms,
                             variants: variant_syms,
                             span: span_to_source_span(span),
                             module: ModuleId::ROOT,
@@ -341,19 +407,34 @@ impl HirLower {
             if let ItemKind::Function(func) = &item.kind {
                 let name_id = self.symbols.intern(&func.name);
                 let def_id = DefId(next_func_def_id);
+                // Intern this function's generic params so that
+                // `ast_type_to_hir` can recognize them as `HirType::Generic`
+                // when resolving the param/return types below.
+                let gparams: Vec<SymbolId> = func
+                    .generic_params
+                    .iter()
+                    .map(|p| self.symbols.intern(p))
+                    .collect();
                 let param_types: Vec<HirType> = func
                     .params
                     .iter()
-                    .map(|(_, t)| ast_type_to_hir(t, &mut self.symbols, &enum_names))
+                    .map(|(_, t)| {
+                        ast_type_to_hir(t, &mut self.symbols, &enum_names, Some(&gparams))
+                    })
                     .collect();
-                let return_type =
-                    ast_type_to_hir(&func.return_type, &mut self.symbols, &enum_names);
+                let return_type = ast_type_to_hir(
+                    &func.return_type,
+                    &mut self.symbols,
+                    &enum_names,
+                    Some(&gparams),
+                );
                 function_sigs.insert(
                     name_id,
                     FunctionSig {
                         def_id,
                         param_types,
                         return_type,
+                        generic_params: gparams,
                     },
                 );
                 next_func_def_id += 1;
@@ -367,6 +448,7 @@ impl HirLower {
                 def_id: PRINTLN_DEF_ID,
                 param_types: vec![HirType::I64],
                 return_type: HirType::Unit,
+                generic_params: Vec::new(),
             },
         );
         // Check for main
@@ -604,20 +686,37 @@ impl HirLower {
             for item in &ast.items {
                 match &item.kind {
                     ItemKind::StructDef {
-                        name, fields, span, ..
+                        name,
+                        generic_params,
+                        fields,
+                        span,
+                        ..
                     } => {
                         let name_id = self.symbols.intern(name);
+                        let generic_param_syms: Vec<SymbolId> = generic_params
+                            .iter()
+                            .map(|p| self.symbols.intern(p))
+                            .collect();
                         let field_syms: Vec<(SymbolId, HirType)> = fields
                             .iter()
                             .map(|(fname, fty)| {
                                 let fid = self.symbols.intern(fname);
-                                (fid, ast_type_to_hir(fty, &mut self.symbols, &enum_names))
+                                (
+                                    fid,
+                                    ast_type_to_hir(
+                                        fty,
+                                        &mut self.symbols,
+                                        &enum_names,
+                                        Some(&generic_param_syms),
+                                    ),
+                                )
                             })
                             .collect();
                         let def_id = DefId(structs.len() as u32);
                         structs.push(StructDef {
                             def_id,
                             name: name_id,
+                            generic_params: generic_param_syms,
                             fields: field_syms,
                             span: span_to_source_span(span),
                             module: module_id,
@@ -626,16 +725,22 @@ impl HirLower {
                     }
                     ItemKind::EnumDef {
                         name,
+                        generic_params,
                         variants,
                         span,
                     } => {
                         let name_id = self.symbols.intern(name);
                         let variant_syms: Vec<SymbolId> =
                             variants.iter().map(|v| self.symbols.intern(v)).collect();
+                        let generic_param_syms: Vec<SymbolId> = generic_params
+                            .iter()
+                            .map(|p| self.symbols.intern(p))
+                            .collect();
                         let def_id = DefId(enums.len() as u32);
                         enums.push(EnumDef {
                             def_id,
                             name: name_id,
+                            generic_params: generic_param_syms,
                             variants: variant_syms,
                             span: span_to_source_span(span),
                             module: module_id,
@@ -687,18 +792,36 @@ impl HirLower {
             for func in &ast.functions {
                 for stmt in &func.body {
                     match stmt {
-                        Stmt::StructDef { name, fields, span } => {
+                        Stmt::StructDef {
+                            name,
+                            generic_params,
+                            fields,
+                            span,
+                        } => {
                             let name_id = self.symbols.intern(name);
+                            let generic_param_syms: Vec<SymbolId> = generic_params
+                                .iter()
+                                .map(|p| self.symbols.intern(p))
+                                .collect();
                             let field_syms: Vec<(SymbolId, HirType)> = fields
                                 .iter()
                                 .map(|(fname, fty)| {
                                     let fid = self.symbols.intern(fname);
-                                    (fid, ast_type_to_hir(fty, &mut self.symbols, &enum_names))
+                                    (
+                                        fid,
+                                        ast_type_to_hir(
+                                            fty,
+                                            &mut self.symbols,
+                                            &enum_names,
+                                            Some(&generic_param_syms),
+                                        ),
+                                    )
                                 })
                                 .collect();
                             structs.push(StructDef {
                                 def_id: DefId(structs.len() as u32),
                                 name: name_id,
+                                generic_params: generic_param_syms,
                                 fields: field_syms,
                                 span: span_to_source_span(span),
                                 module: module_id,
@@ -707,15 +830,21 @@ impl HirLower {
                         }
                         Stmt::EnumDef {
                             name,
+                            generic_params,
                             variants,
                             span,
                         } => {
                             let name_id = self.symbols.intern(name);
                             let variant_syms: Vec<SymbolId> =
                                 variants.iter().map(|v| self.symbols.intern(v)).collect();
+                            let generic_param_syms: Vec<SymbolId> = generic_params
+                                .iter()
+                                .map(|p| self.symbols.intern(p))
+                                .collect();
                             enums.push(EnumDef {
                                 def_id: DefId(enums.len() as u32),
                                 name: name_id,
+                                generic_params: generic_param_syms,
                                 variants: variant_syms,
                                 span: span_to_source_span(span),
                                 module: module_id,
@@ -732,19 +861,33 @@ impl HirLower {
                 if let ItemKind::Function(func) = &item.kind {
                     let name_id = self.symbols.intern(&func.name);
                     let def_id = DefId(next_func_def_id);
+                    // Intern generic params first so signature resolution
+                    // recognizes them as `HirType::Generic`.
+                    let gparams: Vec<SymbolId> = func
+                        .generic_params
+                        .iter()
+                        .map(|p| self.symbols.intern(p))
+                        .collect();
                     let param_types: Vec<HirType> = func
                         .params
                         .iter()
-                        .map(|(_, t)| ast_type_to_hir(t, &mut self.symbols, &enum_names))
+                        .map(|(_, t)| {
+                            ast_type_to_hir(t, &mut self.symbols, &enum_names, Some(&gparams))
+                        })
                         .collect();
-                    let return_type =
-                        ast_type_to_hir(&func.return_type, &mut self.symbols, &enum_names);
+                    let return_type = ast_type_to_hir(
+                        &func.return_type,
+                        &mut self.symbols,
+                        &enum_names,
+                        Some(&gparams),
+                    );
                     function_sigs.insert(
                         name_id,
                         FunctionSig {
                             def_id,
                             param_types,
                             return_type,
+                            generic_params: gparams,
                         },
                     );
                     next_func_def_id += 1;
@@ -760,6 +903,7 @@ impl HirLower {
                 def_id: PRINTLN_DEF_ID,
                 param_types: vec![HirType::I64],
                 return_type: HirType::Unit,
+                generic_params: Vec::new(),
             },
         );
 
@@ -931,13 +1075,32 @@ impl HirLower {
         visibility: HirVisibility,
     ) -> CompilerResult<HirFunction> {
         let name = self.symbols.intern(&func.name);
-        let return_type = ast_type_to_hir(&func.return_type, &mut self.symbols, ctx.enum_names);
+        // Intern generic parameter names. They are also added to the local
+        // variable scope as placeholders so that any use of a type-param name
+        // inside the body (e.g. as the type of a parameter) can be
+        // recognized as `HirType::Generic` by `lower_expr`.
+        let generic_params: Vec<SymbolId> = func
+            .generic_params
+            .iter()
+            .map(|p| self.symbols.intern(p))
+            .collect();
+        let return_type = ast_type_to_hir(
+            &func.return_type,
+            &mut self.symbols,
+            ctx.enum_names,
+            Some(&generic_params),
+        );
         let mut scope = LowerScope::new();
         let mut params: Vec<(SymbolId, HirType)> = Vec::new();
         for (param_name, param_ty) in &func.params {
             let param_id = self.symbols.intern(param_name);
-            let hir_ty = ast_type_to_hir(param_ty, &mut self.symbols, ctx.enum_names);
-            scope.define_variable(param_id, hir_ty, false);
+            let hir_ty = ast_type_to_hir(
+                param_ty,
+                &mut self.symbols,
+                ctx.enum_names,
+                Some(&generic_params),
+            );
+            scope.define_variable(param_id, hir_ty.clone(), false);
             params.push((param_id, hir_ty));
         }
         let mut body: Vec<HirStmt> = Vec::new();
@@ -947,6 +1110,7 @@ impl HirLower {
         Ok(HirFunction {
             def_id,
             name,
+            generic_params,
             params,
             return_type,
             body,
@@ -974,7 +1138,7 @@ impl HirLower {
                 let name_id = self.symbols.intern(name);
                 let inferred = self.lower_expr(value, scope, return_type, ctx)?;
                 let resolved_ty = if let Some(t) = ty {
-                    let ann = ast_type_to_hir(t, &mut self.symbols, ctx.enum_names);
+                    let ann = ast_type_to_hir(t, &mut self.symbols, ctx.enum_names, None);
                     // If the annotation is a Struct type, check if it's actually an enum
                     let resolved = if let HirType::Struct(sym) = ann {
                         // Check if there's an enum with this name
@@ -994,9 +1158,9 @@ impl HirLower {
                     }
                     resolved
                 } else {
-                    inferred.ty
+                    inferred.ty.clone()
                 };
-                scope.define_variable(name_id, resolved_ty, *mutable);
+                scope.define_variable(name_id, resolved_ty.clone(), *mutable);
                 Ok(HirStmt {
                     kind: HirStmtKind::Let {
                         name: name_id,
@@ -1291,7 +1455,12 @@ impl HirLower {
                     }
                 }
             }
-            Expr::Call { func, args, span } => {
+            Expr::Call {
+                func,
+                args,
+                type_args,
+                span,
+            } => {
                 let func_sym = self.symbols.intern(func);
                 let sig = ctx.function_sigs.get(&func_sym).ok_or_else(|| {
                     CompilerError::semantic(format!("undefined function: {}", func))
@@ -1304,10 +1473,31 @@ impl HirLower {
                         args.len()
                     )));
                 }
+                // Resolve explicit type args (turbofish) into HirType so they
+                // are available for monomorphization. The arity is checked
+                // against the callee's generic_params during the monomorphize
+                // pass (it has full visibility into the HIR program by then).
+                let hir_type_args: Vec<HirType> = type_args
+                    .iter()
+                    .map(|t| ast_type_to_hir(t, &mut self.symbols, ctx.enum_names, None))
+                    .collect();
+                // Detect whether the callee is generic. If it is, the
+                // signature's param_types may include `HirType::Generic`,
+                // so a strict per-arg type check would falsely reject the
+                // call (e.g. `id::<i64>(42)` would fail because `id`'s
+                // parameter type is `Generic(T)`, not `I64`). We instead
+                // check that each argument's type is well-formed (non-error
+                // and not itself `Generic`/unresolved) and defer the
+                // concrete type matching to monomorphization.
+                let callee_is_generic = sig
+                    .param_types
+                    .iter()
+                    .any(|t| matches!(t, HirType::Generic(_)))
+                    || sig.return_type.contains_generic();
                 let mut arg_exprs: Vec<HirExpr> = Vec::new();
                 for (arg, expected_ty) in args.iter().zip(sig.param_types.iter()) {
                     let arg_expr = self.lower_expr(arg, scope, return_type, ctx)?;
-                    if arg_expr.ty != *expected_ty {
+                    if !callee_is_generic && arg_expr.ty != *expected_ty {
                         return Err(CompilerError::semantic(format!(
                             "function {} arg type mismatch: expected {:?}, got {:?}",
                             func, expected_ty, arg_expr.ty
@@ -1315,12 +1505,38 @@ impl HirLower {
                     }
                     arg_exprs.push(arg_expr);
                 }
+                // For a generic call, the declared return type is
+                // `HirType::Generic(...)`, which would mismatch a strict
+                // `return` check downstream. We pin the call's HIR type to
+                // the concrete substitution target. When the caller supplies
+                // an explicit turbofish, we substitute each generic param
+                // with the corresponding `HirType` from `hir_type_args` and
+                // get the actual concrete return type (e.g. `id::<i64>(42)`
+                // yields `I64`, not `Generic(T)`). When no turbofish is
+                // present, we fall back to `HirType::Unit`; monomorphization
+                // infers the concrete return from the argument types.
+                let call_ty = if callee_is_generic {
+                    if !hir_type_args.is_empty() {
+                        let subst: std::collections::HashMap<SymbolId, HirType> = sig
+                            .generic_params
+                            .iter()
+                            .cloned()
+                            .zip(hir_type_args.iter().cloned())
+                            .collect();
+                        sig.return_type.substitute(&subst)
+                    } else {
+                        HirType::Unit
+                    }
+                } else {
+                    sig.return_type.clone()
+                };
                 Ok(HirExpr {
                     kind: HirExprKind::Call {
                         func: sig.def_id,
                         args: arg_exprs,
+                        type_args: hir_type_args,
                     },
-                    ty: sig.return_type,
+                    ty: call_ty,
                     span: span_to_source_span(span),
                 })
             }
@@ -1455,7 +1671,12 @@ impl HirLower {
                     span: span_to_source_span(span),
                 })
             }
-            Expr::StructLiteral { name, fields, span } => {
+            Expr::StructLiteral {
+                name,
+                fields,
+                type_args,
+                span,
+            } => {
                 let name_id = self.symbols.intern(name);
                 let struct_def = ctx
                     .struct_defs
@@ -1464,20 +1685,27 @@ impl HirLower {
                     .ok_or_else(|| {
                         CompilerError::semantic(format!("undefined struct: {}", name))
                     })?;
-                // Build a field type lookup from the struct definition
+                // Build a field type lookup from the struct definition.
                 let field_type_map: HashMap<SymbolId, HirType> =
                     struct_def.fields.iter().cloned().collect();
                 let mut lowered_fields: Vec<(SymbolId, Box<HirExpr>)> = Vec::new();
                 for (field_name, field_expr) in fields {
                     let fid = self.symbols.intern(field_name);
-                    let expected_ty = field_type_map.get(&fid).copied().ok_or_else(|| {
+                    let expected_ty = field_type_map.get(&fid).cloned().ok_or_else(|| {
                         CompilerError::semantic(format!(
                             "struct {} has no field {}",
                             name, field_name
                         ))
                     })?;
                     let expr = self.lower_expr(field_expr, scope, return_type, ctx)?;
-                    if expr.ty != expected_ty {
+                    // For generic structs, the field types contain
+                    // `HirType::Generic`, so a strict type check would
+                    // falsely reject well-typed literals. Defer the
+                    // concrete type matching to monomorphization (which
+                    // substitutes the turbofish type_args).
+                    let struct_is_generic =
+                        struct_def.fields.iter().any(|(_, t)| t.contains_generic());
+                    if !struct_is_generic && expr.ty != expected_ty {
                         return Err(CompilerError::semantic(format!(
                             "field {} expects {:?}, got {:?}",
                             field_name, expected_ty, expr.ty
@@ -1485,12 +1713,29 @@ impl HirLower {
                     }
                     lowered_fields.push((fid, Box::new(expr)));
                 }
+                let hir_type_args: Vec<HirType> = type_args
+                    .iter()
+                    .map(|t| ast_type_to_hir(t, &mut self.symbols, ctx.enum_names, None))
+                    .collect();
+                // When turbofish is supplied, surface the struct literal's
+                // type as an `Apply` (so subsequent field accesses can
+                // look up the generic-arg substitution). Without turbofish,
+                // fall back to a plain `Struct` reference.
+                let lit_ty = if hir_type_args.is_empty() {
+                    HirType::Struct(name_id)
+                } else {
+                    HirType::Apply {
+                        base: name_id,
+                        args: hir_type_args.clone(),
+                    }
+                };
                 Ok(HirExpr {
                     kind: HirExprKind::StructLiteral {
                         name: name_id,
                         fields: lowered_fields,
+                        type_args: hir_type_args,
                     },
-                    ty: HirType::Struct(name_id),
+                    ty: lit_ty,
                     span: span_to_source_span(span),
                 })
             }
@@ -1502,6 +1747,7 @@ impl HirLower {
                 let inner = self.lower_expr(inner_expr, scope, return_type, ctx)?;
                 let struct_sym = match inner.ty {
                     HirType::Struct(s) => s,
+                    HirType::Apply { base, .. } => base,
                     _ => {
                         return Err(CompilerError::semantic(format!(
                             "field access on non-struct type: {:?}",
@@ -1520,14 +1766,43 @@ impl HirLower {
                         ))
                     })?;
                 let field_id = self.symbols.intern(field);
-                let field_ty = struct_def
+                let mut field_ty = struct_def
                     .fields
                     .iter()
                     .find(|(f, _)| *f == field_id)
-                    .map(|(_, ty)| *ty)
+                    .map(|(_, ty)| ty.clone())
                     .ok_or_else(|| {
                         CompilerError::semantic(format!("struct has no field: {}", field))
                     })?;
+                // If the inner expression is a generic struct literal with
+                // explicit turbofish (e.g. `Box::<i64> { value: 21 }.value`),
+                // substitute the struct's generic params with the supplied
+                // type_args so the field resolves to its concrete type
+                // (here `I64`) instead of `Generic(T)`.
+                if field_ty.contains_generic() && !struct_def.generic_params.is_empty() {
+                    let mut type_args_opt: Option<Vec<HirType>> = None;
+                    if let HirExprKind::StructLiteral { type_args, .. } = &inner.kind {
+                        if !type_args.is_empty() {
+                            type_args_opt = Some(type_args.clone());
+                        }
+                    }
+                    if type_args_opt.is_none() {
+                        if let HirType::Apply { args, .. } = &inner.ty {
+                            if !args.is_empty() {
+                                type_args_opt = Some(args.clone());
+                            }
+                        }
+                    }
+                    if let Some(ta) = type_args_opt {
+                        let subst: std::collections::HashMap<SymbolId, HirType> = struct_def
+                            .generic_params
+                            .iter()
+                            .cloned()
+                            .zip(ta.iter().cloned())
+                            .collect();
+                        field_ty = field_ty.substitute(&subst);
+                    }
+                }
                 Ok(HirExpr {
                     kind: HirExprKind::FieldAccess {
                         expr: Box::new(inner),
@@ -1722,6 +1997,7 @@ mod tests {
             visibility: AstVisibility::Private,
             kind: ItemKind::StructDef {
                 name: "Point".to_string(),
+                generic_params: vec![],
                 fields: vec![("x".to_string(), crate::ast::Type::I64)],
                 span: 0..10,
             },
@@ -1734,6 +2010,7 @@ mod tests {
                 visibility: AstVisibility::Private,
                 kind: ItemKind::Function(crate::ast::Function {
                     name: "main".to_string(),
+                    generic_params: vec![],
                     params: vec![],
                     return_type: crate::ast::Type::Unit,
                     body: vec![],
@@ -1766,6 +2043,7 @@ mod tests {
                 visibility: AstVisibility::Private,
                 kind: ItemKind::Function(crate::ast::Function {
                     name: "main".to_string(),
+                    generic_params: vec![],
                     params: vec![],
                     return_type: crate::ast::Type::I64,
                     body: vec![],
@@ -1796,6 +2074,7 @@ mod tests {
                 visibility: AstVisibility::Private,
                 kind: ItemKind::Function(crate::ast::Function {
                     name: "main".to_string(),
+                    generic_params: vec![],
                     params: vec![],
                     return_type: crate::ast::Type::I64,
                     body: vec![],

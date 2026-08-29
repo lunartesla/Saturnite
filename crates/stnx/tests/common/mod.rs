@@ -5,8 +5,9 @@
 //! never collides on fixed filenames.  The [`TempDir`] is kept alive inside
 //! the returned handle for the lifetime of the test.
 //!
-// Each integration test binary links this module but only uses a subset of the
-// helpers, so suppress `dead_code` at the module level.
+//! [`compile_src_mono`] is the monomorphization-aware variant of
+//! [`compile_src`] — used by generics tests.
+
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ use std::process::Command;
 use stnx::lexer::Lexer;
 use stnx::mir::codegen::{compile_from_mir_ext, generate_ir_from_mir};
 use stnx::mir::lower::lower_program;
+use stnx::mir::monomorphize::monomorphize;
 use stnx::mir::opt::optimize;
 use stnx::parser;
 use stnx::semantic::analyze_and_lower;
@@ -25,7 +27,7 @@ use tempfile::TempDir;
 /// duration of the test.
 pub struct Artifact {
     pub path: PathBuf,
-    _temp_dir: TempDir,
+    pub(crate) _temp_dir: TempDir,
 }
 
 impl Artifact {
@@ -45,8 +47,34 @@ impl Artifact {
     }
 }
 
-/// Full pipeline: lex -> parse -> HIR -> MIR -> verify -> optimize -> LLVM -> link.
+/// Build a verified, optimized MIR program from `src`.
+pub fn to_mir(src: &str) -> stnx::mir::MirProgram {
+    let tokens: Vec<_> = Lexer::new(src)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("lexing failed");
+    let program = parser::parse(src, tokens).expect("parsing failed");
+    let hir = analyze_and_lower(&program).expect("semantic analysis failed");
+    lower_to_mir(&hir)
+}
+
+/// Lower an already-built HIR into a verified, optimized MIR program.
+/// This is the non-generic path (no monomorphization).
+pub fn lower_to_mir(hir: &stnx::hir::HirProgram) -> stnx::mir::MirProgram {
+    let mut mir = lower_program(hir).expect("MIR lowering failed");
+    if let Err(errs) = mir.verify() {
+        let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
+        panic!("MIR verification failed: {}", msgs.join(", "));
+    }
+    optimize(&mut mir);
+    mir
+}
+
+/// Full pipeline: lex → parse → HIR → MIR → verify → optimize → LLVM → link.
 /// Everything happens inside an isolated temp directory.
+///
+/// **Note:** uses [`lower_program`], so generic call sites are not
+/// instantiated. For programs with generic functions, use
+/// [`compile_src_mono`] instead.
 pub fn compile_src(src: &str) -> Artifact {
     let temp_dir = TempDir::new().expect("failed to create isolated temp dir");
     let exe_path = temp_dir.path().join("program");
@@ -87,26 +115,46 @@ pub fn ir_only(src: &str) -> String {
     generate_ir_from_mir(&mir).expect("IR generation failed")
 }
 
-/// Lex -> parse -> HIR -> MIR -> verify -> optimize.
-/// This is the single production seam the tests share with the compiler driver.
-pub fn to_mir(src: &str) -> stnx::mir::MirProgram {
-    let tokens: Vec<_> = Lexer::new(src)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("lexing failed");
-    let program = parser::parse(src, tokens).expect("parsing failed");
-    let hir = analyze_and_lower(&program).expect("semantic analysis failed");
-    lower_to_mir(&hir)
-}
-
-/// Lower an already-built HIR into a verified, optimized MIR program.
-pub fn lower_to_mir(hir: &stnx::hir::HirProgram) -> stnx::mir::MirProgram {
-    let mut mir = lower_program(hir).expect("MIR lowering failed");
+/// Lower a HIR program to a verified, optimized MIR program via the
+/// monomorphization pass (for generic functions).
+///
+/// Unlike [`lower_to_mir`], this routes through [`monomorphize`] first so
+/// that generic call sites are retargeted to their concrete instantiations
+/// before lowering. Programs without generics are also handled correctly
+/// (the monomorphizer is a no-op for them).
+pub fn lower_to_mir_mono(hir: &stnx::hir::HirProgram) -> stnx::mir::MirProgram {
+    let mut mir = monomorphize(hir).expect("monomorphization failed");
     if let Err(errs) = mir.verify() {
         let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
         panic!("MIR verification failed: {}", msgs.join(", "));
     }
     optimize(&mut mir);
     mir
+}
+
+/// Full pipeline including monomorphization: lex → parse → HIR → monomorphize
+/// → MIR → verify → optimize → LLVM → link. Use this for tests that
+/// exercise generic functions.
+pub fn compile_src_mono(src: &str) -> Artifact {
+    let temp_dir = TempDir::new().expect("failed to create isolated temp dir");
+    let exe_path = temp_dir.path().join("program");
+
+    let tokens: Vec<_> = Lexer::new(src)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("lexing failed");
+    let program = parser::parse(src, tokens).expect("parsing failed");
+    let hir = analyze_and_lower(&program).expect("semantic analysis failed");
+    let mir = lower_to_mir_mono(&hir);
+
+    let mut config = TargetConfig::host().expect("target init failed");
+    config.set_output_kind(OutputKind::Exe);
+    compile_from_mir_ext(&mir, exe_path.to_str().unwrap(), config, false)
+        .expect("codegen/linking failed");
+
+    Artifact {
+        path: exe_path,
+        _temp_dir: temp_dir,
+    }
 }
 
 /// Full analysis that may fail — used by diagnostics / negative tests.

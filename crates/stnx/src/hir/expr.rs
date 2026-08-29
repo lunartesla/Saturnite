@@ -59,9 +59,14 @@ pub enum HirExprKind {
     },
 
     /// Function call. `func` is a [`DefId`] referencing a declared function.
+    /// `type_args` carries the explicit type arguments from a turbofish
+    /// (`f::<T>(x)`); empty when none were supplied. Generic monomorphization
+    /// uses this to drive substitution; non-generic callees must receive
+    /// an empty vec (validated during lowering).
     Call {
         func: DefId,
         args: Vec<HirExpr>,
+        type_args: Vec<HirType>,
     },
 
     If {
@@ -95,9 +100,12 @@ pub enum HirExprKind {
     /// Struct construction: `Point { x: 10, y: 20 }`.
     /// `name` is the struct definition [`SymbolId`].
     /// `fields` maps interned field-name → value expression.
+    /// `type_args` carries explicit turbofish for generic structs
+    /// (`Box::<i64> { value: 21 }`); empty otherwise.
     StructLiteral {
         name: SymbolId,
         fields: Vec<(SymbolId, Box<HirExpr>)>,
+        type_args: Vec<HirType>,
     },
 
     /// Field access: `p.x`.

@@ -35,8 +35,8 @@ pub fn lower_program(hir: &HirProgram) -> CompilerResult<MirProgram> {
     let mut sigs: HashMap<DefId, (Vec<HirType>, HirType)> =
         HashMap::with_capacity(hir.functions.len());
     for func in &hir.functions {
-        let param_types: Vec<HirType> = func.params.iter().map(|(_, t)| *t).collect();
-        sigs.insert(func.def_id, (param_types, func.return_type));
+        let param_types: Vec<HirType> = func.params.iter().map(|(_, t)| t.clone()).collect();
+        sigs.insert(func.def_id, (param_types, func.return_type.clone()));
     }
 
     let mut funcs = Vec::new();
@@ -54,7 +54,7 @@ pub fn lower_program(hir: &HirProgram) -> CompilerResult<MirProgram> {
 }
 
 /// Per-function lowering state.
-struct MirLower<'hir> {
+pub struct MirLower<'hir> {
     hir: &'hir HirProgram,
     func: &'hir crate::hir::function::HirFunction,
     sigs: &'hir HashMap<DefId, (Vec<HirType>, HirType)>,
@@ -71,7 +71,7 @@ struct MirLower<'hir> {
 }
 
 impl<'hir> MirLower<'hir> {
-    fn new(
+    pub fn new(
         hir: &'hir HirProgram,
         func: &'hir crate::hir::function::HirFunction,
         sigs: &'hir HashMap<DefId, (Vec<HirType>, HirType)>,
@@ -163,16 +163,16 @@ impl<'hir> MirLower<'hir> {
 
     // -- Function lowering -----------------------------------------------
 
-    fn lower_function(&mut self) -> CompilerResult<MirFunction> {
+    pub fn lower_function(&mut self) -> CompilerResult<MirFunction> {
         self.start_block("entry");
 
         let mut param_locals: Vec<LocalId> = Vec::with_capacity(self.func.params.len());
         let mut param_types: Vec<(SymbolId, MirType)> = Vec::with_capacity(self.func.params.len());
         for (sym, ty) in &self.func.params {
-            let lid = self.new_local(*ty, *sym, false);
+            let lid = self.new_local(ty.clone(), *sym, false);
             self.var_map.insert(*sym, lid);
             param_locals.push(lid);
-            param_types.push((*sym, *ty));
+            param_types.push((*sym, ty.clone()));
         }
 
         let body = &self.func.body;
@@ -214,7 +214,7 @@ impl<'hir> MirLower<'hir> {
             def_id: self.func.def_id,
             name: self.func.name,
             params: param_types,
-            return_type: self.func.return_type,
+            return_type: self.func.return_type.clone(),
             locals: self.locals.clone(),
             param_locals,
             blocks: self.blocks.clone(),
@@ -232,8 +232,8 @@ impl<'hir> MirLower<'hir> {
                 ty,
                 value,
             } => {
-                let local_ty: MirType = ty.unwrap_or(value.ty);
-                let local = self.new_local(local_ty, *name, *mutable);
+                let local_ty: MirType = ty.clone().unwrap_or_else(|| value.ty.clone());
+                let local = self.new_local(local_ty.clone(), *name, *mutable);
                 // Evaluate the initializer BEFORE updating var_map so that a
                 // shadowing `let x = x + 1` correctly reads the *previous* local.
                 let val = self.lower_expr(value)?;
@@ -351,10 +351,10 @@ impl<'hir> MirLower<'hir> {
             HirExprKind::Binary { op, lhs, rhs } => {
                 let l = self.lower_expr(lhs)?;
                 let r = self.lower_expr(rhs)?;
-                let result_local = self.new_local(expr.ty, self.temp_symbol, false);
+                let result_local = self.new_local(expr.ty.clone(), self.temp_symbol, false);
                 self.emit(MirStmtKind::LocalDecl {
                     local: result_local,
-                    ty: expr.ty,
+                    ty: expr.ty.clone(),
                     mutable: false,
                 });
                 self.emit(MirStmtKind::Assign {
@@ -370,10 +370,10 @@ impl<'hir> MirLower<'hir> {
 
             HirExprKind::Unary { op, expr: inner } => {
                 let val = self.lower_expr(inner)?;
-                let result_local = self.new_local(expr.ty, self.temp_symbol, false);
+                let result_local = self.new_local(expr.ty.clone(), self.temp_symbol, false);
                 self.emit(MirStmtKind::LocalDecl {
                     local: result_local,
-                    ty: expr.ty,
+                    ty: expr.ty.clone(),
                     mutable: false,
                 });
                 self.emit(MirStmtKind::Assign {
@@ -386,7 +386,16 @@ impl<'hir> MirLower<'hir> {
                 Ok(MirOperand::Local(result_local))
             }
 
-            HirExprKind::Call { func: def_id, args } => self.lower_call(*def_id, args, expr.ty),
+            HirExprKind::Call {
+                func: def_id, args, ..
+            } => {
+                // By this point monomorphization has already retargeted
+                // generic call sites to their concrete instantiations,
+                // and the explicit turbofish has been folded into the
+                // substituted callee's signature. We only need the
+                // resolved DefId here.
+                self.lower_call(*def_id, args, expr.ty.clone())
+            }
 
             HirExprKind::If {
                 condition,
@@ -410,15 +419,19 @@ impl<'hir> MirLower<'hir> {
 
             HirExprKind::Range { start, .. } => self.lower_expr(start),
 
-            HirExprKind::StructLiteral { name, fields } => {
+            HirExprKind::StructLiteral {
+                name,
+                fields,
+                type_args: _,
+            } => {
                 let mut field_ops: Vec<(SymbolId, MirOperand)> = Vec::new();
                 for (fid, fexpr) in fields {
                     field_ops.push((*fid, self.lower_expr(fexpr)?));
                 }
-                let local = self.new_local(expr.ty, self.temp_symbol, false);
+                let local = self.new_local(expr.ty.clone(), self.temp_symbol, false);
                 self.emit(MirStmtKind::LocalDecl {
                     local,
-                    ty: expr.ty,
+                    ty: expr.ty.clone(),
                     mutable: false,
                 });
                 self.emit(MirStmtKind::Assign {
@@ -433,20 +446,20 @@ impl<'hir> MirLower<'hir> {
 
             HirExprKind::FieldAccess { expr: inner, field } => {
                 let inner_val = self.lower_expr(inner)?;
-                let inner_local = self.new_local(inner.ty, self.temp_symbol, false);
+                let inner_local = self.new_local(inner.ty.clone(), self.temp_symbol, false);
                 self.emit(MirStmtKind::LocalDecl {
                     local: inner_local,
-                    ty: inner.ty,
+                    ty: inner.ty.clone(),
                     mutable: false,
                 });
                 self.emit(MirStmtKind::Assign {
                     local: inner_local,
                     rvalue: MirRvalue::Use(inner_val),
                 });
-                let result_local = self.new_local(expr.ty, self.temp_symbol, false);
+                let result_local = self.new_local(expr.ty.clone(), self.temp_symbol, false);
                 self.emit(MirStmtKind::LocalDecl {
                     local: result_local,
-                    ty: expr.ty,
+                    ty: expr.ty.clone(),
                     mutable: false,
                 });
                 self.emit(MirStmtKind::Assign {
@@ -500,10 +513,10 @@ impl<'hir> MirLower<'hir> {
         let ret_ty = self
             .sigs
             .get(&def_id)
-            .map(|(_, ret)| *ret)
+            .map(|(_, ret)| ret.clone())
             .unwrap_or(result_ty);
 
-        let dest = self.new_local(ret_ty, self.temp_symbol, false);
+        let dest = self.new_local(ret_ty.clone(), self.temp_symbol, false);
         self.emit(MirStmtKind::LocalDecl {
             local: dest,
             ty: ret_ty,

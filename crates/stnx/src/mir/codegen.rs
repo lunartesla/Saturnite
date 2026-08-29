@@ -706,7 +706,17 @@ impl<'ctx> MirCodeGenContext<'ctx> {
                             .build_return(Some(&self.context.bool_type().const_int(0, false)))
                             .unwrap();
                     }
-                    HirType::Unit | HirType::Str | HirType::Struct(_) | HirType::Enum(_) => {
+                    HirType::Unit
+                    | HirType::Str
+                    | HirType::Struct(_)
+                    | HirType::Enum(_)
+                    | HirType::Generic(_)
+                    | HirType::Apply { .. } => {
+                        // For void/unit-like returns and for monomorphized return
+                        // types, emit an empty `void` return. Generic and Apply
+                        // are unreachable here because monomorphization runs
+                        // before codegen, but we list them so the match is
+                        // exhaustive.
                         self.builder.build_return(None).unwrap();
                     }
                 },
@@ -744,6 +754,29 @@ pub fn mir_type_to_llvm<'ctx>(
             let _ = ctx.struct_type(&field_types, false);
             ctx.ptr_type(inkwell::AddressSpace::default())
                 .as_basic_type_enum()
+        }
+        HirType::Apply { base, .. } => {
+            // A monomorphized generic struct type (`Box<i64>`). The
+            // monomorphizer must have produced a concrete StructDef for
+            // `base`, so we look up that struct's LLVM shape.
+            let struct_def = match prog.struct_def(*base) {
+                Some(def) => def,
+                None => return ctx.i64_type().as_basic_type_enum(),
+            };
+            let field_types: Vec<BasicTypeEnum<'ctx>> = struct_def
+                .fields
+                .iter()
+                .map(|(_, ty)| mir_type_to_llvm(ctx, prog, ty))
+                .collect();
+            let _ = ctx.struct_type(&field_types, false);
+            ctx.ptr_type(inkwell::AddressSpace::default())
+                .as_basic_type_enum()
+        }
+        HirType::Generic(_) => {
+            // Unreachable at codegen: monomorphization runs before this and
+            // substitutes concrete types. We map these to `i64` defensively
+            // so a future regression does not produce a confusing crash.
+            ctx.i64_type().as_basic_type_enum()
         }
     }
 }

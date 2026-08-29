@@ -39,10 +39,14 @@ use miette::SourceSpan;
 use std::collections::HashMap;
 
 /// A lowered function with resolved types and symbol references.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HirFunction {
     pub def_id: DefId,
     pub name: SymbolId,
+    /// Generic parameter names, interned (`fn id<T>(...)` → `[SymbolId("T")]`).
+    /// Empty for non-generic functions. Monomorphization uses this to
+    /// substitute concrete types at instantiation time.
+    pub generic_params: Vec<SymbolId>,
     pub params: Vec<(SymbolId, HirType)>,
     pub return_type: HirType,
     pub body: Vec<HirStmt>,
@@ -58,6 +62,9 @@ pub struct HirFunction {
 pub struct StructDef {
     pub def_id: DefId,
     pub name: SymbolId,
+    /// Generic parameter names, interned (`struct Pair<A, B>` → `[A, B]`).
+    /// Empty for non-generic structs.
+    pub generic_params: Vec<SymbolId>,
     pub fields: Vec<(SymbolId, HirType)>,
     pub span: SourceSpan,
     /// The module that owns this struct.
@@ -72,6 +79,8 @@ pub struct StructDef {
 pub struct EnumDef {
     pub def_id: DefId,
     pub name: SymbolId,
+    /// Generic parameter names, interned. Empty for non-generic enums.
+    pub generic_params: Vec<SymbolId>,
     pub variants: Vec<SymbolId>,
     pub span: SourceSpan,
     /// The module that owns this enum.
