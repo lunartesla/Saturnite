@@ -62,6 +62,9 @@
       "Bash(claude *)",
       "Bash(npm ls *)",
       "Bash(npm -g config get prefix)"
+    ],
+    "additionalDirectories": [
+      "/home/kali/saturn/rust"
     ]
   }
 }
