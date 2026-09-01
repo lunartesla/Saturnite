@@ -2,6 +2,7 @@ use std::ops::Range;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TokenKind {
+    // --- Legacy keywords ---
     Fn,
     Let,
     Mut,
@@ -26,10 +27,28 @@ pub enum TokenKind {
     Use,
     Pub,
     As,
+
+    // --- 0.5 native syntax additions ---
+    /// `module name` — full-word module declaration alias for `mod`.
+    Module,
+    /// `give expr` — synonym for `return`.
+    Give,
+    /// `say expr` — synonym for `println`.
+    Say,
+    /// `raise expr` — error raise (lowered to abort in 0.5).
+    Raise,
+    /// `text` — type alias for `str`.
+    Text,
+    /// `number` — type alias for `i64`.
+    Number,
+
+    // --- Literals ---
     Ident(String),
     Integer(i64),
     Float(f64),
     StrLit(String),
+
+    // --- Operators ---
     Plus,
     Minus,
     Star,
@@ -53,6 +72,10 @@ pub enum TokenKind {
     DotDotEllipsis,
     Dot,
     DoubleColon,
+    /// `|>` pipeline operator.
+    Pipe,
+
+    // --- Punctuation ---
     LParen,
     RParen,
     LBrace,
@@ -60,6 +83,16 @@ pub enum TokenKind {
     Comma,
     Colon,
     RArrow,
+
+    // --- Synthetic indentation tokens (emitted by the indent pre-pass) ---
+    /// One indent level deeper than the previous line's indent.
+    Indent,
+    /// One indent level shallower than the previous line's indent.
+    Dedent,
+    /// Logical newline (a non-blank line boundary).
+    Newline,
+
+    // --- Meta ---
     Error,
     Eof,
 }

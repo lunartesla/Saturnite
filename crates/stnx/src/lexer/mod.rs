@@ -1,5 +1,7 @@
+mod indent;
 mod token;
 
+pub use indent::{run as run_indent, IndentedTokens};
 pub use token::{Token, TokenKind};
 
 use crate::error::LexError;
@@ -56,6 +58,20 @@ pub enum LexicalToken {
     Pub,
     #[token("as")]
     As,
+
+    // --- 0.5 native syntax additions ---
+    #[token("module")]
+    Module,
+    #[token("give")]
+    Give,
+    #[token("say")]
+    Say,
+    #[token("raise")]
+    Raise,
+    #[token("text")]
+    Text,
+    #[token("number")]
+    Number,
 
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
@@ -116,6 +132,9 @@ pub enum LexicalToken {
     Dot,
     #[token("::")]
     DoubleColon,
+
+    #[token("|>")]
+    Pipe,
 
     #[token("(")]
     LParen,
@@ -208,6 +227,12 @@ fn convert(lt: LexicalToken) -> TokenKind {
         LexicalToken::Use => TokenKind::Use,
         LexicalToken::Pub => TokenKind::Pub,
         LexicalToken::As => TokenKind::As,
+        LexicalToken::Module => TokenKind::Module,
+        LexicalToken::Give => TokenKind::Give,
+        LexicalToken::Say => TokenKind::Say,
+        LexicalToken::Raise => TokenKind::Raise,
+        LexicalToken::Text => TokenKind::Text,
+        LexicalToken::Number => TokenKind::Number,
         LexicalToken::Ident(s) => TokenKind::Ident(s),
         LexicalToken::Integer(s) => match s.parse::<i64>() {
             Ok(n) => TokenKind::Integer(n),
@@ -241,6 +266,7 @@ fn convert(lt: LexicalToken) -> TokenKind {
         LexicalToken::DotDotEllipsis => TokenKind::DotDotEllipsis,
         LexicalToken::Dot => TokenKind::Dot,
         LexicalToken::DoubleColon => TokenKind::DoubleColon,
+        LexicalToken::Pipe => TokenKind::Pipe,
         LexicalToken::LParen => TokenKind::LParen,
         LexicalToken::RParen => TokenKind::RParen,
         LexicalToken::LBrace => TokenKind::LBrace,
