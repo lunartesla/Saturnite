@@ -16,7 +16,6 @@ pub fn run(src: &str, raw: Vec<Token>) -> Result<IndentedTokens, Vec<LexError>> 
     let mut indent_stack: Vec<usize> = vec![0];
     let mut errors: Vec<LexError> = Vec::new();
     let mut cursor: usize = 0;
-    let mut prev_token_end_on_line: Option<usize> = None;
 
     for tok in raw {
         let span_start = tok.span.start;

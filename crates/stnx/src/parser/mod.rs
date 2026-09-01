@@ -574,6 +574,7 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
                         Expr::Call {
                             func: name,
                             args,
+                            named_args: Vec::new(),
                             type_args: type_args.unwrap_or_default(),
                             span: name_span,
                         }
@@ -1270,7 +1271,10 @@ fn stmt_span(e: &Expr) -> Range<usize> {
         | Expr::Range { span, .. }
         | Expr::StructLiteral { span, .. }
         | Expr::FieldAccess { span, .. }
-        | Expr::EnumConstructor { span, .. } => span.clone(),
+        | Expr::EnumConstructor { span, .. }
+        | Expr::Pipeline { span, .. }
+        | Expr::Closure { span, .. }
+        | Expr::InterpolatedStr(_, span) => span.clone(),
     }
 }
 
@@ -1281,6 +1285,9 @@ fn stmt_span_expr(s: &Stmt) -> Range<usize> {
         | Stmt::Expr(_, span)
         | Stmt::Return(_, span)
         | Stmt::Println(_, span)
+        | Stmt::Give(_, span)
+        | Stmt::Say(_, span)
+        | Stmt::Raise(_, span)
         | Stmt::StructDef { span, .. }
         | Stmt::EnumDef { span, .. } => span.clone(),
     }

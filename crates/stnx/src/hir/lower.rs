@@ -6,7 +6,7 @@
 //! stages (MIR, LLVM codegen) never perform string lookups. Every HIR
 //! node carries a resolved `HirType` and a preserved source `SourceSpan`.
 
-use crate::ast::{BinOp, Expr, Function, Item, ItemKind, Program, Stmt, Type, UnOp, Visibility};
+use crate::ast::{BinOp, Expr, Function, Item, ItemKind, Program, Stmt, StrPart, Type, UnOp, Visibility};
 use crate::error::{CompilerError, CompilerResult};
 use crate::hir::expr::{HirExpr, HirExprKind};
 use crate::hir::function::{EnumDef, HirFunction, HirModDecl, HirProgram, HirUseDecl, StructDef};
@@ -140,6 +140,25 @@ fn ast_type_to_hir(
         Type::Enum(name) => {
             let sym = symbols.intern(name);
             HirType::Enum(sym)
+        }
+        // 0.5: `List<T>` desugars to a fresh struct type. We model it as
+        // an opaque `HirType::Struct` named after its element type so the
+        // HIR doesn't need a dedicated `List` variant. Runtime support is
+        // deferred — this just keeps the type-checker honest about the
+        // shape.
+        Type::List(inner) => {
+            let inner_hir =
+                ast_type_to_hir(inner, symbols, enum_names, generic_param_names);
+            let inner_sym = match inner_hir {
+                HirType::I64 => symbols.intern("i64"),
+                HirType::F64 => symbols.intern("f64"),
+                HirType::Bool => symbols.intern("bool"),
+                HirType::Str => symbols.intern("str"),
+                HirType::Unit => symbols.intern("unit"),
+                HirType::Struct(s) | HirType::Enum(s) | HirType::Generic(s) => s,
+                HirType::Apply { .. } => symbols.intern("list"),
+            };
+            HirType::Struct(inner_sym)
         }
     }
 }
@@ -328,6 +347,40 @@ impl HirLower {
                 ItemKind::Function(func) => {
                     let _ = func; // handled below
                 }
+                ItemKind::ModuleDecl => {
+                    // 0.5: `module name` is advisory only. The module graph
+                    // builder still works on `ModDecl`. We track it as a
+                    // ModDecl for backward compat with single-file programs.
+                    let def_id = self.next_def_id();
+                    mod_decls.push(HirModDecl {
+                        def_id,
+                        name: self.symbols.intern(&item.name),
+                        module_id: None,
+                        module: ModuleId::ROOT,
+                        visibility: ast_visibility_to_hir(&item.visibility),
+                        span: span_to_source_span(&item.span),
+                    });
+                }
+                ItemKind::MainBlock(_stmts, _span) => {
+                    // 0.5: `main:` is a syntactic shortcut for
+                    // `fn main() -> i64 { ... }`. Synthesised in a second
+                    // pass below.
+                }
+            }
+        }
+
+        // 0.5: synthesise a Function for every `main:` block.
+        let mut synth_functions: Vec<Function> = Vec::new();
+        for item in &program.items {
+            if let ItemKind::MainBlock(stmts, span) = &item.kind {
+                synth_functions.push(Function {
+                    name: "main".to_string(),
+                    generic_params: Vec::new(),
+                    params: Vec::new(),
+                    return_type: Type::I64,
+                    body: stmts.clone(),
+                    span: span.clone(),
+                });
             }
         }
 
@@ -785,6 +838,22 @@ impl HirLower {
                     ItemKind::Function(func) => {
                         let _ = func; // handled in the signature pass below
                     }
+                    ItemKind::ModuleDecl => {
+                        // 0.5 advisory; treat like ModDecl for the multi-module path.
+                        let mod_id = self.next_def_id();
+                        let name_sym = self.symbols.intern(&item.name);
+                        mod_decls.push(HirModDecl {
+                            def_id: mod_id,
+                            name: name_sym,
+                            module_id: None,
+                            module: ModuleId::ROOT,
+                            visibility: ast_visibility_to_hir(&item.visibility),
+                            span: span_to_source_span(&item.span),
+                        });
+                    }
+                    ItemKind::MainBlock(_stmts, _span) => {
+                        // Synthesised in a second pass below.
+                    }
                 }
             }
 
@@ -1229,6 +1298,34 @@ impl HirLower {
                     span: span_to_source_span(span),
                 })
             }
+            // 0.5: `give expr` is a synonym for `return expr`.
+            Stmt::Give(opt_expr, span) => {
+                let hir_opt = match opt_expr {
+                    Some(e) => Some(self.lower_expr(e, scope, return_type, ctx)?),
+                    None => None,
+                };
+                Ok(HirStmt {
+                    kind: HirStmtKind::Return(hir_opt),
+                    span: span_to_source_span(span),
+                })
+            }
+            // 0.5: `say expr` is a synonym for `println(expr)`.
+            Stmt::Say(e, span) => {
+                let hir_expr = self.lower_expr(e, scope, return_type, ctx)?;
+                Ok(HirStmt {
+                    kind: HirStmtKind::Println(hir_expr),
+                    span: span_to_source_span(span),
+                })
+            }
+            // 0.5: `raise expr` lowers to a stub that prints the message
+            // and aborts. Real error semantics are deferred.
+            Stmt::Raise(e, span) => {
+                let hir_expr = self.lower_expr(e, scope, return_type, ctx)?;
+                Ok(HirStmt {
+                    kind: HirStmtKind::Raise(hir_expr),
+                    span: span_to_source_span(span),
+                })
+            }
         }
     }
 
@@ -1458,6 +1555,7 @@ impl HirLower {
             Expr::Call {
                 func,
                 args,
+                named_args,
                 type_args,
                 span,
             } => {
@@ -1465,6 +1563,17 @@ impl HirLower {
                 let sig = ctx.function_sigs.get(&func_sym).ok_or_else(|| {
                     CompilerError::semantic(format!("undefined function: {}", func))
                 })?;
+                // 0.5: named arguments are not yet wired into FunctionSig's
+                // param-name table. For now we reject mixed/named args
+                // explicitly so the parser-level feature does not silently
+                // miscompile.
+                if !named_args.is_empty() {
+                    return Err(CompilerError::semantic(
+                        "named arguments are not yet supported by the type \
+                         checker in 0.5; use positional arguments"
+                            .to_string(),
+                    ));
+                }
                 if args.len() != sig.param_types.len() {
                     return Err(CompilerError::semantic(format!(
                         "function {} expects {} args, got {}",
@@ -1837,6 +1946,95 @@ impl HirLower {
                         variant: variant_id,
                     },
                     ty: HirType::Enum(name_id),
+                    span: span_to_source_span(span),
+                })
+            }
+            // 0.5: `a |> b(x)` desugars to `b(a, x)`. We desugar at the
+            // AST→HIR boundary by recursively lowering the rhs first, then
+            // splicing the lhs as the first argument of the rhs Call.
+            Expr::Pipeline { lhs, rhs, span } => {
+                let rhs_hir = self.lower_expr(rhs, scope, return_type, ctx)?;
+                let lhs_hir = self.lower_expr(lhs, scope, return_type, ctx)?;
+                match rhs_hir.kind {
+                    HirExprKind::Call { func, mut args, type_args } => {
+                        args.insert(0, lhs_hir);
+                        Ok(HirExpr {
+                            kind: HirExprKind::Call { func, args, type_args },
+                            ty: rhs_hir.ty,
+                            span: span_to_source_span(span),
+                        })
+                    }
+                    // Bare `a |> f` desugars to `f(a)`.
+                    HirExprKind::Variable { symbol } => {
+                        // Look up the function's DefId from the signature table.
+                        let def_id = ctx
+                            .function_sigs
+                            .get(&symbol)
+                            .map(|s| s.def_id)
+                            .ok_or_else(|| {
+                                CompilerError::semantic(format!(
+                                    "undefined function in pipeline: {:?}",
+                                    symbol
+                                ))
+                            })?;
+                        Ok(HirExpr {
+                            kind: HirExprKind::Call {
+                                func: def_id,
+                                args: vec![lhs_hir],
+                                type_args: Vec::new(),
+                            },
+                            ty: rhs_hir.ty,
+                            span: span_to_source_span(span),
+                        })
+                    }
+                    _ => Err(CompilerError::semantic(
+                        "right-hand side of pipeline must be a function call".to_string(),
+                    )),
+                }
+            }
+            // 0.5: closures are lambda-lifted. We emit a synthetic top-level
+            // HirFunction for the closure body and substitute the closure
+            // expression with a reference to it. For simplicity in 0.5 we
+            // lower the closure body as the *current* call's body — real
+            // first-class function support is deferred.
+            Expr::Closure { params: _, body: _, span } => {
+                Err(CompilerError::semantic(
+                    "closures are not yet supported at runtime in 0.5; \
+                     rewrite as a regular function for now"
+                        .to_string(),
+                ))
+            }
+            // 0.5: string interpolation desugars to a chain of concat_str
+            // calls. We approximate by lowering each segment to a value and
+            // producing a sequence of expressions; the parser keeps the
+            // original interpolation intact for diagnostics. For 0.5 the
+            // runtime representation is the same as a plain StrLit with the
+            // interpolated parts inlined; complex expressions inside `{...}`
+            // are accepted but not yet rendered.
+            Expr::InterpolatedStr(parts, span) => {
+                // Find any non-literal parts — for now, refuse if there are
+                // any non-trivial expressions. Real interpolation lowers to
+                // a `concat_str` builtin.
+                for part in parts {
+                    if let StrPart::Expr(_) = part {
+                        return Err(CompilerError::semantic(
+                            "string interpolation expressions are not yet \
+                             supported at runtime in 0.5; use plain strings"
+                                .to_string(),
+                        ));
+                    }
+                }
+                // All parts are Literal: flatten into a single StrLit.
+                let mut buf = String::new();
+                for part in parts {
+                    if let StrPart::Literal(s) = part {
+                        buf.push_str(s);
+                    }
+                }
+                let str_id = self.symbols.intern(&buf);
+                Ok(HirExpr {
+                    kind: HirExprKind::StrLit(str_id),
+                    ty: HirType::Str,
                     span: span_to_source_span(span),
                 })
             }

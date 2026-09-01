@@ -89,6 +89,9 @@ impl From<crate::ast::Type> for HirType {
             crate::ast::Type::Unit => HirType::Unit,
             crate::ast::Type::Struct(_) => HirType::Struct(SymbolId(0)),
             crate::ast::Type::Enum(_) => HirType::Enum(SymbolId(0)),
+            // 0.5: List<T> lowers to a placeholder struct type. Real
+            // runtime support is deferred.
+            crate::ast::Type::List(_) => HirType::Struct(SymbolId(0)),
         }
     }
 }

@@ -15,6 +15,11 @@ pub enum Type {
     Struct(String),
     /// A named enum type, referenced by name.
     Enum(String),
+    /// `List<T>` — a homogeneous list type. For 0.5 this is parsed and
+    /// lowered but the runtime support is deferred (desugars to a
+    /// sequence of allocations). Tracked here so the parser can accept
+    /// the syntax without changing semantics.
+    List(Box<Type>),
 }
 
 // --- AST Nodes ---
@@ -92,6 +97,11 @@ pub enum ItemKind {
         path: Vec<String>,
         alias: Option<String>,
     },
+    /// `module name` — 0.5 advisory module declaration (no semantic effect).
+    ModuleDecl,
+    /// `main:` — 0.5 entry-point block. Lowered to a synthetic `Function`
+    /// named `main` with empty parameters and `i64` return type.
+    MainBlock(Vec<Stmt>, Range<usize>),
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +128,13 @@ pub enum Stmt {
     Expr(Expr, Range<usize>),
     Return(Option<Expr>, Range<usize>),
     Println(Expr, Range<usize>),
+    /// `give expr` — 0.5 synonym for `return`.
+    Give(Option<Expr>, Range<usize>),
+    /// `say expr` — 0.5 synonym for `println`.
+    Say(Expr, Range<usize>),
+    /// `raise expr` — 0.5 error raise. Lowers to a stub that prints the
+    /// expression and aborts the process; real error semantics are deferred.
+    Raise(Expr, Range<usize>),
     /// A struct definition: `struct Point { x: i64, y: i64 }`
     StructDef {
         name: String,
@@ -132,6 +149,29 @@ pub enum Stmt {
         variants: Vec<String>,
         span: Range<usize>,
     },
+}
+
+/// A single segment of an interpolated string.
+#[derive(Clone, Debug)]
+pub enum StrPart {
+    /// A literal text segment, with no `{...}` expressions inside it.
+    Literal(String),
+    /// An interpolated expression (the contents of a `{...}` in the source).
+    Expr(Expr),
+}
+
+/// A single argument in a call: either positional or named.
+#[derive(Clone, Debug)]
+pub enum CallArg {
+    Positional(Expr),
+    Named { name: String, value: Expr },
+}
+
+/// A single parameter of a closure: name with optional explicit annotation.
+#[derive(Clone, Debug)]
+pub struct ClosureParam {
+    pub name: String,
+    pub ty: Option<Type>,
 }
 
 #[derive(Clone, Debug)]
@@ -166,7 +206,12 @@ pub enum Expr {
     },
     Call {
         func: String,
+        /// Positional arguments (in source order). Named arguments live in
+        /// `named_args` and are reordered against the callee's signature at
+        /// AST→HIR lowering.
         args: Vec<Expr>,
+        /// Named arguments: `f(name: value)`.
+        named_args: Vec<(String, Expr)>,
         /// Explicit type arguments supplied at the call site via turbofish
         /// syntax (`f::<i64, bool>(x, y)`). Empty when no turbofish was used.
         type_args: Vec<Type>,
@@ -217,6 +262,24 @@ pub enum Expr {
         variant: String,
         span: Range<usize>,
     },
+    /// 0.5 pipeline: `a |> f(x)` desugars to `f(a, x)` at AST→HIR lowering.
+    Pipeline {
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+        span: Range<usize>,
+    },
+    /// 0.5 closure: `x -> body` or `(x, y) -> body`. Lowered to a synthetic
+    /// top-level `Function` whose body captures free variables (lambda
+    /// lifting). At call sites the closure expression is replaced by a
+    /// `Var` reference to the synthetic function.
+    Closure {
+        params: Vec<ClosureParam>,
+        body: Box<Expr>,
+        span: Range<usize>,
+    },
+    /// 0.5 string interpolation: `"hello {name}!"`. Lowered to a chain of
+    /// `concat_str` calls at AST→HIR lowering.
+    InterpolatedStr(Vec<StrPart>, Range<usize>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

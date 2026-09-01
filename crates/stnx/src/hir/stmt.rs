@@ -36,6 +36,12 @@ pub enum HirStmtKind {
     /// `println(expr);` — builtin call to `println_i64`.
     Println(HirExpr),
 
+    /// 0.5: `raise expr;` — lowers to a stub that prints the message and
+    /// aborts the process. Real error semantics are deferred to a later
+    /// phase. The MIR→LLVM backend lowers this to a `println` followed by
+    /// `llvm.trap`.
+    Raise(HirExpr),
+
     /// A struct definition: `struct Point { x: i64, y: i64 }`.
     /// `name` is the struct definition [`SymbolId`].
     /// `fields` maps interned field-name → [`HirType`].

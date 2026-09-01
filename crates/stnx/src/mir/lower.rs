@@ -283,6 +283,31 @@ impl<'hir> MirLower<'hir> {
                 Ok(())
             }
             HirStmtKind::StructDef { .. } | HirStmtKind::EnumDef { .. } => Ok(()),
+            // 0.5: `raise expr` lowers to a stub — print the expression
+            // (which is expected to be a StrLit in 0.5) and then emit an
+            // Unreachable terminator. The LLVM backend will map Unreachable
+            // in a position with no Return to a trap. Real error semantics
+            // are deferred.
+            HirStmtKind::Raise(e) => {
+                let val = self.lower_expr(e)?;
+                let dest = self.new_local(MirType::I64, self.temp_symbol, false);
+                self.emit(MirStmtKind::LocalDecl {
+                    local: dest,
+                    ty: MirType::I64,
+                    mutable: false,
+                });
+                let next = self.create_block(format!("raise_cont_{}", self.blocks.len()));
+                self.finish(MirTerminator::Call {
+                    func: PRINTLN_DEF_ID,
+                    args: vec![val],
+                    destination: dest,
+                    next,
+                });
+                self.switch_to(next);
+                // After printing, mark the block as unreachable.
+                self.finish(MirTerminator::Unreachable);
+                Ok(())
+            }
         }
     }
 

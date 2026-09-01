@@ -314,6 +314,7 @@ impl<'hir> Monomorphizer<'hir> {
             HirStmtKind::Return(Some(e)) => self.collect_from_expr(e),
             HirStmtKind::Return(None) => Ok(()),
             HirStmtKind::Println(e) => self.collect_from_expr(e),
+            HirStmtKind::Raise(e) => self.collect_from_expr(e),
             HirStmtKind::StructDef { .. } | HirStmtKind::EnumDef { .. } => Ok(()),
         }
     }
@@ -827,6 +828,7 @@ fn substitute_stmt(stmt: &HirStmt, subst: &HashMap<SymbolId, HirType>) -> HirStm
             HirStmtKind::Return(e.as_ref().map(|x| substitute_expr(x, subst)))
         }
         HirStmtKind::Println(e) => HirStmtKind::Println(substitute_expr(e, subst)),
+        HirStmtKind::Raise(e) => HirStmtKind::Raise(substitute_expr(e, subst)),
         HirStmtKind::StructDef { name, fields } => HirStmtKind::StructDef {
             name: *name,
             fields: fields
@@ -891,6 +893,7 @@ fn rewrite_stmt(
             HirStmtKind::Return(e.as_ref().map(|x| rewrite_expr(x, remap, struct_remap)))
         }
         HirStmtKind::Println(e) => HirStmtKind::Println(rewrite_expr(e, remap, struct_remap)),
+        HirStmtKind::Raise(e) => HirStmtKind::Raise(rewrite_expr(e, remap, struct_remap)),
         HirStmtKind::StructDef { name, fields } => HirStmtKind::StructDef {
             name: *name,
             fields: fields.clone(),
