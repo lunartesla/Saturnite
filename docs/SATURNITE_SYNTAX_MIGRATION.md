@@ -4,6 +4,33 @@
 > compiler requires (or does not require) to absorb the new native Saturnite
 > syntax described in `docs/SATURNITE_SYNTAX.md`.
 
+> **Implementation status (post-0.5):** The migration is complete. The native
+> syntax is accepted and compiles/runs end-to-end. Key implementation decisions
+> made during the phase:
+>
+> - **Colon blocks are desugared at the token level** (`lexer/prepare.rs`): a `:`
+>   followed by a newline becomes an opening brace, and the indent pre-pass's
+>   `Indent`/`Dedent`/`Newline` synthetic tokens are consumed to emit closing
+>   braces and (for struct/enum bodies) field-line commas. The brace parser is
+>   untouched.
+> - **`main:`** desugars to `fn main() -> i64 { ... }` at the token level.
+> - **Bare `name = expr` (Python-style declaration) was rejected.** It conflicts
+>   with the existing immutable-assignment diagnostic (a later `x = 2` must be a
+>   reassignment error, not a silently-shadowing declaration). Native code uses
+>   explicit `let` for declarations. Bare `x = value` remains an assignment.
+> - **String printing is implemented.** `say "..."`/`raise "..."` require a string
+>   printer, so a new `println_str` builtin was added: runtime C function,
+>   `build.rs`, MIR `PrintlnStr` statement, a second `PRINTLN_STR_DEF_ID`
+>   sentinel, and the `HirType::Str` → `i8*` LLVM mapping (strings are now
+>   NUL-terminated byte globals instead of raw const arrays).
+> - **Named arguments are implemented** (`f(x, b: 2)`): `FunctionSig` gained a
+>   `param_names` field, and call-site lowering reorders named args into
+>   positional slots.
+> - **String interpolation** parses to `Expr::InterpolatedStr` but runtime
+>   rendering is deferred (semantic error) — see §8.
+> - **List literals** `[...]` lex and parse; runtime list support is deferred
+>   (lowers to a placeholder string).
+
 ## Can remain unchanged
 
 - **Resolver** (`crates/stnx/src/resolver.rs`) — `use`/`mod` semantics unchanged;

@@ -1,10 +1,14 @@
 # Saturnite Native Syntax (0.5)
 
-> **Status:** In progress. Both legacy brace-style syntax (`fn f() -> i64 { ... }`,
+> **Status:** Implemented. Both legacy brace-style syntax (`fn f() -> i64 { ... }`,
 > `return x`, `println(x)`, `i64`/`str`/`bool`) and the new colon-indented syntax
-> described below are accepted during the 0.5 transition. This document defines
-> the new syntax, its grammar, semantics, and how it interacts with the existing
-> compiler pipeline.
+> described below are accepted. This document defines the new syntax, its grammar,
+> semantics, and how it interacts with the existing compiler pipeline.
+>
+> **Implementation note:** the native colon-indented blocks are desugared at the
+> **token level** into brace blocks by `crates/stnx/src/lexer/prepare.rs` (which
+> wraps the indent pre-pass). The brace-based parser and all downstream stages
+> (HIR, resolver, type checking, MIR, LLVM) are untouched for block structure.
 
 The native syntax is **human-first**: it borrows Python's readability (indentation,
 `:`, `say`, `give`, list literals) while keeping Saturnite's static typing, the
