@@ -24,7 +24,6 @@ use crate::ast::{ItemKind, Program};
 use crate::config::SaturnConfig;
 use crate::error::{CompilerError, CompilerResult};
 use crate::hir::symbol::{DefId, SymbolId, SymbolInterner};
-use crate::lexer::Lexer;
 use crate::parser;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -700,14 +699,12 @@ fn extract_ident(s: &str) -> Option<String> {
 }
 
 /// Lex and parse source text into an AST [`Program`].
+///
+/// Tokens go through the 0.5 preparation pass (`lexer::prepare`), which
+/// runs the indent pre-pass and desugars native colon-blocks into brace
+/// blocks before parsing.
 fn parse_source(source: &str) -> CompilerResult<Program> {
-    let mut tokens = Vec::new();
-    for token_result in Lexer::new(source) {
-        match token_result {
-            Ok(token) => tokens.push(token),
-            Err(e) => return Err(CompilerError::Lexer(e)),
-        }
-    }
+    let tokens = crate::lexer::prepare(source)?;
     parser::parse(source, tokens)
 }
 

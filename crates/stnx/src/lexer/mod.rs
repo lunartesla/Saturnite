@@ -1,7 +1,9 @@
 mod indent;
+mod prepare;
 mod token;
 
 pub use indent::{run as run_indent, IndentedTokens};
+pub use prepare::prepare;
 pub use token::{Token, TokenKind};
 
 use crate::error::LexError;
@@ -140,6 +142,10 @@ pub enum LexicalToken {
     LParen,
     #[token(")")]
     RParen,
+    #[token("[")]
+    LBracket,
+    #[token("]")]
+    RBracket,
     #[token("{")]
     LBrace,
     #[token("}")]
@@ -271,6 +277,8 @@ fn convert(lt: LexicalToken) -> TokenKind {
         LexicalToken::RParen => TokenKind::RParen,
         LexicalToken::LBrace => TokenKind::LBrace,
         LexicalToken::RBrace => TokenKind::RBrace,
+        LexicalToken::LBracket => TokenKind::LBracket,
+        LexicalToken::RBracket => TokenKind::RBracket,
         LexicalToken::Comma => TokenKind::Comma,
         LexicalToken::Colon => TokenKind::Colon,
         LexicalToken::RArrow => TokenKind::RArrow,

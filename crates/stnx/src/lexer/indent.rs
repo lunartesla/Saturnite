@@ -22,10 +22,7 @@ pub fn run(src: &str, raw: Vec<Token>) -> Result<IndentedTokens, Vec<LexError>> 
         let span_end = tok.span.end;
 
         // Compute the start of the line containing this token.
-        let line_start = src[..span_start]
-            .rfind('\n')
-            .map(|p| p + 1)
-            .unwrap_or(0);
+        let line_start = src[..span_start].rfind('\n').map(|p| p + 1).unwrap_or(0);
 
         // Did we cross any newlines between `cursor` and `line_start`?
         let crossed_newline = cursor <= line_start;
@@ -100,7 +97,10 @@ fn is_blank_or_comment_line(line: &str) -> bool {
 }
 
 fn compute_indent(prefix: &str) -> usize {
-    prefix.chars().take_while(|c| *c == ' ' || *c == '\t').count()
+    prefix
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .count()
 }
 
 fn apply_indent(
@@ -149,9 +149,7 @@ mod tests {
     use crate::lexer::Lexer;
 
     fn lex(src: &str) -> Vec<Token> {
-        Lexer::new(src)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("lex")
+        Lexer::new(src).collect::<Result<Vec<_>, _>>().expect("lex")
     }
 
     fn kinds(toks: &[Token]) -> Vec<TokenKind> {
