@@ -29,6 +29,11 @@ use crate::mir::{
 /// Must match `hir::lower::PRINTLN_DEF_ID`.
 const PRINTLN_DEF_ID: DefId = DefId(u32::MAX - 1);
 
+/// `DefId` sentinel for the builtin `println_str` function (0.5 native
+/// `say "..."` / `raise "..."`). Codegen maps this to the runtime
+/// `println_str` function.
+const PRINTLN_STR_DEF_ID: DefId = DefId(u32::MAX - 2);
+
 /// Entry point: lower a `HirProgram` into a `MirProgram`.
 pub fn lower_program(hir: &HirProgram) -> CompilerResult<MirProgram> {
     // Build a function signature table for call return-type resolution.
@@ -282,6 +287,24 @@ impl<'hir> MirLower<'hir> {
                 self.switch_to(next);
                 Ok(())
             }
+            HirStmtKind::PrintlnStr(e) => {
+                let val = self.lower_expr(e)?;
+                let dest = self.new_local(MirType::I64, self.temp_symbol, false);
+                self.emit(MirStmtKind::LocalDecl {
+                    local: dest,
+                    ty: MirType::I64,
+                    mutable: false,
+                });
+                let next = self.create_block(format!("println_str_cont_{}", self.blocks.len()));
+                self.finish(MirTerminator::Call {
+                    func: PRINTLN_STR_DEF_ID,
+                    args: vec![val],
+                    destination: dest,
+                    next,
+                });
+                self.switch_to(next);
+                Ok(())
+            }
             HirStmtKind::StructDef { .. } | HirStmtKind::EnumDef { .. } => Ok(()),
             // 0.5: `raise expr` lowers to a stub — print the expression
             // (which is expected to be a StrLit in 0.5) and then emit an
@@ -297,8 +320,15 @@ impl<'hir> MirLower<'hir> {
                     mutable: false,
                 });
                 let next = self.create_block(format!("raise_cont_{}", self.blocks.len()));
+                // String messages go to the string printer; numeric tags to
+                // the i64 printer.
+                let func = if e.ty == HirType::Str {
+                    PRINTLN_STR_DEF_ID
+                } else {
+                    PRINTLN_DEF_ID
+                };
                 self.finish(MirTerminator::Call {
-                    func: PRINTLN_DEF_ID,
+                    func,
                     args: vec![val],
                     destination: dest,
                     next,

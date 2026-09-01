@@ -6,7 +6,9 @@
 //! stages (MIR, LLVM codegen) never perform string lookups. Every HIR
 //! node carries a resolved `HirType` and a preserved source `SourceSpan`.
 
-use crate::ast::{BinOp, Expr, Function, Item, ItemKind, Program, Stmt, StrPart, Type, UnOp, Visibility};
+use crate::ast::{
+    BinOp, Expr, Function, Item, ItemKind, Program, Stmt, StrPart, Type, UnOp, Visibility,
+};
 use crate::error::{CompilerError, CompilerResult};
 use crate::hir::expr::{HirExpr, HirExprKind};
 use crate::hir::function::{EnumDef, HirFunction, HirModDecl, HirProgram, HirUseDecl, StructDef};
@@ -36,6 +38,9 @@ fn ast_visibility_to_hir(vis: &Visibility) -> HirVisibility {
 struct FunctionSig {
     def_id: DefId,
     param_types: Vec<HirType>,
+    /// Interned parameter names in declaration order. Used to reorder
+    /// named arguments (`f(amount: 20)`) into positional slots.
+    param_names: Vec<SymbolId>,
     return_type: HirType,
     /// Interned names of the function's generic parameters, in declaration
     /// order. Empty for non-generic functions. Used by `lower_expr` to
@@ -147,8 +152,7 @@ fn ast_type_to_hir(
         // deferred — this just keeps the type-checker honest about the
         // shape.
         Type::List(inner) => {
-            let inner_hir =
-                ast_type_to_hir(inner, symbols, enum_names, generic_param_names);
+            let inner_hir = ast_type_to_hir(inner, symbols, enum_names, generic_param_names);
             let inner_sym = match inner_hir {
                 HirType::I64 => symbols.intern("i64"),
                 HirType::F64 => symbols.intern("f64"),
@@ -475,6 +479,11 @@ impl HirLower {
                         ast_type_to_hir(t, &mut self.symbols, &enum_names, Some(&gparams))
                     })
                     .collect();
+                let param_names: Vec<SymbolId> = func
+                    .params
+                    .iter()
+                    .map(|(n, _)| self.symbols.intern(n))
+                    .collect();
                 let return_type = ast_type_to_hir(
                     &func.return_type,
                     &mut self.symbols,
@@ -486,6 +495,7 @@ impl HirLower {
                     FunctionSig {
                         def_id,
                         param_types,
+                        param_names,
                         return_type,
                         generic_params: gparams,
                     },
@@ -500,6 +510,7 @@ impl HirLower {
             FunctionSig {
                 def_id: PRINTLN_DEF_ID,
                 param_types: vec![HirType::I64],
+                param_names: vec![println_sym],
                 return_type: HirType::Unit,
                 generic_params: Vec::new(),
             },
@@ -955,6 +966,11 @@ impl HirLower {
                         FunctionSig {
                             def_id,
                             param_types,
+                            param_names: func
+                                .params
+                                .iter()
+                                .map(|(n, _)| self.symbols.intern(n))
+                                .collect(),
                             return_type,
                             generic_params: gparams,
                         },
@@ -971,6 +987,7 @@ impl HirLower {
             FunctionSig {
                 def_id: PRINTLN_DEF_ID,
                 param_types: vec![HirType::I64],
+                param_names: vec![println_sym],
                 return_type: HirType::Unit,
                 generic_params: Vec::new(),
             },
@@ -1312,10 +1329,20 @@ impl HirLower {
             // 0.5: `say expr` is a synonym for `println(expr)`.
             Stmt::Say(e, span) => {
                 let hir_expr = self.lower_expr(e, scope, return_type, ctx)?;
-                Ok(HirStmt {
-                    kind: HirStmtKind::Println(hir_expr),
-                    span: span_to_source_span(span),
-                })
+                match hir_expr.ty {
+                    HirType::Str => Ok(HirStmt {
+                        kind: HirStmtKind::PrintlnStr(hir_expr),
+                        span: span_to_source_span(span),
+                    }),
+                    HirType::I64 | HirType::Enum(_) => Ok(HirStmt {
+                        kind: HirStmtKind::Println(hir_expr),
+                        span: span_to_source_span(span),
+                    }),
+                    other => Err(CompilerError::semantic(format!(
+                        "say expects a text or number argument, got {:?}",
+                        other
+                    ))),
+                }
             }
             // 0.5: `raise expr` lowers to a stub that prints the message
             // and aborts. Real error semantics are deferred.
@@ -1563,17 +1590,62 @@ impl HirLower {
                 let sig = ctx.function_sigs.get(&func_sym).ok_or_else(|| {
                     CompilerError::semantic(format!("undefined function: {}", func))
                 })?;
-                // 0.5: named arguments are not yet wired into FunctionSig's
-                // param-name table. For now we reject mixed/named args
-                // explicitly so the parser-level feature does not silently
-                // miscompile.
-                if !named_args.is_empty() {
-                    return Err(CompilerError::semantic(
-                        "named arguments are not yet supported by the type \
-                         checker in 0.5; use positional arguments"
-                            .to_string(),
-                    ));
-                }
+                // 0.5: named arguments are reordered into positional slots
+                // against the callee's parameter names. Positional args fill
+                // free slots left-to-right in source order.
+                let args: Vec<Expr> = if named_args.is_empty() {
+                    args.clone()
+                } else {
+                    let mut slots: Vec<Option<Expr>> = vec![None; sig.param_types.len()];
+                    let mut next_pos = 0usize;
+                    for a in args {
+                        while next_pos < slots.len() && slots[next_pos].is_some() {
+                            next_pos += 1;
+                        }
+                        if next_pos >= slots.len() {
+                            return Err(CompilerError::semantic(format!(
+                                "function {} expects {} args, got more",
+                                func,
+                                sig.param_types.len()
+                            )));
+                        }
+                        slots[next_pos] = Some(a.clone());
+                        next_pos += 1;
+                    }
+                    for (name, value) in named_args {
+                        let name_sym = self.symbols.intern(name);
+                        let idx = sig
+                            .param_names
+                            .iter()
+                            .position(|&p| p == name_sym)
+                            .ok_or_else(|| {
+                                CompilerError::semantic(format!(
+                                    "no parameter named `{}` on function {}",
+                                    name, func
+                                ))
+                            })?;
+                        if slots[idx].is_some() {
+                            return Err(CompilerError::semantic(format!(
+                                "duplicate argument `{}` in call to {}",
+                                name, func
+                            )));
+                        }
+                        slots[idx] = Some(value.clone());
+                    }
+                    slots
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, slot)| {
+                            slot.ok_or_else(|| {
+                                CompilerError::semantic(format!(
+                                    "missing argument for parameter {} of {}",
+                                    i + 1,
+                                    func
+                                ))
+                            })
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?
+                };
                 if args.len() != sig.param_types.len() {
                     return Err(CompilerError::semantic(format!(
                         "function {} expects {} args, got {}",
@@ -1950,30 +2022,40 @@ impl HirLower {
                 })
             }
             // 0.5: `a |> b(x)` desugars to `b(a, x)`. We desugar at the
-            // AST→HIR boundary by recursively lowering the rhs first, then
-            // splicing the lhs as the first argument of the rhs Call.
+            // AST→HIR boundary by splicing the lhs as the first positional
+            // argument of the rhs call *before* lowering, so arity and
+            // named-argument checks see the complete argument list.
             Expr::Pipeline { lhs, rhs, span } => {
-                let rhs_hir = self.lower_expr(rhs, scope, return_type, ctx)?;
-                let lhs_hir = self.lower_expr(lhs, scope, return_type, ctx)?;
-                match rhs_hir.kind {
-                    HirExprKind::Call { func, mut args, type_args } => {
-                        args.insert(0, lhs_hir);
-                        Ok(HirExpr {
-                            kind: HirExprKind::Call { func, args, type_args },
-                            ty: rhs_hir.ty,
-                            span: span_to_source_span(span),
-                        })
+                match rhs.as_ref() {
+                    Expr::Call {
+                        func,
+                        args,
+                        named_args,
+                        type_args,
+                        span: call_span,
+                    } => {
+                        let mut combined_args: Vec<Expr> = vec![(**lhs).clone()];
+                        combined_args.extend(args.iter().cloned());
+                        let combined = Expr::Call {
+                            func: func.clone(),
+                            args: combined_args,
+                            named_args: named_args.clone(),
+                            type_args: type_args.clone(),
+                            span: call_span.clone(),
+                        };
+                        self.lower_expr(&combined, scope, return_type, ctx)
                     }
                     // Bare `a |> f` desugars to `f(a)`.
-                    HirExprKind::Variable { symbol } => {
-                        // Look up the function's DefId from the signature table.
+                    Expr::Var(symbol, _) => {
+                        let lhs_hir = self.lower_expr(lhs, scope, return_type, ctx)?;
+                        let name_sym = self.symbols.intern(symbol.as_str());
                         let def_id = ctx
                             .function_sigs
-                            .get(&symbol)
+                            .get(&name_sym)
                             .map(|s| s.def_id)
                             .ok_or_else(|| {
                                 CompilerError::semantic(format!(
-                                    "undefined function in pipeline: {:?}",
+                                    "undefined function in pipeline: {}",
                                     symbol
                                 ))
                             })?;
@@ -1983,7 +2065,7 @@ impl HirLower {
                                 args: vec![lhs_hir],
                                 type_args: Vec::new(),
                             },
-                            ty: rhs_hir.ty,
+                            ty: HirType::Unit,
                             span: span_to_source_span(span),
                         })
                     }
@@ -1997,13 +2079,15 @@ impl HirLower {
             // expression with a reference to it. For simplicity in 0.5 we
             // lower the closure body as the *current* call's body — real
             // first-class function support is deferred.
-            Expr::Closure { params: _, body: _, span } => {
-                Err(CompilerError::semantic(
-                    "closures are not yet supported at runtime in 0.5; \
+            Expr::Closure {
+                params: _,
+                body: _,
+                span: _,
+            } => Err(CompilerError::semantic(
+                "closures are not yet supported at runtime in 0.5; \
                      rewrite as a regular function for now"
-                        .to_string(),
-                ))
-            }
+                    .to_string(),
+            )),
             // 0.5: string interpolation desugars to a chain of concat_str
             // calls. We approximate by lowering each segment to a value and
             // producing a sequence of expressions; the parser keeps the

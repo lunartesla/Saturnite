@@ -36,6 +36,10 @@ pub enum HirStmtKind {
     /// `println(expr);` — builtin call to `println_i64`.
     Println(HirExpr),
 
+    /// 0.5: `say expr` where expr is a string — builtin call to
+    /// `println_str`.
+    PrintlnStr(HirExpr),
+
     /// 0.5: `raise expr;` — lowers to a stub that prints the message and
     /// aborts the process. Real error semantics are deferred to a later
     /// phase. The MIR→LLVM backend lowers this to a `println` followed by

@@ -26,6 +26,10 @@ use std::collections::HashMap;
 /// DefId sentinel for the builtin `println` function.
 const PRINTLN_DEF_ID: crate::hir::symbol::DefId = crate::hir::symbol::DefId(u32::MAX - 1);
 
+/// DefId sentinel for the builtin `println_str` function (0.5 native
+/// `say "..."` / `raise "..."`).
+const PRINTLN_STR_DEF_ID: crate::hir::symbol::DefId = crate::hir::symbol::DefId(u32::MAX - 2);
+
 /// A local alloca plus its LLVM type (needed for loading with the right type).
 type AllocaInfo<'ctx> = (PointerValue<'ctx>, BasicTypeEnum<'ctx>);
 
@@ -94,12 +98,15 @@ impl<'ctx> MirCodeGenContext<'ctx> {
         let i64_ty = self.context.i64_type();
         self.module
             .add_function("println_i64", i64_ty.fn_type(&[i64_ty.into()], false), None);
+        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+        self.module
+            .add_function("println_str", i64_ty.fn_type(&[ptr_ty.into()], false), None);
     }
 
     /// Declare all functions from the MIR program into the module.
     pub fn declare_functions(&mut self, prog: &MirProgram) -> CompilerResult<()> {
         for func in &prog.functions {
-            if func.def_id == PRINTLN_DEF_ID {
+            if func.def_id == PRINTLN_DEF_ID || func.def_id == PRINTLN_STR_DEF_ID {
                 continue;
             }
             let name = prog
@@ -230,8 +237,13 @@ impl<'ctx> MirCodeGenContext<'ctx> {
                     .symbols
                     .lookup(*sym)
                     .ok_or_else(|| CompilerError::codegen("undefined string symbol"))?;
-                let gv = self.context.const_string(s.as_bytes(), false);
-                Ok(gv.as_basic_value_enum())
+                // 0.5: strings are private NUL-terminated globals; the
+                // rvalue evaluates to an `i8*` pointing at the bytes.
+                Ok(self
+                    .builder
+                    .build_global_string_ptr(s, "str_lit")
+                    .unwrap()
+                    .as_basic_value_enum())
             }
         }
     }
@@ -642,6 +654,8 @@ impl<'ctx> MirCodeGenContext<'ctx> {
             } => {
                 let fname = if *def_id == PRINTLN_DEF_ID {
                     "println_i64"
+                } else if *def_id == PRINTLN_STR_DEF_ID {
+                    "println_str"
                 } else {
                     prog.function_name(*def_id).ok_or_else(|| {
                         CompilerError::codegen(format!(
@@ -739,7 +753,12 @@ pub fn mir_type_to_llvm<'ctx>(
         HirType::I64 => ctx.i64_type().as_basic_type_enum(),
         HirType::F64 => ctx.f64_type().as_basic_type_enum(),
         HirType::Bool => ctx.bool_type().as_basic_type_enum(),
-        HirType::Str | HirType::Unit => ctx.i64_type().as_basic_type_enum(),
+        // 0.5: strings are NUL-terminated byte pointers (globals produced
+        // by `StrLit` rvalues).
+        HirType::Str => ctx
+            .ptr_type(inkwell::AddressSpace::default())
+            .as_basic_type_enum(),
+        HirType::Unit => ctx.i64_type().as_basic_type_enum(),
         HirType::Enum(_) => ctx.i64_type().as_basic_type_enum(),
         HirType::Struct(sym) => {
             let struct_def = match prog.struct_def(*sym) {
