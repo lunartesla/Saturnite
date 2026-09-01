@@ -53,6 +53,36 @@ fn main() -> i64 {
 > MIR model where every block ends in a terminator and `Return` is the only
 > way out of a function.
 
+> **Native syntax (0.5):** Saturnite also accepts a Python-inspired,
+> indentation-aware surface syntax (`fn f() -> i64:` with an indented body,
+> `give` for `return`, `say` for `println`, `main:` entry block, `module`,
+> `text`/`number` type aliases). Both the legacy brace style and the native
+> style may be mixed in one file. See
+> [`docs/SATURNITE_SYNTAX.md`](docs/SATURNITE_SYNTAX.md). The example below is
+> a native-syntax program (it lives at `examples/native_demo.stn`):
+
+```text
+module inventory_demo
+
+struct Item:
+    name: text
+    price: number
+    quantity: number
+
+fn total_value(price: number, qty: number) -> number:
+    give price * qty
+
+fn restock(price: number, amount: number) -> number:
+    if amount <= 0:
+        raise "restock amount must be positive"
+    give price + amount
+
+main:
+    let x = total_value(4, 10)
+    say x
+    give 0
+```
+
 ---
 
 ## Features at a glance
