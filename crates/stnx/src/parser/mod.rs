@@ -1,7 +1,7 @@
 pub use crate::ast::*;
 
 use crate::error::{CompilerError, CompilerResult, ParseError};
-use crate::lexer::{Token, TokenKind};
+use crate::lexer::{Lexer, Token, TokenKind};
 use chumsky::error::Simple;
 use chumsky::prelude::*;
 use chumsky::recursive::Direct;
@@ -170,7 +170,9 @@ fn item<'a>() -> impl Parser<'a, &'a [Token], Item, ParserExtra<'a>> {
                 // mod declaration: mod <ident>
                 .or(mod_decl().map(|(name, span)| (name.clone(), ItemKind::ModDecl, span)))
                 // use declaration: use <path> [as <alias>]
-                .or(use_decl().map(|(name, kind, span)| (name, kind, span))),
+                .or(use_decl().map(|(name, kind, span)| (name, kind, span)))
+                // 0.5 native module declaration: module <ident> (advisory)
+                .or(module_decl().map(|(name, span)| (name.clone(), ItemKind::ModuleDecl, span))),
         )
         .map(|(vis, (name, kind, span))| Item {
             name,
@@ -233,6 +235,14 @@ fn enum_item<'a>(
 /// Returns the module name and its byte span.
 fn mod_decl<'a>() -> impl Parser<'a, &'a [Token], (String, Range<usize>), ParserExtra<'a>> {
     kw_span("mod")
+        .ignore_then(t_ident())
+        .map(|(name, span)| (name, span))
+}
+
+/// Parse a 0.5 native `module <ident>` declaration (advisory header).
+/// Returns the module name and its byte span.
+fn module_decl<'a>() -> impl Parser<'a, &'a [Token], (String, Range<usize>), ParserExtra<'a>> {
+    kw_span("module")
         .ignore_then(t_ident())
         .map(|(name, span)| (name, span))
 }
@@ -316,29 +326,83 @@ fn params<'a>() -> impl Parser<'a, &'a [Token], Vec<(String, Type)>, ParserExtra
         .or(rparen().to(Vec::new()))
 }
 
+/// 0.5: a call argument list — positional expressions and/or
+/// `name: value` named arguments. Named arguments are collected into the
+/// parallel `named_args` vec and reordered against the callee signature
+/// at AST→HIR lowering.
+fn call_args<'a>(
+    expr: Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExtra<'a>>>,
+) -> impl Parser<'a, &'a [Token], (Vec<Expr>, Vec<(String, Expr)>), ParserExtra<'a>> {
+    let arg = t_ident()
+        .then(colon().ignore_then(expr.clone()))
+        .map(|((name, _), value)| (Vec::new(), vec![(name, value)]))
+        .or(expr.map(|e| (vec![e], Vec::new())))
+        .boxed();
+
+    arg.separated_by(comma()).collect::<Vec<_>>().map(|parts| {
+        let mut args = Vec::new();
+        let mut named_args = Vec::new();
+        for (a, n) in parts {
+            args.extend(a);
+            named_args.extend(n);
+        }
+        (args, named_args)
+    })
+}
+
+/// 0.5 shared type atom: legacy type names plus native aliases and
+/// `List<T>`. Used by annotations, return types, and turbofish lists.
+fn type_atom<'a>() -> Boxed<'a, 'a, &'a [Token], Type, ParserExtra<'a>> {
+    kw("i64")
+        .to(Type::I64)
+        .or(kw("f64").to(Type::F64))
+        .or(kw("bool").to(Type::Bool))
+        .or(kw("str").to(Type::Str))
+        .or(kw("text").to(Type::Str))
+        .or(kw("number").to(Type::I64))
+        .or(kw("unit").to(Type::Unit))
+        // `List<T>` — one nesting level (`List<List<T>>` is not supported).
+        .or(t_ident()
+            .then(
+                lt().ignore_then(
+                    simple_type_name().or(t_ident()
+                        .then_ignore(lt())
+                        .ignore_then(simple_type_name())
+                        .then_ignore(gt())
+                        .map(Box::new)
+                        .map(Type::List)),
+                )
+                .then_ignore(gt())
+                .or_not(),
+            )
+            .map(|((name, _span), inner)| match inner {
+                Some(t) if name == "List" => Type::List(Box::new(t)),
+                Some(_) => Type::Struct(name),
+                None => Type::Struct(name),
+            }))
+        .boxed()
+}
+
+/// A plain named/builtin type with no generic arguments.
+fn simple_type_name<'a>() -> impl Parser<'a, &'a [Token], Type, ParserExtra<'a>> {
+    kw("i64")
+        .to(Type::I64)
+        .or(kw("f64").to(Type::F64))
+        .or(kw("bool").to(Type::Bool))
+        .or(kw("str").to(Type::Str))
+        .or(kw("text").to(Type::Str))
+        .or(kw("number").to(Type::I64))
+        .or(kw("unit").to(Type::Unit))
+        .or(t_ident().map(|(name, _)| Type::Struct(name)))
+}
+
 fn type_ann<'a>() -> impl Parser<'a, &'a [Token], Type, ParserExtra<'a>> {
-    colon().ignore_then(
-        kw("i64")
-            .to(Type::I64)
-            .or(kw("f64").to(Type::F64))
-            .or(kw("bool").to(Type::Bool))
-            .or(kw("str").to(Type::Str))
-            .or(kw("unit").to(Type::Unit))
-            .or(t_ident().map(|(name, _)| Type::Struct(name))),
-    )
+    colon().ignore_then(type_atom())
 }
 
 fn ret_type<'a>() -> impl Parser<'a, &'a [Token], Type, ParserExtra<'a>> {
     rarrow()
-        .ignore_then(
-            kw("i64")
-                .to(Type::I64)
-                .or(kw("f64").to(Type::F64))
-                .or(kw("bool").to(Type::Bool))
-                .or(kw("str").to(Type::Str))
-                .or(kw("unit").to(Type::Unit))
-                .or(t_ident().map(|(name, _)| Type::Struct(name))),
-        )
+        .ignore_then(type_atom())
         .or_not()
         .map(|opt: Option<Type>| opt.unwrap_or(Type::Unit))
 }
@@ -446,14 +510,43 @@ fn stmt<'a>(
             },
         );
 
-    let expr_stmt = expr.map(|e| {
+    let expr_stmt = expr.clone().map(|e| {
         let span = stmt_span(&e);
         Stmt::Expr(e, span)
+    });
+
+    // 0.5: `give [expr]` — synonym for `return`.
+    let give_stmt = kw_span("give")
+        .then(expr.clone().or_not())
+        .map(|(give_span, e)| {
+            let span = e
+                .as_ref()
+                .map(|e| {
+                    let es = stmt_span(e);
+                    give_span.start..es.end
+                })
+                .unwrap_or(give_span);
+            Stmt::Give(e, span)
+        });
+
+    // 0.5: `say expr` — synonym for `println(expr)`.
+    let say_stmt = kw_span("say").then(expr.clone()).map(|(say_span, e)| {
+        let es = stmt_span(&e);
+        Stmt::Say(e, say_span.start..es.end)
+    });
+
+    // 0.5: `raise expr` — error raise (stub in 0.5: print + abort).
+    let raise_stmt = kw_span("raise").then(expr.clone()).map(|(raise_span, e)| {
+        let es = stmt_span(&e);
+        Stmt::Raise(e, raise_span.start..es.end)
     });
 
     let_stmt
         .or(return_stmt)
         .or(println_stmt)
+        .or(give_stmt)
+        .or(say_stmt)
+        .or(raise_stmt)
         .or(struct_def)
         .or(enum_def)
         .or(expr_stmt)
@@ -485,29 +578,38 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
             .or(any::<&[Token], _>()
                 .filter(|t: &Token| matches!(&t.kind, TokenKind::StrLit(_)))
                 .map(|t| match &t.kind {
-                    TokenKind::StrLit(s) => Expr::StrLit(s.clone(), t.span.clone()),
+                    TokenKind::StrLit(s) => {
+                        // 0.5: strings containing `{...}` become interpolated
+                        // strings. Segments without expressions are
+                        // flattened back to a plain literal at lowering.
+                        let span = t.span.clone();
+                        match split_interpolation(s) {
+                            Some(parts) => Expr::InterpolatedStr(parts, span),
+                            None => Expr::StrLit(s.clone(), span),
+                        }
+                    }
                     _ => unreachable!(),
                 }))
             .or(kw_span("true")
                 .map(|s| Expr::Bool(true, s))
                 .or(kw_span("false").map(|s| Expr::Bool(false, s))))
             .or(lbrace_span().then_ignore(rbrace()).map(Expr::Unit))
+            .or(lbracket_span()
+                .ignore_then(expr.clone().separated_by(comma()).collect::<Vec<_>>())
+                .then_ignore(rbracket())
+                .map(|items| {
+                    let span = items.first().map(stmt_span).unwrap_or(0..0);
+                    // 0.5: list literal — store as a special Expr for now
+                    // (runtime support is deferred; we use a StrLit so
+                    // codegen accepts it without runtime support).
+                    Expr::StrLit(format!("[list:{}]", items.len()), span.start..span.end)
+                }))
             .or(t_ident()
                 // Optional turbofish for struct literals: `Box::<i64> { ... }`.
                 .then(
                     double_colon()
                         .ignore_then(lt())
-                        .ignore_then(
-                            kw("i64")
-                                .to(Type::I64)
-                                .or(kw("f64").to(Type::F64))
-                                .or(kw("bool").to(Type::Bool))
-                                .or(kw("str").to(Type::Str))
-                                .or(kw("unit").to(Type::Unit))
-                                .or(t_ident().map(|(name, _)| Type::Struct(name)))
-                                .separated_by(comma())
-                                .collect::<Vec<_>>(),
-                        )
+                        .ignore_then(type_atom().separated_by(comma()).collect::<Vec<_>>())
                         .then_ignore(gt())
                         .or_not(),
                 )
@@ -546,42 +648,25 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
                 .then(
                     double_colon()
                         .ignore_then(lt())
-                        .ignore_then(
-                            // A type-arg list: one or more `Type`s separated by commas.
-                            // We reuse `type_ann`-shaped identifiers via the same
-                            // inner Type productions used elsewhere.
-                            kw("i64")
-                                .to(Type::I64)
-                                .or(kw("f64").to(Type::F64))
-                                .or(kw("bool").to(Type::Bool))
-                                .or(kw("str").to(Type::Str))
-                                .or(kw("unit").to(Type::Unit))
-                                .or(t_ident().map(|(name, _)| Type::Struct(name)))
-                                .separated_by(comma())
-                                .collect::<Vec<_>>(),
-                        )
+                        .ignore_then(type_atom().separated_by(comma()).collect::<Vec<_>>())
                         .then_ignore(gt())
                         .or_not(),
                 )
                 .then(
                     lparen()
-                        .ignore_then(expr.clone().separated_by(comma()).collect::<Vec<_>>())
+                        .ignore_then(call_args(expr.clone()))
                         .then_ignore(rparen())
                         .or_not(),
                 )
-                .map(|(((name, name_span), type_args), args)| {
-                    if let Some(args) = args {
+                .map(|(((name, name_span), type_args), parsed)| {
+                    if let Some((args, named_args)) = parsed {
                         Expr::Call {
                             func: name,
                             args,
-                            named_args: Vec::new(),
+                            named_args,
                             type_args: type_args.unwrap_or_default(),
                             span: name_span,
                         }
-                    } else if type_args.is_some() {
-                        // `f::<T>` without `(args)` — surface as a parse error
-                        // (a turbofish without a call is malformed).
-                        Expr::Var(name, name_span)
                     } else {
                         Expr::Var(name, name_span)
                     }
@@ -826,6 +911,118 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
             ))
             .boxed();
 
+        // 0.5: pipeline chain — lowest binary precedence:
+        // `a |> f(x) |> g(y)` folds left into nested Expr::Pipeline.
+        let pipeline_expr = range_expr
+            .clone()
+            .foldl(
+                pipe_op().then(range_expr.clone()).repeated(),
+                |lhs, ((), rhs)| {
+                    let span = combine_spans(&lhs, &rhs);
+                    Expr::Pipeline {
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                        span,
+                    }
+                },
+            )
+            .boxed();
+
+        // 0.5: closure — `x -> body` or `(x, y) -> body`.
+        let closure_expr = t_ident()
+            .then_ignore(closure_arrow())
+            .then(expr.clone())
+            .map(|((name, name_span), body)| {
+                let body_span = stmt_span(&body);
+                Expr::Closure {
+                    params: vec![ClosureParam { name, ty: None }],
+                    body: Box::new(body),
+                    span: name_span.start..body_span.end,
+                }
+            })
+            .or(lparen()
+                .ignore_then(
+                    t_ident()
+                        .then(type_ann().or_not())
+                        .separated_by(comma())
+                        .collect::<Vec<_>>(),
+                )
+                .then_ignore(rparen())
+                .then_ignore(closure_arrow())
+                .then(expr.clone())
+                .map(|(params, body)| {
+                    let body_span = stmt_span(&body);
+                    let start = params
+                        .first()
+                        .map(|((_, s), _)| s.start)
+                        .unwrap_or(body_span.start);
+                    Expr::Closure {
+                        params: params
+                            .into_iter()
+                            .map(|((name, _), ty)| ClosureParam { name, ty })
+                            .collect(),
+                        body: Box::new(body),
+                        span: start..body_span.end,
+                    }
+                }))
+            .boxed();
+
+        // 0.5: bare closure `x -> body` at expression position. This must
+        // be tried before the primary expression so `give x -> x` parses
+        // as a closure rather than a variable followed by garbage.
+        let bare_closure = t_ident()
+            .then_ignore(closure_arrow())
+            .then(expr.clone())
+            .map(|((name, name_span), body)| {
+                let body_span = stmt_span(&body);
+                Expr::Closure {
+                    params: vec![ClosureParam { name, ty: None }],
+                    body: Box::new(body),
+                    span: name_span.start..body_span.end,
+                }
+            })
+            .boxed();
+
+        // 0.5: parenthesised closure `(x, y) -> body` or `(x -> body)`.
+        // This is tried at the expression level (not primary) to avoid
+        // ambiguity with `(expr)` grouping.
+        let paren_closure = lparen()
+            .ignore_then(t_ident().map(|(n, _)| n))
+            .then(
+                closure_arrow()
+                    .ignore_then(expr.clone())
+                    .then_ignore(rparen())
+                    .map(|body| (vec![], body))
+                    .or(comma()
+                        .ignore_then(
+                            t_ident()
+                                .then(type_ann().or_not())
+                                .separated_by(comma())
+                                .collect::<Vec<_>>(),
+                        )
+                        .then_ignore(rparen())
+                        .then_ignore(closure_arrow())
+                        .then(expr.clone())
+                        .then_ignore(rparen())
+                        .map(|(rest, body)| (rest, body))),
+            )
+            .map(|(first, (rest, body))| {
+                let body_span = stmt_span(&body);
+                let mut params = vec![ClosureParam {
+                    name: first,
+                    ty: None,
+                }];
+                for ((name, _), ty) in rest {
+                    params.push(ClosureParam { name, ty });
+                }
+                Expr::Closure {
+                    params,
+                    body: Box::new(body),
+                    span: body_span.start..body_span.end,
+                }
+            })
+            .boxed();
+
         // Control flow expressions are tried first (they start with keywords
         // that don't match primary), then assignment (starts with ident),
         // then the basic expression chain (logical OR is the outermost binary layer)
@@ -833,8 +1030,11 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
         let base_expr = if_expr
             .or(for_expr.clone())
             .or(while_expr.clone())
+            .or(bare_closure.clone())
+            .or(paren_closure.clone())
+            .or(closure_expr.clone())
             .or(assign_expr.clone())
-            .or(range_expr.clone())
+            .or(pipeline_expr.clone())
             .memoized()
             .boxed();
 
@@ -1012,6 +1212,12 @@ fn kw_span<'a>(k: &'a str) -> Boxed<'a, 'a, &'a [Token], Range<usize>, ParserExt
                     | (TokenKind::Use, "use")
                     | (TokenKind::Pub, "pub")
                     | (TokenKind::As, "as")
+                    | (TokenKind::Module, "module")
+                    | (TokenKind::Give, "give")
+                    | (TokenKind::Say, "say")
+                    | (TokenKind::Raise, "raise")
+                    | (TokenKind::Text, "text")
+                    | (TokenKind::Number, "number")
             )
         })
         .map(|t| t.span.clone())
@@ -1053,6 +1259,12 @@ fn is_keyword(s: &str) -> bool {
             | "use"
             | "pub"
             | "as"
+            | "module"
+            | "give"
+            | "say"
+            | "raise"
+            | "text"
+            | "number"
     )
 }
 
@@ -1078,6 +1290,18 @@ fn lbrace_span<'a>() -> impl Parser<'a, &'a [Token], Range<usize>, ParserExtra<'
     any::<&[Token], _>()
         .filter(|t: &Token| t.kind == TokenKind::LBrace)
         .map(|t| t.span.clone())
+}
+
+fn lbracket_span<'a>() -> impl Parser<'a, &'a [Token], Range<usize>, ParserExtra<'a>> {
+    any::<&[Token], _>()
+        .filter(|t: &Token| t.kind == TokenKind::LBracket)
+        .map(|t| t.span.clone())
+}
+
+fn rbracket<'a>() -> impl Parser<'a, &'a [Token], (), ParserExtra<'a>> {
+    any::<&[Token], _>()
+        .filter(|t: &Token| t.kind == TokenKind::RBracket)
+        .ignored()
 }
 
 fn rbrace<'a>() -> impl Parser<'a, &'a [Token], (), ParserExtra<'a>> {
@@ -1202,6 +1426,20 @@ fn or_op<'a>() -> impl Parser<'a, &'a [Token], BinOp, ParserExtra<'a>> + Clone +
         .boxed()
 }
 
+/// 0.5: the `|>` pipeline operator.
+fn pipe_op<'a>() -> impl Parser<'a, &'a [Token], (), ParserExtra<'a>> + Clone + 'a {
+    any::<&[Token], _>()
+        .filter(|t: &Token| t.kind == TokenKind::Pipe)
+        .ignored()
+}
+
+/// 0.5: the `->` closure arrow.
+fn closure_arrow<'a>() -> impl Parser<'a, &'a [Token], (), ParserExtra<'a>> + Clone + 'a {
+    any::<&[Token], _>()
+        .filter(|t: &Token| t.kind == TokenKind::RArrow)
+        .ignored()
+}
+
 fn bang<'a>() -> impl Parser<'a, &'a [Token], (), ParserExtra<'a>> {
     any::<&[Token], _>()
         .filter(|t: &Token| t.kind == TokenKind::Bang)
@@ -1249,6 +1487,35 @@ fn dot_dot_dot<'a>() -> impl Parser<'a, &'a [Token], (), ParserExtra<'a>> {
     any::<&[Token], _>()
         .filter(|t: &Token| t.kind == TokenKind::DotDotEllipsis)
         .ignored()
+}
+
+/// 0.5: split a string literal containing `{...}` segments into
+/// interpolated-string parts. Returns `None` if the string has no
+/// interpolation or if an embedded expression fails to parse (in which
+/// case the plain literal is kept).
+fn split_interpolation(s: &str) -> Option<Vec<StrPart>> {
+    if !(s.contains('{') && s.contains('}')) {
+        return None;
+    }
+    let mut parts: Vec<StrPart> = Vec::new();
+    let mut buf = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find('{') {
+        let end_rel = rest[start..].find('}')?;
+        buf.push_str(&rest[..start]);
+        parts.push(StrPart::Literal(std::mem::take(&mut buf)));
+        let inner = &rest[start + 1..start + end_rel];
+        let toks: Vec<Token> = Lexer::new(inner).collect::<Result<Vec<_>, _>>().ok()?;
+        let (out, errs) = recursive_expr().parse(&toks).into_output_errors();
+        match (out, errs.is_empty()) {
+            (Some(e), true) => parts.push(StrPart::Expr(e)),
+            _ => return None,
+        }
+        rest = &rest[start + end_rel + 1..];
+    }
+    buf.push_str(rest);
+    parts.push(StrPart::Literal(buf));
+    Some(parts)
 }
 
 /// Helper to extract the span from an Expr for use in Stmt::Expr
