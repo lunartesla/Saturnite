@@ -470,6 +470,50 @@ impl ModuleGraph {
         format!("crate::{}", segments.join("::"))
     }
 
+    /// Detect a simple cycle in the module import/dependency graph.
+    ///
+    /// Defensive guard only; visibility enforcement remains deferred.
+    pub fn detect_cycle(&self) -> Option<Vec<ModuleId>> {
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = Vec::new();
+        fn dfs(
+            graph: &ModuleGraph,
+            node: ModuleId,
+            visited: &mut std::collections::HashSet<ModuleId>,
+            stack: &mut Vec<ModuleId>,
+            cycle: &mut Option<Vec<ModuleId>>,
+        ) {
+            if cycle.is_some() {
+                return;
+            }
+            if visited.contains(&node) {
+                if let Some(pos) = stack.iter().position(|&n| n == node) {
+                    *cycle = Some(stack[pos..].to_vec());
+                }
+                return;
+            }
+            visited.insert(node);
+            stack.push(node);
+            if let Some(deps) = graph.imports.get(&node) {
+                for &child in deps {
+                    dfs(graph, child, visited, stack, cycle);
+                }
+            }
+            stack.pop();
+        }
+        for id in 0..self.modules.len() as u32 {
+            let mid = ModuleId(id);
+            if !visited.contains(&mid) {
+                let mut cycle_opt: Option<Vec<ModuleId>> = None;
+                dfs(self, mid, &mut visited, &mut stack, &mut cycle_opt);
+                if cycle_opt.is_some() {
+                    return cycle_opt;
+                }
+            }
+        }
+        None
+    }
+
     /// Resolve a module path relative to a current module's path.
     pub fn resolve_path(&self, from: ModuleId, segments: &[SymbolId]) -> Option<ModuleId> {
         let base_module = self.get_module(from)?;
