@@ -52,6 +52,16 @@ struct FunctionSig {
 /// DefId sentinel for the builtin `println` function.
 const PRINTLN_DEF_ID: DefId = DefId(u32::MAX - 1);
 
+/// DefId sentinel for the runtime `concat_str` builtin (0.5.1 string
+/// interpolation). Signature `(Str, Str) -> Str`. Must match
+/// `mir::codegen::CONCAT_STR_DEF_ID`.
+const CONCAT_STR_DEF_ID: DefId = DefId(u32::MAX - 3);
+
+/// DefId sentinel for the runtime `str_i64` builtin (0.5.1 numeric string
+/// interpolation). Signature `(I64) -> Str`. Must match
+/// `mir::codegen::STR_I64_DEF_ID`.
+const STR_I64_DEF_ID: DefId = DefId(u32::MAX - 4);
+
 /// Context passed to lowering functions, bundling immutable references to
 /// the function signature table and the struct/enum registries.  This allows
 /// `lower_stmt` / `lower_expr` to resolve type names and look up struct/enum
@@ -2088,38 +2098,65 @@ impl HirLower {
                      rewrite as a regular function for now"
                     .to_string(),
             )),
-            // 0.5: string interpolation desugars to a chain of concat_str
-            // calls. We approximate by lowering each segment to a value and
-            // producing a sequence of expressions; the parser keeps the
-            // original interpolation intact for diagnostics. For 0.5 the
-            // runtime representation is the same as a plain StrLit with the
-            // interpolated parts inlined; complex expressions inside `{...}`
-            // are accepted but not yet rendered.
+            // 0.5.1: string interpolation lowers to a chain of runtime
+            // `concat_str` calls. Each literal segment becomes a `StrLit`;
+            // each `{expr}` segment is lowered. `{Str}` segments concatenate
+            // directly; `{I64}` segments are first converted to a string by
+            // the runtime `str_i64` builtin. Every other type is rejected at
+            // compile time rather than silently miscompiled. The resulting
+            // nested `Call`(s) reuse the ordinary call pipeline through
+            // monomorphization → MIR → LLVM codegen.
             Expr::InterpolatedStr(parts, span) => {
-                // Find any non-literal parts — for now, refuse if there are
-                // any non-trivial expressions. Real interpolation lowers to
-                // a `concat_str` builtin.
+                let span = span_to_source_span(span);
+                let mut acc: Option<HirExpr> = None;
                 for part in parts {
-                    if let StrPart::Expr(_) = part {
-                        return Err(CompilerError::semantic(
-                            "string interpolation expressions are not yet \
-                             supported at runtime in 0.5; use plain strings"
-                                .to_string(),
-                        ));
-                    }
+                    let segment = match part {
+                        StrPart::Literal(s) => {
+                            let str_id = self.symbols.intern(&s);
+                            HirExpr {
+                                kind: HirExprKind::StrLit(str_id),
+                                ty: HirType::Str,
+                                span,
+                            }
+                        }
+                        StrPart::Expr(e) => {
+                            let inner = self.lower_expr(e, scope, return_type, ctx)?;
+                            match inner.ty {
+                                HirType::Str => inner,
+                                HirType::I64 => HirExpr {
+                                    kind: HirExprKind::Call {
+                                        func: STR_I64_DEF_ID,
+                                        args: vec![inner],
+                                        type_args: Vec::new(),
+                                    },
+                                    ty: HirType::Str,
+                                    span,
+                                },
+                                other => {
+                                    return Err(CompilerError::semantic(format!(
+                                        "string interpolation: cannot render a {:?} value; \
+                                         supported types are text and number",
+                                        other
+                                    )));
+                                }
+                            }
+                        }
+                    };
+                    acc = Some(match acc {
+                        None => segment,
+                        Some(prev) => HirExpr {
+                            kind: HirExprKind::Call {
+                                func: CONCAT_STR_DEF_ID,
+                                args: vec![prev, segment],
+                                type_args: Vec::new(),
+                            },
+                            ty: HirType::Str,
+                            span,
+                        },
+                    });
                 }
-                // All parts are Literal: flatten into a single StrLit.
-                let mut buf = String::new();
-                for part in parts {
-                    if let StrPart::Literal(s) = part {
-                        buf.push_str(s);
-                    }
-                }
-                let str_id = self.symbols.intern(&buf);
-                Ok(HirExpr {
-                    kind: HirExprKind::StrLit(str_id),
-                    ty: HirType::Str,
-                    span: span_to_source_span(span),
+                acc.ok_or_else(|| {
+                    CompilerError::semantic("string interpolation produced no segments".to_string())
                 })
             }
         }

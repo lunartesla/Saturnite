@@ -1,0 +1,32 @@
+// Saturnite 0.5.1 example: runtime string interpolation.
+//
+// Interpolated strings wrap runtime expressions in `{...}`. Text and
+// number (i64) values can be rendered; the compiler rejects other types.
+
+fn add(a: number, b: number) -> number:
+    give a + b
+
+main:
+    let name = "Saturnite"
+    let age = 15
+    let quote = "the coolest compiler"
+
+    // A single interpolated segment.
+    say "Hello {name}!"
+
+    // Multiple segments + literals.
+    say "{name} is {age} years old."
+
+    // Interpolation of a function call result.
+    say "2 + 3 = {add(2, 3)}"
+
+    // Adjacent interpolations.
+    say "{age} and {name} mixed in one string"
+
+    // Text and numbers combined with surrounding literals.
+    say "{quote}: {name} has {age} years"
+
+    // A plain literal (no interpolation) must keep working.
+    say "no interpolation here"
+
+    give 0

@@ -26,8 +26,10 @@
 > - **Named arguments are implemented** (`f(x, b: 2)`): `FunctionSig` gained a
 >   `param_names` field, and call-site lowering reorders named args into
 >   positional slots.
-> - **String interpolation** parses to `Expr::InterpolatedStr` but runtime
->   rendering is deferred (semantic error) — see §8.
+> - **String interpolation** parses to `Expr::InterpolatedStr`. Runtime rendering
+>   is now implemented in 0.5.1 (`.tau/specs/phase0_5_1_string_interpolation.md`):
+>   `Str` segments concatenate directly; `I64` segments use `str_i64`; other types
+>   get a compile-time diagnostic.
 > - **List literals** `[...]` lex and parse; runtime list support is deferred
 >   (lowers to a placeholder string).
 

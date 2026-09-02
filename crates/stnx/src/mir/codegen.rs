@@ -30,6 +30,14 @@ const PRINTLN_DEF_ID: crate::hir::symbol::DefId = crate::hir::symbol::DefId(u32:
 /// `say "..."` / `raise "..."`).
 const PRINTLN_STR_DEF_ID: crate::hir::symbol::DefId = crate::hir::symbol::DefId(u32::MAX - 2);
 
+/// DefId sentinel for the runtime `concat_str` function (0.5.1 string
+/// interpolation). Must match `hir::lower::CONCAT_STR_DEF_ID`.
+const CONCAT_STR_DEF_ID: crate::hir::symbol::DefId = crate::hir::symbol::DefId(u32::MAX - 3);
+
+/// DefId sentinel for the runtime `str_i64` function (0.5.1 numeric string
+/// interpolation). Must match `hir::lower::STR_I64_DEF_ID`.
+const STR_I64_DEF_ID: crate::hir::symbol::DefId = crate::hir::symbol::DefId(u32::MAX - 4);
+
 /// A local alloca plus its LLVM type (needed for loading with the right type).
 type AllocaInfo<'ctx> = (PointerValue<'ctx>, BasicTypeEnum<'ctx>);
 
@@ -101,6 +109,15 @@ impl<'ctx> MirCodeGenContext<'ctx> {
         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
         self.module
             .add_function("println_str", i64_ty.fn_type(&[ptr_ty.into()], false), None);
+        // 0.5.1 string interpolation: `concat_str(i8*, i8*) -> i8*` and
+        // `str_i64(i64) -> i8*`.
+        self.module.add_function(
+            "concat_str",
+            ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+            None,
+        );
+        self.module
+            .add_function("str_i64", ptr_ty.fn_type(&[i64_ty.into()], false), None);
     }
 
     /// Declare all functions from the MIR program into the module.
@@ -656,6 +673,10 @@ impl<'ctx> MirCodeGenContext<'ctx> {
                     "println_i64"
                 } else if *def_id == PRINTLN_STR_DEF_ID {
                     "println_str"
+                } else if *def_id == CONCAT_STR_DEF_ID {
+                    "concat_str"
+                } else if *def_id == STR_I64_DEF_ID {
+                    "str_i64"
                 } else {
                     prog.function_name(*def_id).ok_or_else(|| {
                         CompilerError::codegen(format!(

@@ -169,9 +169,11 @@ say "Total inventory value: {total_value(catalog)}"
 ```
 
 `"{...}"` segments inside a string literal are parsed into `Expr::InterpolatedStr`,
-which lowers to a chain of `concat_str(...)` calls. Each segment between `{...}`
-is a `StrLit`; each `{...}` is a parenthesised expression (curly braces are
-literal punctuation, not grouping).
+which lowers to a chain of `concat_str(...)` runtime calls. Each literal segment
+is a `StrLit`; each `{...}` is a resolved expression. `Str` expressions concatenate
+straight to the result; `I64` expressions are converted by a runtime `str_i64` before
+concatenation. All other types are rejected with a clear compile diagnostic.
+String interpolation is implemented in 0.5.1 (see §5 HIR additions).
 
 ### 3.9 Named arguments
 
@@ -229,6 +231,8 @@ Minimal — only what's strictly required:
   `println(msg); exit(1)` (a runtime abort intrinsic).
 - `HirStmtKind::StrInterp(Vec<InterpSegment>)` — preserves interpolation
   structure for diagnostics; codegen emits a chain of `concat_str` calls.
+  (Implemented in 0.5.1: `concat_str`, `str_i64`, and the `Str`/`I64` interpolation
+  conversion pipeline are now live in the compiler and runtime.)
 - `FunctionSig.param_names: Vec<SymbolId>` — added so the lower pass can reorder
   named arguments.
 
