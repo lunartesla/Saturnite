@@ -27,6 +27,10 @@ pub enum HirType {
     /// `i64` tag so codegen is straightforward; the `SymbolId` enables
     /// future pattern-matching / variant discrimination.
     Enum(SymbolId),
+    /// A homogeneous list type with its element type.
+    List(Box<HirType>),
+    /// A homogeneous list type with its element type.
+    List(Box<HirType>),
     /// A free type variable — the name of a generic parameter as it appears
     /// in the source (e.g. `T` in `fn id<T>(x: T) -> T`). Resolved at
     /// monomorphization time by substitution. Not produced by `From<ast::Type>`.
@@ -91,7 +95,10 @@ impl From<crate::ast::Type> for HirType {
             crate::ast::Type::Enum(_) => HirType::Enum(SymbolId(0)),
             // 0.5: List<T> lowers to a placeholder struct type. Real
             // runtime support is deferred.
-            crate::ast::Type::List(_) => HirType::Struct(SymbolId(0)),
+            crate::ast::Type::List(inner) => {
+                let elem_ty: HirType = (*inner).into();
+                HirType::List(Box::new(elem_ty))
+            }
         }
     }
 }

@@ -116,6 +116,16 @@ pub enum HirExprKind {
         field: SymbolId,
     },
 
+    /// List literal: `[1, 2, 3]`. Elements must have uniform type.
+    ListLiteral {
+        elements: Vec<HirExpr>,
+    },
+
+    /// List literal: `[1, 2, 3]`. Elements must have uniform type.
+    ListLiteral {
+        elements: Vec<HirExpr>,
+    },
+
     /// Enum variant construction: `Result::Ok`.
     /// `name` is the enum definition [`SymbolId`].
     /// `variant` is the variant [`SymbolId`].

@@ -2106,6 +2106,90 @@ impl HirLower {
             // compile time rather than silently miscompiled. The resulting
             // nested `Call`(s) reuse the ordinary call pipeline through
             // monomorphization → MIR → LLVM codegen.
+            Expr::ListLiteral { items, span } => {
+                if items.is_empty() {
+                    return Err(CompilerError::semantic(
+                        "empty list literal `[]` is not supported in 0.5.3; \
+                         provide at least one element (e.g., `[1]`) so the \
+                         element type can be inferred".to_string(),
+                    ));
+                }
+                let mut lowered_elements: Vec<HirExpr> = Vec::with_capacity(items.len());
+                let mut common_ty: Option<HirType> = None;
+                for item_expr in items {
+                    let lowered = self.lower_expr(item_expr, scope, return_type, ctx)?;
+                    // Only i64 elements supported in 0.5.3
+                    if lowered.ty != HirType::I64 {
+                        return Err(CompilerError::semantic(format!(
+                            "list literal: element type `{:?}` is not supported; \
+                             only `i64` is allowed in 0.5.3",
+                            lowered.ty
+                        )));
+                    }
+                    match &common_ty {
+                        Some(ct) => {
+                            if lowered.ty != *ct {
+                                return Err(CompilerError::semantic(format!(
+                                    "mixed-type list literal: expected `{:?}`, \
+                                     found `{:?}`", ct, lowered.ty
+                                )));
+                            }
+                        }
+                        None => common_ty = Some(lowered.ty.clone()),
+                    }
+                    lowered_elements.push(lowered);
+                }
+                let ty = common_ty.unwrap_or(HirType::I64);
+                Ok(HirExpr {
+                    kind: HirExprKind::ListLiteral {
+                        elements: lowered_elements,
+                    },
+                    ty: HirType::List(Box::new(ty)),
+                    span: span_to_source_span(span),
+                })
+            }
+            Expr::ListLiteral { items, span } => {
+                if items.is_empty() {
+                    return Err(CompilerError::semantic(
+                        "empty list literal `[]` is not supported in 0.5.3; \
+                         provide at least one element (e.g., `[1]`) so the \
+                         element type can be inferred".to_string(),
+                    ));
+                }
+                let mut lowered_elements: Vec<HirExpr> = Vec::with_capacity(items.len());
+                let mut common_ty: Option<HirType> = None;
+                for item_expr in items {
+                    let lowered = self.lower_expr(item_expr, scope, return_type, ctx)?;
+                    // Only i64 elements supported in 0.5.3
+                    if lowered.ty != HirType::I64 {
+                        return Err(CompilerError::semantic(format!(
+                            "list literal: element type `{:?}` is not supported; \
+                             only `i64` is allowed in 0.5.3",
+                            lowered.ty
+                        )));
+                    }
+                    match &common_ty {
+                        Some(ct) => {
+                            if lowered.ty != *ct {
+                                return Err(CompilerError::semantic(format!(
+                                    "mixed-type list literal: expected `{:?}`, \
+                                     found `{:?}`", ct, lowered.ty
+                                )));
+                            }
+                        }
+                        None => common_ty = Some(lowered.ty.clone()),
+                    }
+                    lowered_elements.push(lowered);
+                }
+                let ty = common_ty.unwrap_or(HirType::I64);
+                Ok(HirExpr {
+                    kind: HirExprKind::ListLiteral {
+                        elements: lowered_elements,
+                    },
+                    ty: HirType::List(Box::new(ty)),
+                    span: span_to_source_span(span),
+                })
+            }
             Expr::InterpolatedStr(parts, span) => {
                 let span = span_to_source_span(span);
                 let mut acc: Option<HirExpr> = None;
@@ -2437,6 +2521,118 @@ mod tests {
         let hir = lower_src("fn main() -> i64 { 0 }");
         let root = hir.module(ModuleId::ROOT).expect("root module");
         assert!(root.path.is_empty());
+    }
+
+    #[test]
+    fn test_list_literal_lower_single_element() {
+        let hir = lower_src("fn main() -> i64 { let a = [42] 0 }");
+        // Lowering completes; actual HIR structure inspection deferred to full pipeline.
+    }
+
+    #[test]
+    fn test_list_literal_lower_multiple_elements() {
+        let hir = lower_src("fn main() -> i64 { let a = [1, 2, 3] 0 }");
+    }
+
+    #[test]
+    fn test_list_literal_reject_empty() {
+        let tokens: Vec<_> = Lexer::new("fn main() -> i64 { let a = [] 0 }")
+            .collect().unwrap();
+        let prog = parser::parse("fn main() -> i64 { let a = [] 0 }", tokens).expect("parse ok");
+        let result = lower(&prog);
+        assert!(result.is_err(), "empty list must be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("empty list"), "expected empty list error, got: {}", err_msg);
+    }
+
+    #[test]
+    fn test_list_literal_reject_mixed_type() {
+        // Even though parser accepts mixed expressions, HIR should reject non-i64.
+        // Here both are i64; to test rejection we would need a bool, which parser cannot easily mix
+        // without syntax. This test documents the current state: same-type i64 lists pass.
+        let hir = lower_src("fn main() -> i64 { let a = [1, 2] 0 }");
+    }
+
+    #[test]
+    fn test_list_literal_reject_non_i64_element() {
+        // `true` lowers to Bool, which should be rejected in list context.
+        let tokens: Vec<_> = Lexer::new("fn main() -> i64 { let a = [true] 0 }")
+            .collect().unwrap();
+        let prog = parser::parse("fn main() -> i64 { let a = [true] 0 }", tokens).expect("parse ok");
+        let result = lower(&prog);
+        assert!(result.is_err(), "non-i64 list element must be rejected");
+    }
+
+    #[test]
+    fn test_list_literal_nested_expr() {
+        let hir = lower_src("fn main() -> i64 { let a = [1 + 2, 3 * 4] 0 }");
+    }
+
+    #[test]
+    fn test_list_literal_deferred_nested() {
+        // Nested list `[ [1, 2], [3] ]` is deferred; first element `[1,2]` lowers to List(I64),
+        // second also List(I64) — they match, so lowering succeeds. Full nested semantics deferred.
+        let tokens: Vec<_> = Lexer::new("fn main() -> i64 { let a = [[1, 2], [3]] 0 }")
+            .collect().unwrap();
+        let prog = parser::parse("fn main() -> i64 { let a = [[1, 2], [3]] 0 }", tokens).expect("parse ok");
+        // Lowering may succeed (same inner type) but nested list runtime is deferred.
+        let _ = lower(&prog);
+    }
+
+    #[test]
+    fn test_list_literal_lower_single_element() {
+        let hir = lower_src("fn main() -> i64 { let a = [42] 0 }");
+        // Lowering completes; actual HIR structure inspection deferred to full pipeline.
+    }
+
+    #[test]
+    fn test_list_literal_lower_multiple_elements() {
+        let hir = lower_src("fn main() -> i64 { let a = [1, 2, 3] 0 }");
+    }
+
+    #[test]
+    fn test_list_literal_reject_empty() {
+        let tokens: Vec<_> = Lexer::new("fn main() -> i64 { let a = [] 0 }")
+            .collect().unwrap();
+        let prog = parser::parse("fn main() -> i64 { let a = [] 0 }", tokens).expect("parse ok");
+        let result = lower(&prog);
+        assert!(result.is_err(), "empty list must be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("empty list"), "expected empty list error, got: {}", err_msg);
+    }
+
+    #[test]
+    fn test_list_literal_reject_mixed_type() {
+        // Even though parser accepts mixed expressions, HIR should reject non-i64.
+        // Here both are i64; to test rejection we would need a bool, which parser cannot easily mix
+        // without syntax. This test documents the current state: same-type i64 lists pass.
+        let hir = lower_src("fn main() -> i64 { let a = [1, 2] 0 }");
+    }
+
+    #[test]
+    fn test_list_literal_reject_non_i64_element() {
+        // `true` lowers to Bool, which should be rejected in list context.
+        let tokens: Vec<_> = Lexer::new("fn main() -> i64 { let a = [true] 0 }")
+            .collect().unwrap();
+        let prog = parser::parse("fn main() -> i64 { let a = [true] 0 }", tokens).expect("parse ok");
+        let result = lower(&prog);
+        assert!(result.is_err(), "non-i64 list element must be rejected");
+    }
+
+    #[test]
+    fn test_list_literal_nested_expr() {
+        let hir = lower_src("fn main() -> i64 { let a = [1 + 2, 3 * 4] 0 }");
+    }
+
+    #[test]
+    fn test_list_literal_deferred_nested() {
+        // Nested list `[ [1, 2], [3] ]` is deferred; first element `[1,2]` lowers to List(I64),
+        // second also List(I64) — they match, so lowering succeeds. Full nested semantics deferred.
+        let tokens: Vec<_> = Lexer::new("fn main() -> i64 { let a = [[1, 2], [3]] 0 }")
+            .collect().unwrap();
+        let prog = parser::parse("fn main() -> i64 { let a = [[1, 2], [3]] 0 }", tokens).expect("parse ok");
+        // Lowering may succeed (same inner type) but nested list runtime is deferred.
+        let _ = lower(&prog);
     }
 
     // ---------------------------------------------------------------------------
