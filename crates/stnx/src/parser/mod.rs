@@ -598,11 +598,9 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
                 .ignore_then(expr.clone().separated_by(comma()).collect::<Vec<_>>())
                 .then_ignore(rbracket())
                 .map(|items| {
-                    let span = items.first().map(stmt_span).unwrap_or(0..0);
-                    // 0.5: list literal — store as a special Expr for now
-                    // (runtime support is deferred; we use a StrLit so
-                    // codegen accepts it without runtime support).
-                    Expr::StrLit(format!("[list:{}]", items.len()), span.start..span.end)
+                    let start = items.first().map(stmt_span).map(|s| s.start).unwrap_or(0);
+                    let end = items.last().map(stmt_span).map(|s| s.end).unwrap_or(start);
+                    Expr::ListLiteral { items, span: start..end }
                 }))
             .or(t_ident()
                 // Optional turbofish for struct literals: `Box::<i64> { ... }`.
@@ -1803,6 +1801,50 @@ mod tests {
             "expected error for `pub` without item, got: {}",
             err
         );
+    }
+
+    // --- list literal tests ---
+    #[test]
+    fn test_parse_empty_list() {
+        let prog = parse_src("let a = []");
+        // Just verify it parses without panic; AST inspection covered by expression parsing.
+    }
+
+    #[test]
+    fn test_parse_list_single_element() {
+        let prog = parse_src("let a = [42]");
+    }
+
+    #[test]
+    fn test_parse_list_multiple_elements() {
+        let prog = parse_src("let a = [1, 2, 3]");
+    }
+
+    #[test]
+    fn test_parse_list_nested_expr() {
+        let prog = parse_src("let a = [1 + 2, 3 * 4]");
+    }
+
+    // --- list literal tests ---
+    #[test]
+    fn test_parse_empty_list() {
+        let prog = parse_src("let a = []");
+        // Just verify it parses without panic; AST inspection covered by expression parsing.
+    }
+
+    #[test]
+    fn test_parse_list_single_element() {
+        let prog = parse_src("let a = [42]");
+    }
+
+    #[test]
+    fn test_parse_list_multiple_elements() {
+        let prog = parse_src("let a = [1, 2, 3]");
+    }
+
+    #[test]
+    fn test_parse_list_nested_expr() {
+        let prog = parse_src("let a = [1 + 2, 3 * 4]");
     }
 
     #[test]
