@@ -1920,6 +1920,56 @@ impl HirLower {
                     span: span_to_source_span(span),
                 })
             }
+            Expr::Index {
+                list: list_expr,
+                index: index_expr,
+                span,
+            } => {
+                let list = self.lower_expr(list_expr, scope, return_type, ctx)?;
+                let element_ty = match &list.ty {
+                    HirType::List(elem) => *elem.clone(),
+                    other => {
+                        return Err(CompilerError::semantic(format!(
+                            "indexing requires a List<T>, got {:?}",
+                            other
+                        )))
+                    }
+                };
+                let idx = self.lower_expr(index_expr, scope, return_type, ctx)?;
+                if idx.ty != HirType::I64 {
+                    return Err(CompilerError::semantic(format!(
+                        "list index must be i64, got {:?}",
+                        idx.ty
+                    )));
+                }
+                Ok(HirExpr {
+                    kind: HirExprKind::Index {
+                        list: Box::new(list),
+                        index: Box::new(idx),
+                    },
+                    ty: element_ty,
+                    span: span_to_source_span(span),
+                })
+            }
+            Expr::Length {
+                expr: inner_expr,
+                span,
+            } => {
+                let inner = self.lower_expr(inner_expr, scope, return_type, ctx)?;
+                match &inner.ty {
+                    HirType::List(_) => Ok(HirExpr {
+                        kind: HirExprKind::Length {
+                            expr: Box::new(inner),
+                        },
+                        ty: HirType::I64,
+                        span: span_to_source_span(span),
+                    }),
+                    other => Err(CompilerError::semantic(format!(
+                        "`.length` requires a List<T>, got {:?}",
+                        other
+                    ))),
+                }
+            }
             Expr::FieldAccess {
                 expr: inner_expr,
                 field,
@@ -1929,6 +1979,26 @@ impl HirLower {
                 let struct_sym = match inner.ty {
                     HirType::Struct(s) => s,
                     HirType::Apply { base, .. } => base,
+                    // 0.5.3: `.length` is the list length accessor. The
+                    // parser emits it as a field access on a List; lower it
+                    // to a list length expression here. Any other field on a
+                    // list is rejected.
+                    HirType::List(_) => {
+                        let field_id = self.symbols.intern(field);
+                        if self.symbols.lookup(field_id) == Some("length") {
+                            return Ok(HirExpr {
+                                kind: HirExprKind::Length {
+                                    expr: Box::new(inner),
+                                },
+                                ty: HirType::I64,
+                                span: span_to_source_span(span),
+                            });
+                        }
+                        return Err(CompilerError::semantic(format!(
+                            "list has no field: {}",
+                            field
+                        )));
+                    }
                     _ => {
                         return Err(CompilerError::semantic(format!(
                             "field access on non-struct type: {:?}",

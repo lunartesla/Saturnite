@@ -118,13 +118,24 @@ impl<'ctx> MirCodeGenContext<'ctx> {
         );
         self.module
             .add_function("str_i64", ptr_ty.fn_type(&[i64_ty.into()], false), None);
-        // 0.5.3 List<i64> construction: `list_new_from(long long* elems,
-        // long long count) -> sat_list*`. `elems` is an alloca the generated
-        // code fills left-to-right before the call; the returned pointer is
-        // the list's LLVM representation (ptr), matching the sat_list ABI.
+        // 0.5.3 List<i64> runtime ABI (see runtime/list.c):
+        //   list_new_from(long long* elems, long long count) -> sat_list*
+        //   list_get(sat_list*, long long index) -> long long
+        //   list_len(sat_list*) -> long long
+        // The list pointer is the List LLVM representation (ptr).
         self.module.add_function(
             "list_new_from",
             ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "list_get",
+            i64_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "list_len",
+            i64_ty.fn_type(&[ptr_ty.into()], false),
             None,
         );
     }
@@ -333,6 +344,57 @@ impl<'ctx> MirCodeGenContext<'ctx> {
                 Ok(ret
                     .basic()
                     .ok_or_else(|| CompilerError::codegen("list_new_from returned no value"))?)
+            }
+            MirRvalue::Index { list_local, index } => {
+                // Lower the list expression first, then the index expression.
+                let (list_alloca, list_llvm_ty) = self.local_allocas.get(list_local).ok_or_else(|| {
+                    CompilerError::codegen(format!("list local {:?} not found", list_local))
+                })?;
+                let list_val = self.builder.build_load(*list_llvm_ty, *list_alloca, "list").unwrap();
+                let idx = self.materialize_operand(index)?;
+                let idx_i64 = match idx {
+                    BasicValueEnum::IntValue(v) => v,
+                    other => {
+                        return Err(CompilerError::codegen(format!(
+                            "list index is not an i64 value: {:?}",
+                            other.get_type()
+                        )))
+                    }
+                };
+                let list_fn = self
+                    .module
+                    .get_function("list_get")
+                    .ok_or_else(|| CompilerError::codegen("list_get not declared"))?;
+                let call = self
+                    .builder
+                    .build_call(
+                        list_fn,
+                        &[list_val.into(), idx_i64.into()],
+                        "list_get",
+                    )
+                    .unwrap();
+                let ret = call.try_as_basic_value();
+                Ok(ret
+                    .basic()
+                    .ok_or_else(|| CompilerError::codegen("list_get returned no value"))?)
+            }
+            MirRvalue::Length { list_local } => {
+                let (list_alloca, list_llvm_ty) = self.local_allocas.get(list_local).ok_or_else(|| {
+                    CompilerError::codegen(format!("list local {:?} not found", list_local))
+                })?;
+                let list_val = self.builder.build_load(*list_llvm_ty, *list_alloca, "list").unwrap();
+                let list_fn = self
+                    .module
+                    .get_function("list_len")
+                    .ok_or_else(|| CompilerError::codegen("list_len not declared"))?;
+                let call = self
+                    .builder
+                    .build_call(list_fn, &[list_val.into()], "list_len")
+                    .unwrap();
+                let ret = call.try_as_basic_value();
+                Ok(ret
+                    .basic()
+                    .ok_or_else(|| CompilerError::codegen("list_len returned no value"))?)
             }
         }
     }

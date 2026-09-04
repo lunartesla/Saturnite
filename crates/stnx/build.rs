@@ -30,9 +30,6 @@ fn main() {
     if list_c.exists() {
         build.file(&list_c);
     }
-    if list_c.exists() {
-        build.file(&list_c);
-    }
 
     // Detect the host C compiler so we can report what was searched for.
     let host_cc = build.get_compiler();
@@ -58,9 +55,6 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed={}", runtime_c.display());
-    if list_c.exists() {
-        println!("cargo:rerun-if-changed={}", list_c.display());
-    }
     if list_c.exists() {
         println!("cargo:rerun-if-changed={}", list_c.display());
     }

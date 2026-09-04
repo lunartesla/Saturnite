@@ -11,6 +11,30 @@ use std::ops::Range;
 /// Error type alias for parsers that track spans via `SimpleSpan<usize>`.
 pub type ParserExtra<'a> = extra::Err<Simple<'a, Token, SimpleSpan<usize>>>;
 
+/// Postfix operator kinds used by the postfix chain in `recursive_expr`.
+enum PostfixOp {
+    Field { name: String, span: Range<usize> },
+    Index { idx: Expr, lbracket_span: Range<usize> },
+}
+
+/// Postfix chain: field access (`a.b`) and list indexing (`a[i]`) applied
+/// repeatedly to a base expression. Used by `recursive_expr` so that a
+/// postfix expression is a single atomic unit for the binary chains above
+/// it (e.g. `values[0] + 1` parses as `(values[0]) + 1`).
+fn postfix<'a>(
+    expr: Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExtra<'a>>>,
+) -> impl Parser<'a, &'a [Token], Vec<PostfixOp>, ParserExtra<'a>> {
+    dot()
+        .ignore_then(t_ident())
+        .map(|(name, span)| PostfixOp::Field { name, span })
+        .or(lbracket_span()
+            .then(expr)
+            .then_ignore(rbracket())
+            .map(|(lbracket_span, idx)| PostfixOp::Index { idx, lbracket_span }))
+        .repeated()
+        .collect::<Vec<_>>()
+}
+
 /// Convert a `Simple` error to a human-readable message.
 fn format_simple_error(err: &Simple<'_, Token, SimpleSpan<usize>>) -> String {
     let found = err
@@ -688,6 +712,10 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
             .boxed();
 
         // Unary: -expr, !expr
+        // Postfix operators (field access `a.b` and list indexing `a[i]`)
+        // are applied here so that a postfix expression is a single atomic
+        // unit for the binary chains above it (e.g. `values[0] + 1` parses
+        // as `(values[0]) + 1` rather than being left dangling).
         let unary = minus()
             .ignore_then(expr.clone())
             .map(|e| {
@@ -706,7 +734,30 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
                     span: s,
                 }
             }))
-            .or(primary.clone())
+            .or(primary.clone().then(postfix(expr.clone())).map(|(base, ops)| {
+                let mut expr = base;
+                for op in ops {
+                    match op {
+                        PostfixOp::Field { name, span } => {
+                            let expr_span = stmt_span(&expr);
+                            expr = Expr::FieldAccess {
+                                expr: Box::new(expr),
+                                field: name,
+                                span: expr_span.start..span.end,
+                            };
+                        }
+                        PostfixOp::Index { idx, lbracket_span } => {
+                            let idx_span = stmt_span(&idx);
+                            expr = Expr::Index {
+                                list: Box::new(expr),
+                                index: Box::new(idx),
+                                span: lbracket_span.start..idx_span.end,
+                            };
+                        }
+                    }
+                }
+                expr
+            }))
             .boxed();
 
         // Multiplicative: * / %
@@ -1240,7 +1291,9 @@ fn kw_span<'a>(k: &'a str) -> Boxed<'a, 'a, &'a [Token], Range<usize>, ParserExt
 
 fn t_ident<'a>() -> impl Parser<'a, &'a [Token], (String, Range<usize>), ParserExtra<'a>> {
     any::<&[Token], _>()
-        .filter(|t: &Token| matches!(&t.kind, TokenKind::Ident(s) if !is_keyword(s)))
+        .filter(|t: &Token| {
+            matches!(&t.kind, TokenKind::Ident(s) if !is_keyword(s) || s == "length")
+        })
         .map(|t| match &t.kind {
             TokenKind::Ident(s) => (s.clone(), t.span.clone()),
             _ => unreachable!(),
@@ -1552,6 +1605,8 @@ fn stmt_span(e: &Expr) -> Range<usize> {
         | Expr::Range { span, .. }
         | Expr::StructLiteral { span, .. }
         | Expr::FieldAccess { span, .. }
+        | Expr::Index { span, .. }
+        | Expr::Length { span, .. }
         | Expr::EnumConstructor { span, .. }
         | Expr::Pipeline { span, .. }
         | Expr::Closure { span, .. }

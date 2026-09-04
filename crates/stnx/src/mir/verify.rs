@@ -178,6 +178,10 @@ fn rvalue_operands(rvalue: &MirRvalue) -> Vec<MirOperand> {
         MirRvalue::StructLit { fields, .. } => fields.iter().map(|(_, v)| v.clone()).collect(),
         MirRvalue::EnumCtor { .. } => vec![],
         MirRvalue::ListLiteral { elements } => elements.clone(),
+        MirRvalue::Index { list_local, index } => {
+            vec![MirOperand::Local(*list_local), index.clone()]
+        }
+        MirRvalue::Length { list_local } => vec![MirOperand::Local(*list_local)],
         MirRvalue::StrLit(_) => vec![],
     }
 }

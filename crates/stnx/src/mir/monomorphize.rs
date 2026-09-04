@@ -406,6 +406,11 @@ impl<'hir> Monomorphizer<'hir> {
                 }
                 Ok(())
             }
+            HirExprKind::Index { list, index } => {
+                self.collect_from_expr(list)?;
+                self.collect_from_expr(index)
+            }
+            HirExprKind::Length { expr } => self.collect_from_expr(expr),
             HirExprKind::EnumConstructor { .. } => Ok(()),
         }
     }
@@ -812,6 +817,13 @@ fn substitute_expr(expr: &HirExpr, subst: &HashMap<SymbolId, HirType>) -> HirExp
         HirExprKind::ListLiteral { elements } => HirExprKind::ListLiteral {
             elements: elements.iter().map(|e| substitute_expr(e, subst)).collect(),
         },
+        HirExprKind::Index { list, index } => HirExprKind::Index {
+            list: Box::new(substitute_expr(list, subst)),
+            index: Box::new(substitute_expr(index, subst)),
+        },
+        HirExprKind::Length { expr } => HirExprKind::Length {
+            expr: Box::new(substitute_expr(expr, subst)),
+        },
     };
     HirExpr {
         kind: new_kind,
@@ -1070,6 +1082,13 @@ fn rewrite_expr(
                 .iter()
                 .map(|e| rewrite_expr(e, remap, struct_remap))
                 .collect(),
+        },
+        HirExprKind::Index { list, index } => HirExprKind::Index {
+            list: Box::new(rewrite_expr(list, remap, struct_remap)),
+            index: Box::new(rewrite_expr(index, remap, struct_remap)),
+        },
+        HirExprKind::Length { expr } => HirExprKind::Length {
+            expr: Box::new(rewrite_expr(expr, remap, struct_remap)),
         },
     };
     HirExpr {

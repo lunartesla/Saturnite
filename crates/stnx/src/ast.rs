@@ -256,6 +256,17 @@ pub enum Expr {
         field: String,
         span: Range<usize>,
     },
+    /// List element access: `items[i]`. The container must be a List.
+    Index {
+        list: Box<Expr>,
+        index: Box<Expr>,
+        span: Range<usize>,
+    },
+    /// List length: `items.length`. The receiver must be a List.
+    Length {
+        expr: Box<Expr>,
+        span: Range<usize>,
+    },
     /// Enum variant construction: `Result::Ok`
     EnumConstructor {
         name: String,

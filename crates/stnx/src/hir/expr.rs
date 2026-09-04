@@ -121,6 +121,19 @@ pub enum HirExprKind {
         elements: Vec<HirExpr>,
     },
 
+    /// List element access: `items[i]`. The container must be a `List<T>`.
+    /// The resolved type is the element type (e.g. `I64`).
+    Index {
+        list: Box<HirExpr>,
+        index: Box<HirExpr>,
+    },
+
+    /// List length: `items.length`. The receiver must be a `List<T>`.
+    /// The resolved type is `I64`.
+    Length {
+        expr: Box<HirExpr>,
+    },
+
     /// Enum variant construction: `Result::Ok`.
     /// `name` is the enum definition [`SymbolId`].
     /// `variant` is the variant [`SymbolId`].

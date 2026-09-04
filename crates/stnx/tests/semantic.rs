@@ -299,3 +299,54 @@ fn test_mod_on_bool_rejected() {
     let result = analyze_src(src);
     assert!(result.is_err(), "mod on bool should be rejected");
 }
+
+// ---------------------------------------------------------------------------
+// 0.5.3 Phase 7: list indexing and length semantics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_index_on_non_list_rejected() {
+    let src = "fn main() -> i64 { let x = 5 let y = x[0] 0 }";
+    let result = analyze_src(src);
+    assert!(
+        result.is_err(),
+        "indexing a non-list should be rejected"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("List<T>"),
+        "error should mention List<T>, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_length_on_non_list_rejected() {
+    let src = "fn main() -> i64 { let x = 5 let y = x.length 0 }";
+    let result = analyze_src(src);
+    assert!(
+        result.is_err(),
+        "length on a non-list should be rejected"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("non-struct type") || err.contains("List<T>"),
+        "error should mention the type mismatch, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_index_valid_list_passes() {
+    let src = "fn main() -> i64 { let values = [10, 20, 30] let x = values[0] 0 }";
+    let result = analyze_src(src);
+    assert!(result.is_ok(), "indexing a List<i64> should pass");
+}
+
+#[test]
+fn test_length_valid_list_passes() {
+    let src = "fn main() -> i64 { let values = [10, 20, 30] let x = values.length 0 }";
+    let result = analyze_src(src);
+    assert!(result.is_ok(), "length on a List<i64> should pass");
+}
+

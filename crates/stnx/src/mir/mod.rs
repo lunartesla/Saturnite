@@ -211,6 +211,18 @@ pub enum MirRvalue {
     /// stores elements into a temporary sequence. Runtime allocation
     /// deferred; for 0.5.3 this is a minimal representation only.
     ListLiteral { elements: Vec<MirOperand> },
+    /// List element access: `list_get(list, index)`. The list is a
+    /// process-lifetime sat_list pointer; the index is i64. Bounds-checked
+    /// at runtime; out-of-bounds aborts deterministically.
+    Index {
+        list_local: LocalId,
+        index: MirOperand,
+    },
+    /// List length: `list_len(list)`. Returns the current logical length
+    /// as an i64.
+    Length {
+        list_local: LocalId,
+    },
     /// String literal → global string pointer cast to i64.
     StrLit(SymbolId),
 }

@@ -547,6 +547,63 @@ impl<'hir> MirLower<'hir> {
                 Ok(MirOperand::Const(MirConst::I64(variant_idx as i64)))
             }
 
+            HirExprKind::Index { list, index } => {
+                // Lower the list expression first, then the index expression.
+                let list_val = self.lower_expr(list)?;
+                let list_local = self.new_local(list.ty.clone(), self.temp_symbol, false);
+                self.emit(MirStmtKind::LocalDecl {
+                    local: list_local,
+                    ty: list.ty.clone(),
+                    mutable: false,
+                });
+                self.emit(MirStmtKind::Assign {
+                    local: list_local,
+                    rvalue: MirRvalue::Use(list_val),
+                });
+                let idx = self.lower_expr(index)?;
+                let result_local = self.new_local(expr.ty.clone(), self.temp_symbol, false);
+                self.emit(MirStmtKind::LocalDecl {
+                    local: result_local,
+                    ty: expr.ty.clone(),
+                    mutable: false,
+                });
+                self.emit(MirStmtKind::Assign {
+                    local: result_local,
+                    rvalue: MirRvalue::Index {
+                        list_local,
+                        index: idx,
+                    },
+                });
+                Ok(MirOperand::Local(result_local))
+            }
+
+            HirExprKind::Length { expr: inner } => {
+                let inner_val = self.lower_expr(inner)?;
+                let inner_local = self.new_local(inner.ty.clone(), self.temp_symbol, false);
+                self.emit(MirStmtKind::LocalDecl {
+                    local: inner_local,
+                    ty: inner.ty.clone(),
+                    mutable: false,
+                });
+                self.emit(MirStmtKind::Assign {
+                    local: inner_local,
+                    rvalue: MirRvalue::Use(inner_val),
+                });
+                let result_local = self.new_local(expr.ty.clone(), self.temp_symbol, false);
+                self.emit(MirStmtKind::LocalDecl {
+                    local: result_local,
+                    ty: expr.ty.clone(),
+                    mutable: false,
+                });
+                self.emit(MirStmtKind::Assign {
+                    local: result_local,
+                    rvalue: MirRvalue::Length {
+                        list_local: inner_local,
+                    },
+                });
+                Ok(MirOperand::Local(result_local))
+            }
+
             HirExprKind::ListLiteral { elements } => {
                 // 0.5.3: lower each element left-to-right, collecting operands.
                 // The result local holds a `List<I64>`; codegen lowers the

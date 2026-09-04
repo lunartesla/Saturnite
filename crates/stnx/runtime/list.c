@@ -67,3 +67,48 @@ sat_list *list_new_from(long long *elems, long long count) {
     }
     return list;
 }
+
+// Return the current logical length of `list` as an i64 (Saturnite-visible).
+// 0 <= len <= cap invariant is maintained by list_new_from.
+long long list_len(sat_list *list) {
+    if (list == NULL) {
+        fputs("Saturnite runtime: list_len on null list\n", stderr);
+        exit(1);
+    }
+    return (long long)list->len;
+}
+
+// Bounds-checked element read. Returns the element at `index` (i64, matching
+// the Saturnite i64 loop/index representation). Out-of-bounds prints a
+// diagnostic to stderr and aborts — no exception propagation in 0.5.3.
+long long list_get(sat_list *list, long long index) {
+    if (list == NULL) {
+        fputs("Saturnite runtime: list_get on null list\n", stderr);
+        exit(1);
+    }
+    if (index < 0 || (size_t)index >= list->len) {
+        fprintf(stderr,
+                "Saturnite runtime: list index out of bounds: index=%lld, len=%zu\n",
+                (long long)index, list->len);
+        exit(1);
+    }
+    return list->data[(size_t)index];
+}
+
+// Bounds-checked element write. Out-of-bounds prints a diagnostic and aborts.
+void list_set(sat_list *list, long long index, long long value) {
+    if (list == NULL) {
+        fputs("Saturnite runtime: list_set on null list\n", stderr);
+        exit(1);
+    }
+    if (index < 0 || (size_t)index >= list->len) {
+        fprintf(stderr,
+                "Saturnite runtime: list index out of bounds: index=%lld, len=%zu\n",
+                (long long)index, list->len);
+        exit(1);
+    }
+    list->data[(size_t)index] = value;
+}
+
+// Return the current logical length of `list` as an i64 (Saturnite-visible).
+// 0 <= len <= cap invariant is maintained by list_new_from.

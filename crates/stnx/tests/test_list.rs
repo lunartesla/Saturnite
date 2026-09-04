@@ -100,3 +100,155 @@ fn main() -> i64 {
     let (code, _) = bin.run();
     assert_eq!(code, 0);
 }
+
+// ---------------------------------------------------------------------------
+// 0.5.3 Phase 7: indexing and length
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_list_index_first() {
+    let src = r#"
+fn main() -> i64 {
+    let values = [10, 20, 30]
+    println(values[0])
+    return 0
+}
+"#;
+    let bin = compile_src(src);
+    let (code, stdout) = bin.run();
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "10\n");
+}
+
+#[test]
+fn test_list_index_middle() {
+    let src = r#"
+fn main() -> i64 {
+    let values = [10, 20, 30]
+    println(values[1])
+    return 0
+}
+"#;
+    let bin = compile_src(src);
+    let (code, stdout) = bin.run();
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "20\n");
+}
+
+#[test]
+fn test_list_index_last() {
+    let src = r#"
+fn main() -> i64 {
+    let values = [10, 20, 30]
+    println(values[2])
+    return 0
+}
+"#;
+    let bin = compile_src(src);
+    let (code, stdout) = bin.run();
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "30\n");
+}
+
+#[test]
+fn test_list_length() {
+    let src = r#"
+fn main() -> i64 {
+    let values = [10, 20, 30]
+    println(values.length)
+    return 0
+}
+"#;
+    let bin = compile_src(src);
+    let (code, stdout) = bin.run();
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "3\n");
+}
+
+#[test]
+fn test_list_index_expression_element() {
+    let src = r#"
+fn main() -> i64 {
+    let values = [10, 20, 30]
+    let i = 1
+    println(values[i])
+    return 0
+}
+"#;
+    let bin = compile_src(src);
+    let (code, stdout) = bin.run();
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "20\n");
+}
+
+#[test]
+fn test_list_index_out_of_bounds_deterministic() {
+    // Out-of-bounds must abort deterministically, not corrupt memory.
+    let src = r#"
+fn main() -> i64 {
+    let values = [10, 20, 30]
+    println(values[3])
+    return 0
+}
+"#;
+    let bin = compile_src(src);
+    let (code, _stdout) = bin.run();
+    assert_ne!(code, 0, "out-of-bounds access must fail non-zero");
+}
+
+#[test]
+fn test_list_index_negative_out_of_bounds_deterministic() {
+    let src = r#"
+fn main() -> i64 {
+    let values = [10, 20, 30]
+    println(values[-1])
+    return 0
+}
+"#;
+    let bin = compile_src(src);
+    let (code, _stdout) = bin.run();
+    assert_ne!(code, 0, "negative index must fail non-zero");
+}
+
+#[test]
+fn test_list_index_then_length_chained() {
+    // Indexing and length compose: read the element at length-1.
+    let src = r#"
+fn main() -> i64 {
+    let values = [10, 20, 30]
+    let last = values[values.length - 1]
+    println(last)
+    return 0
+}
+"#;
+    let bin = compile_src(src);
+    let (code, stdout) = bin.run();
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "30\n");
+}
+
+#[test]
+fn test_list_ir_contains_list_get_and_list_len_calls() {
+    let src = r#"
+fn main() -> i64 {
+    let values = [10, 20, 30]
+    println(values[1])
+    println(values.length)
+    return 0
+}
+"#;
+    let ir = ir_only(src);
+    assert!(
+        ir.contains("call i64 @list_get"),
+        "generated IR should call list_get for indexing"
+    );
+    assert!(
+        ir.contains("call i64 @list_len"),
+        "generated IR should call list_len for length"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 0.5.3 Phase 7: indexing and length
+// ---------------------------------------------------------------------------
+
