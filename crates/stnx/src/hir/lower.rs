@@ -1774,13 +1774,19 @@ impl HirLower {
                 span,
             } => {
                 let iter_expr = self.lower_expr(iter, scope, return_type, ctx)?;
-                match &iter_expr.kind {
-                    HirExprKind::Range { .. } => {}
-                    _ => {
-                        return Err(CompilerError::codegen(
-                            "for loop requires a range expression",
-                        ))
-                    }
+                // 0.5.3 Phase 8: a `for` loop may iterate over a `Range`
+                // (`for i in 0..10`) or a `List<i64>` (`for item in items`).
+                // Any other iterable type is rejected with a diagnostic.
+                let is_range = matches!(&iter_expr.kind, HirExprKind::Range { .. });
+                let is_list_i64 = matches!(
+                    &iter_expr.ty,
+                    HirType::List(inner) if matches!(inner.as_ref(), HirType::I64)
+                );
+                if !is_range && !is_list_i64 {
+                    return Err(CompilerError::semantic(format!(
+                        "for loop requires a range or List<i64> expression, got {:?}",
+                        iter_expr.ty
+                    )));
                 }
                 let var_sym = self.symbols.intern(var);
                 let mut loop_scope = LowerScope::with_parent(scope.clone());
@@ -2336,6 +2342,14 @@ mod tests {
         lower(&program).expect("lowering should succeed")
     }
 
+    /// Helper: lex + parse a source string into a `Program` (no lowering).
+    fn parse_program(src: &str) -> Program {
+        let tokens: Vec<_> = Lexer::new(src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        parser::parse(src, tokens).expect("parsing should succeed")
+    }
+
     /// Helper: construct a `Program` from raw AST items.
     fn program_from_items(items: Vec<Item>) -> Program {
         Program::from_items(items)
@@ -2633,6 +2647,46 @@ mod tests {
             .expect("parse ok");
         // Lowering may succeed (same inner type) but nested list runtime is deferred.
         let _ = lower(&prog);
+    }
+
+    // --- 0.5.3 Phase 8: for loop over List<i64> ---
+
+    #[test]
+    fn test_for_loop_over_list_accepted() {
+        let hir =
+            lower_src("fn main() -> i64 { let a = [1, 2, 3] for x in a { println(x) } return 0 }");
+        let main = hir.function_by_name("main").expect("main");
+        let has_for = main.body.iter().any(|s| {
+            matches!(
+                &s.kind,
+                HirStmtKind::Expr(HirExpr {
+                    kind: HirExprKind::For { iter, .. },
+                    ty: HirType::Unit,
+                    ..
+                }) if matches!(iter.kind, HirExprKind::ListLiteral { .. } | HirExprKind::Variable { .. })
+            )
+        });
+        assert!(has_for, "expected a For HIR node iterating a list");
+    }
+
+    #[test]
+    fn test_for_loop_over_list_rejects_non_list_iterable() {
+        // A `for` loop over a bare i64 (not a range, not a list) must be
+        // rejected at HIR lowering with an iterable diagnostic.
+        let result = lower(&parse_program("fn main() -> i64 { for x in 42 { } 0 }"));
+        assert!(result.is_err(), "for loop over a bare i64 must be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("for loop requires a range or List<i64>"),
+            "expected a for-loop iterable diagnostic, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_for_loop_over_list_rejects_bool_iterable() {
+        let result = lower(&parse_program("fn main() -> i64 { for x in true { } 0 }"));
+        assert!(result.is_err(), "for loop over a bool must be rejected");
     }
 
     #[test]

@@ -750,6 +750,24 @@ impl<'hir> MirLower<'hir> {
 
     /// Lower a `for var in start..end` (or `start...end` inclusive) loop.
     fn lower_for(&mut self, var: SymbolId, iter: &HirExpr, body: &[HirStmt]) -> CompilerResult<()> {
+        // 0.5.3 Phase 8: a `for` loop iterates over a `Range`
+        // (`for i in 0..10`) or a `List<i64>` (`for item in items`).
+        // Both lower to the same index-based loop shape: an index local
+        // initialized to 0, a condition comparing it against the iterable's
+        // length, a body that binds the loop variable, and an increment.
+        match &iter.kind {
+            HirExprKind::Range { .. } => self.lower_for_range(var, iter, body),
+            _ => self.lower_for_list(var, iter, body),
+        }
+    }
+
+    /// Lower a range-based `for` loop: `for var in start..end`.
+    fn lower_for_range(
+        &mut self,
+        var: SymbolId,
+        iter: &HirExpr,
+        body: &[HirStmt],
+    ) -> CompilerResult<()> {
         let (start_expr, end_expr, is_inclusive) = match &iter.kind {
             HirExprKind::Range {
                 start,
@@ -758,7 +776,7 @@ impl<'hir> MirLower<'hir> {
             } => (start.as_ref(), end.as_ref(), *is_inclusive),
             _ => {
                 return Err(CompilerError::semantic(
-                    "for loop iterator must be a range expression".to_string(),
+                    "range for loop iterator must be a range expression".to_string(),
                 ));
             }
         };
@@ -788,7 +806,8 @@ impl<'hir> MirLower<'hir> {
             rvalue: MirRvalue::Use(end_val),
         });
 
-        // Loop variable (mutable).
+        // Loop variable (mutable). The range form starts the loop variable
+        // at `start_local`, not at zero.
         let loop_var = self.new_local(MirType::I64, var, true);
 
         let cond_bb = self.create_block("for_cond");
@@ -846,6 +865,128 @@ impl<'hir> MirLower<'hir> {
             rvalue: MirRvalue::Binary {
                 op: MirBinOp::Add,
                 lhs: MirOperand::Local(loop_var),
+                rhs: MirOperand::Const(MirConst::I64(1)),
+            },
+        });
+        self.ensure_terminated(cond_bb);
+
+        self.switch_to(exit_bb);
+        Ok(())
+    }
+
+    /// Lower a list-based `for` loop: `for var in list`.
+    ///
+    /// The list expression is evaluated exactly once into a local before the
+    /// loop. The loop is index-based:
+    ///
+    /// ```text
+    ///     index = 0
+    ///     while index < list_len(list):
+    ///         var = list_get(list, index)
+    ///         body
+    ///         index += 1
+    /// ```
+    ///
+    /// Empty lists execute zero iterations because `0 < 0` is false.
+    fn lower_for_list(
+        &mut self,
+        var: SymbolId,
+        iter: &HirExpr,
+        body: &[HirStmt],
+    ) -> CompilerResult<()> {
+        // Evaluate the iterable list expression exactly once, into a local,
+        // before entering the loop. This preserves left-to-right evaluation
+        // of any side effects in the iterable and keeps the list pointer
+        // stable for the duration of the loop.
+        let list_val = self.lower_expr(iter)?;
+        let list_local = self.new_local(iter.ty.clone(), self.temp_symbol, false);
+        self.emit(MirStmtKind::LocalDecl {
+            local: list_local,
+            ty: iter.ty.clone(),
+            mutable: false,
+        });
+        self.emit(MirStmtKind::Assign {
+            local: list_local,
+            rvalue: MirRvalue::Use(list_val),
+        });
+
+        // Mutable index local, initialized to zero.
+        let index_local = self.new_local(MirType::I64, self.temp_symbol, true);
+
+        let cond_bb = self.create_block("for_cond");
+        let body_bb = self.create_block("for_body");
+        let exit_bb = self.create_block("for_exit");
+
+        // Init index to 0, then goto cond.
+        self.emit(MirStmtKind::LocalDecl {
+            local: index_local,
+            ty: MirType::I64,
+            mutable: true,
+        });
+        self.emit(MirStmtKind::Assign {
+            local: index_local,
+            rvalue: MirRvalue::Use(MirOperand::Const(MirConst::I64(0))),
+        });
+        self.finish(MirTerminator::Goto { target: cond_bb });
+
+        // cond_bb: check index < list_len(list_local)
+        self.switch_to(cond_bb);
+        let len_local = self.new_local(MirType::I64, self.temp_symbol, false);
+        self.emit(MirStmtKind::LocalDecl {
+            local: len_local,
+            ty: MirType::I64,
+            mutable: false,
+        });
+        self.emit(MirStmtKind::Assign {
+            local: len_local,
+            rvalue: MirRvalue::Length { list_local },
+        });
+        let cond_local = self.new_local(MirType::Bool, self.temp_symbol, false);
+        self.emit(MirStmtKind::LocalDecl {
+            local: cond_local,
+            ty: MirType::Bool,
+            mutable: false,
+        });
+        self.emit(MirStmtKind::Assign {
+            local: cond_local,
+            rvalue: MirRvalue::Binary {
+                op: MirBinOp::Lt,
+                lhs: MirOperand::Local(index_local),
+                rhs: MirOperand::Local(len_local),
+            },
+        });
+        self.finish(MirTerminator::SwitchInt {
+            scrutinee: MirOperand::Local(cond_local),
+            ty: MirType::Bool,
+            branches: vec![(1, body_bb)],
+            else_target: exit_bb,
+        });
+
+        // body_bb: bind var = list_get(list_local, index), lower body,
+        // increment index, goto cond.
+        self.switch_to(body_bb);
+        let loop_var = self.new_local(MirType::I64, var, true);
+        self.emit(MirStmtKind::LocalDecl {
+            local: loop_var,
+            ty: MirType::I64,
+            mutable: true,
+        });
+        self.emit(MirStmtKind::Assign {
+            local: loop_var,
+            rvalue: MirRvalue::Index {
+                list_local,
+                index: MirOperand::Local(index_local),
+            },
+        });
+        self.var_map.insert(var, loop_var);
+        for s in body {
+            self.lower_stmt(s)?;
+        }
+        self.emit(MirStmtKind::Assign {
+            local: index_local,
+            rvalue: MirRvalue::Binary {
+                op: MirBinOp::Add,
+                lhs: MirOperand::Local(index_local),
                 rhs: MirOperand::Const(MirConst::I64(1)),
             },
         });

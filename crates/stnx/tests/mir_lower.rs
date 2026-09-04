@@ -572,3 +572,158 @@ fn test_constant_folding_i64_lt() {
     assert!(!has_binop(&mir, MirBinOp::Lt));
     assert!(has_const_value(&mir, &stnx::mir::MirConst::Bool(true)));
 }
+
+// ---------------------------------------------------------------------------
+// 0.5.3 Phase 8: list iteration MIR shape
+// ---------------------------------------------------------------------------
+
+/// Collect every `MirRvalue` appearing in any statement of any block.
+fn all_rvalues(mir: &stnx::mir::MirProgram) -> Vec<&MirRvalue> {
+    let mut out = Vec::new();
+    for f in &mir.functions {
+        for b in &f.blocks {
+            for s in &b.stmts {
+                if let MirStmtKind::Assign { rvalue, .. } = &s.kind {
+                    out.push(rvalue);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn test_list_iteration_lower_uses_list_len_and_list_get() {
+    let mir = to_mir("fn main() -> i64 { let a = [1, 2, 3] for x in a { println(x) } return 0 }");
+    let rvs = all_rvalues(&mir);
+    let has_len = rvs.iter().any(|r| matches!(r, MirRvalue::Length { .. }));
+    let has_get = rvs.iter().any(|r| matches!(r, MirRvalue::Index { .. }));
+    assert!(
+        has_len,
+        "list iteration MIR must contain a Length rvalue (list_len)"
+    );
+    assert!(
+        has_get,
+        "list iteration MIR must contain an Index rvalue (list_get)"
+    );
+}
+
+#[test]
+fn test_list_iteration_lower_index_starts_at_zero() {
+    // The loop index must be initialized to the constant 0 before the
+    // condition block.
+    let mir = to_mir("fn main() -> i64 { let a = [1, 2, 3] for x in a { println(x) } return 0 }");
+    let rvs = all_rvalues(&mir);
+    let zero_init = rvs.iter().any(|r| {
+        matches!(
+            r,
+            MirRvalue::Use(MirOperand::Const(stnx::mir::MirConst::I64(0)))
+        )
+    });
+    assert!(
+        zero_init,
+        "list iteration must initialize the index local to 0"
+    );
+}
+
+#[test]
+fn test_list_iteration_lower_terminates_at_len() {
+    // The loop condition must compare the index against the list length
+    // with a strict less-than, and the loop must branch on the result.
+    let mir = to_mir("fn main() -> i64 { let a = [1, 2, 3] for x in a { println(x) } return 0 }");
+    let has_lt = all_rvalues(&mir).iter().any(|r| {
+        matches!(
+            r,
+            MirRvalue::Binary {
+                op: MirBinOp::Lt,
+                ..
+            }
+        )
+    });
+    assert!(
+        has_lt,
+        "list iteration condition must use a strict less-than against the list length"
+    );
+    let has_switch = mir.functions.iter().any(|f| {
+        f.blocks
+            .iter()
+            .any(|b| matches!(b.terminator, MirTerminator::SwitchInt { .. }))
+    });
+    assert!(
+        has_switch,
+        "list iteration must branch via a SwitchInt terminator"
+    );
+}
+
+#[test]
+fn test_list_iteration_lower_increments_index_once_per_iteration() {
+    // The index local must be incremented by exactly 1 in the loop body.
+    let mir = to_mir("fn main() -> i64 { let a = [1, 2, 3] for x in a { println(x) } return 0 }");
+    let rvs = all_rvalues(&mir);
+    let inc = rvs.iter().any(|r| {
+        matches!(
+            r,
+            MirRvalue::Binary {
+                op: MirBinOp::Add,
+                rhs: MirOperand::Const(stnx::mir::MirConst::I64(1)),
+                ..
+            }
+        )
+    });
+    assert!(
+        inc,
+        "list iteration must increment the index by exactly 1 per iteration"
+    );
+}
+
+#[test]
+fn test_list_iteration_lower_evaluates_iterable_once() {
+    // The list expression is lowered exactly once into a local before the
+    // loop; the MIR must contain exactly one ListLiteral rvalue for the
+    // iterable, not one per iteration.
+    let mir = to_mir("fn main() -> i64 { let a = [1, 2, 3] for x in a { println(x) } return 0 }");
+    let rvs = all_rvalues(&mir);
+    let list_lit_count = rvs
+        .iter()
+        .filter(|r| matches!(r, MirRvalue::ListLiteral { .. }))
+        .count();
+    assert_eq!(
+        list_lit_count, 1,
+        "the list iterable must be evaluated exactly once, not per iteration"
+    );
+}
+
+#[test]
+fn test_list_iteration_lower_range_for_unchanged() {
+    // Regression: the range-based for loop must still lower to the same
+    // shape (start/end locals, Lt/Le condition, increment).
+    let mir = to_mir("fn main() -> i64 { for i in 0..10 { println(i) } return 0 }");
+    let has_lt = all_rvalues(&mir).iter().any(|r| {
+        matches!(
+            r,
+            MirRvalue::Binary {
+                op: MirBinOp::Lt,
+                ..
+            }
+        )
+    });
+    assert!(has_lt, "range for loop must still use a Lt comparison");
+    let has_switch = mir.functions.iter().any(|f| {
+        f.blocks
+            .iter()
+            .any(|b| matches!(b.terminator, MirTerminator::SwitchInt { .. }))
+    });
+    assert!(has_switch, "range for loop must still branch via SwitchInt");
+}
+
+#[test]
+fn test_list_iteration_lower_rejects_non_list_iterable() {
+    // A `for` loop over a bare i64 must fail HIR lowering before MIR.
+    let tokens: Vec<_> = Lexer::new("fn main() -> i64 { for x in 42 { } return 0 }")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let program = parser::parse("fn main() -> i64 { for x in 42 { } return 0 }", tokens)
+        .expect("parsing should succeed");
+    let result = lower(&program);
+    assert!(result.is_err(), "for loop over a bare i64 must be rejected");
+}
