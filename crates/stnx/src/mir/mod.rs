@@ -210,15 +210,7 @@ pub enum MirRvalue {
     /// List literal: evaluates each element expression left-to-right,
     /// stores elements into a temporary sequence. Runtime allocation
     /// deferred; for 0.5.3 this is a minimal representation only.
-    ListLiteral {
-        elements: Vec<MirOperand>,
-    },
-    /// List literal: evaluates each element expression left-to-right,
-    /// stores elements into a temporary sequence. Runtime allocation
-    /// deferred; for 0.5.3 this is a minimal representation only.
-    ListLiteral {
-        elements: Vec<MirOperand>,
-    },
+    ListLiteral { elements: Vec<MirOperand> },
     /// String literal → global string pointer cast to i64.
     StrLit(SymbolId),
 }

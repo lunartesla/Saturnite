@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 fn main() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let runtime_c = PathBuf::from(manifest_dir)
-        .join("runtime")
-        .join("println_i64.c");
+    let runtime_dir = PathBuf::from(manifest_dir).join("runtime");
+    let runtime_c = runtime_dir.join("println_i64.c");
+    let list_c = runtime_dir.join("list.c");
 
     // Emit a clear diagnostic if the runtime source is missing, rather than
     // silently falling back to a stale, architecture-specific checked-in object.
@@ -27,6 +27,12 @@ fn main() {
 
     let mut build = cc::Build::new();
     build.file(&runtime_c);
+    if list_c.exists() {
+        build.file(&list_c);
+    }
+    if list_c.exists() {
+        build.file(&list_c);
+    }
 
     // Detect the host C compiler so we can report what was searched for.
     let host_cc = build.get_compiler();
@@ -52,4 +58,10 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed={}", runtime_c.display());
+    if list_c.exists() {
+        println!("cargo:rerun-if-changed={}", list_c.display());
+    }
+    if list_c.exists() {
+        println!("cargo:rerun-if-changed={}", list_c.display());
+    }
 }

@@ -282,11 +282,6 @@ pub enum Expr {
         items: Vec<Expr>,
         span: Range<usize>,
     },
-    /// Real list literal: `[1, 2, 3]`. Element expressions stored directly.
-    ListLiteral {
-        items: Vec<Expr>,
-        span: Range<usize>,
-    },
     /// 0.5 string interpolation: `"hello {name}!"`. Lowered to a chain of
     /// `concat_str` calls at AST→HIR lowering.
     InterpolatedStr(Vec<StrPart>, Range<usize>),

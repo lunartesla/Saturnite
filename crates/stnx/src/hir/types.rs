@@ -29,8 +29,6 @@ pub enum HirType {
     Enum(SymbolId),
     /// A homogeneous list type with its element type.
     List(Box<HirType>),
-    /// A homogeneous list type with its element type.
-    List(Box<HirType>),
     /// A free type variable — the name of a generic parameter as it appears
     /// in the source (e.g. `T` in `fn id<T>(x: T) -> T`). Resolved at
     /// monomorphization time by substitution. Not produced by `From<ast::Type>`.

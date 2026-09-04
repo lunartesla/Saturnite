@@ -118,6 +118,15 @@ impl<'ctx> MirCodeGenContext<'ctx> {
         );
         self.module
             .add_function("str_i64", ptr_ty.fn_type(&[i64_ty.into()], false), None);
+        // 0.5.3 List<i64> construction: `list_new_from(long long* elems,
+        // long long count) -> sat_list*`. `elems` is an alloca the generated
+        // code fills left-to-right before the call; the returned pointer is
+        // the list's LLVM representation (ptr), matching the sat_list ABI.
+        self.module.add_function(
+            "list_new_from",
+            ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+            None,
+        );
     }
 
     /// Declare all functions from the MIR program into the module.
@@ -261,6 +270,69 @@ impl<'ctx> MirCodeGenContext<'ctx> {
                     .build_global_string_ptr(s, "str_lit")
                     .unwrap()
                     .as_basic_value_enum())
+            }
+            MirRvalue::ListLiteral { elements } => {
+                // 0.5.3 List<i64> construction. Elements are materialized
+                // left-to-right into a stack buffer, then handed to the
+                // runtime constructor `list_new_from`, which allocates the
+                // process-lifetime sat_list. The rvalue evaluates to the
+                // sat_list pointer (the List LLVM representation).
+                let i64_ty = self.context.i64_type();
+                let count = elements.len() as u64;
+
+                // Stack buffer for the evaluated elements. Zero-length lists
+                // cannot reach codegen (HIR rejects empty literals), but the
+                // buffer is still sized safely via max(1).
+                let buf_alloca = self
+                    .builder
+                    .build_array_alloca(i64_ty, i64_ty.const_int(count.max(1), false), "list_elems")
+                    .unwrap();
+
+                // Left-to-right evaluation: materialize each element in order
+                // and store it into the buffer slot.
+                for (idx, elem) in elements.iter().enumerate() {
+                    let val = self.materialize_operand(elem)?;
+                    let val_i64 = match val {
+                        BasicValueEnum::IntValue(v) => v,
+                        other => {
+                            return Err(CompilerError::codegen(format!(
+                                "list literal element is not an i64 value: {:?}",
+                                other.get_type()
+                            )))
+                        }
+                    };
+                    let slot = unsafe {
+                        self.builder
+                            .build_gep(
+                                i64_ty,
+                                buf_alloca,
+                                &[i64_ty.const_int(idx as u64, false)],
+                                &format!("list_elem_{}", idx),
+                            )
+                            .unwrap()
+                    };
+                    self.builder.build_store(slot, val_i64).unwrap();
+                }
+
+                let list_fn = self
+                    .module
+                    .get_function("list_new_from")
+                    .ok_or_else(|| CompilerError::codegen("list_new_from not declared"))?;
+                let call = self
+                    .builder
+                    .build_call(
+                        list_fn,
+                        &[
+                            buf_alloca.as_basic_value_enum().into(),
+                            i64_ty.const_int(count, false).as_basic_value_enum().into(),
+                        ],
+                        "list_new",
+                    )
+                    .unwrap();
+                let ret = call.try_as_basic_value();
+                Ok(ret
+                    .basic()
+                    .ok_or_else(|| CompilerError::codegen("list_new_from returned no value"))?)
             }
         }
     }
@@ -745,6 +817,7 @@ impl<'ctx> MirCodeGenContext<'ctx> {
                     | HirType::Str
                     | HirType::Struct(_)
                     | HirType::Enum(_)
+                    | HirType::List(_)
                     | HirType::Generic(_)
                     | HirType::Apply { .. } => {
                         // For void/unit-like returns and for monomorphized return
@@ -809,6 +882,12 @@ pub fn mir_type_to_llvm<'ctx>(
                 .map(|(_, ty)| mir_type_to_llvm(ctx, prog, ty))
                 .collect();
             let _ = ctx.struct_type(&field_types, false);
+            ctx.ptr_type(inkwell::AddressSpace::default())
+                .as_basic_type_enum()
+        }
+        HirType::List(_) => {
+            // 0.5.3: a List is a pointer to the runtime `sat_list` struct
+            // (data/len/cap), consistent with the runtime ABI in list.c.
             ctx.ptr_type(inkwell::AddressSpace::default())
                 .as_basic_type_enum()
         }

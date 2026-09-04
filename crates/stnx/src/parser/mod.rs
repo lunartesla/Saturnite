@@ -595,12 +595,28 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
                 .or(kw_span("false").map(|s| Expr::Bool(false, s))))
             .or(lbrace_span().then_ignore(rbrace()).map(Expr::Unit))
             .or(lbracket_span()
-                .ignore_then(expr.clone().separated_by(comma()).collect::<Vec<_>>())
-                .then_ignore(rbracket())
+                .ignore_then(
+                    // Empty list case: just close bracket.
+                    rbracket().to(vec![])
+                        .or(
+                            // Non-empty list: first element + zero or more (, element).
+                            expr.clone()
+                                .then(comma().ignore_then(expr.clone()).repeated().collect::<Vec<_>>())
+                                .then_ignore(rbracket())
+                                .map(|(first, rest)| {
+                                    let mut v = vec![first];
+                                    v.extend(rest);
+                                    v
+                                }),
+                        )
+                )
                 .map(|items| {
                     let start = items.first().map(stmt_span).map(|s| s.start).unwrap_or(0);
                     let end = items.last().map(stmt_span).map(|s| s.end).unwrap_or(start);
-                    Expr::ListLiteral { items, span: start..end }
+                    Expr::ListLiteral {
+                        items,
+                        span: start..end,
+                    }
                 }))
             .or(t_ident()
                 // Optional turbofish for struct literals: `Box::<i64> { ... }`.
@@ -1539,6 +1555,7 @@ fn stmt_span(e: &Expr) -> Range<usize> {
         | Expr::EnumConstructor { span, .. }
         | Expr::Pipeline { span, .. }
         | Expr::Closure { span, .. }
+        | Expr::ListLiteral { span, .. }
         | Expr::InterpolatedStr(_, span) => span.clone(),
     }
 }
@@ -1806,45 +1823,26 @@ mod tests {
     // --- list literal tests ---
     #[test]
     fn test_parse_empty_list() {
-        let prog = parse_src("let a = []");
-        // Just verify it parses without panic; AST inspection covered by expression parsing.
+        let prog = parse_src("fn main() -> i64 { let a = [] 0 }");
+        assert!(prog.functions.len() == 1);
     }
 
     #[test]
     fn test_parse_list_single_element() {
-        let prog = parse_src("let a = [42]");
+        let prog = parse_src("fn main() -> i64 { let a = [42] 0 }");
+        assert!(prog.functions.len() == 1);
     }
 
     #[test]
     fn test_parse_list_multiple_elements() {
-        let prog = parse_src("let a = [1, 2, 3]");
+        let prog = parse_src("fn main() -> i64 { let a = [1, 2, 3] 0 }");
+        assert!(prog.functions.len() == 1);
     }
 
     #[test]
     fn test_parse_list_nested_expr() {
-        let prog = parse_src("let a = [1 + 2, 3 * 4]");
-    }
-
-    // --- list literal tests ---
-    #[test]
-    fn test_parse_empty_list() {
-        let prog = parse_src("let a = []");
-        // Just verify it parses without panic; AST inspection covered by expression parsing.
-    }
-
-    #[test]
-    fn test_parse_list_single_element() {
-        let prog = parse_src("let a = [42]");
-    }
-
-    #[test]
-    fn test_parse_list_multiple_elements() {
-        let prog = parse_src("let a = [1, 2, 3]");
-    }
-
-    #[test]
-    fn test_parse_list_nested_expr() {
-        let prog = parse_src("let a = [1 + 2, 3 * 4]");
+        let prog = parse_src("fn main() -> i64 { let a = [1 + 2, 3 * 4] 0 }");
+        assert!(prog.functions.len() == 1);
     }
 
     #[test]

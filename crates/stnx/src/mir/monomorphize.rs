@@ -400,6 +400,12 @@ impl<'hir> Monomorphizer<'hir> {
                 Ok(())
             }
             HirExprKind::FieldAccess { expr, .. } => self.collect_from_expr(expr),
+            HirExprKind::ListLiteral { elements } => {
+                for e in elements {
+                    self.collect_from_expr(e)?;
+                }
+                Ok(())
+            }
             HirExprKind::EnumConstructor { .. } => Ok(()),
         }
     }
@@ -803,6 +809,9 @@ fn substitute_expr(expr: &HirExpr, subst: &HashMap<SymbolId, HirType>) -> HirExp
             name: *name,
             variant: *variant,
         },
+        HirExprKind::ListLiteral { elements } => HirExprKind::ListLiteral {
+            elements: elements.iter().map(|e| substitute_expr(e, subst)).collect(),
+        },
     };
     HirExpr {
         kind: new_kind,
@@ -1055,6 +1064,12 @@ fn rewrite_expr(
         HirExprKind::EnumConstructor { name, variant } => HirExprKind::EnumConstructor {
             name: *name,
             variant: *variant,
+        },
+        HirExprKind::ListLiteral { elements } => HirExprKind::ListLiteral {
+            elements: elements
+                .iter()
+                .map(|e| rewrite_expr(e, remap, struct_remap))
+                .collect(),
         },
     };
     HirExpr {

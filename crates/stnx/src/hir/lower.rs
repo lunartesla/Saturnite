@@ -156,23 +156,13 @@ fn ast_type_to_hir(
             let sym = symbols.intern(name);
             HirType::Enum(sym)
         }
-        // 0.5: `List<T>` desugars to a fresh struct type. We model it as
-        // an opaque `HirType::Struct` named after its element type so the
-        // HIR doesn't need a dedicated `List` variant. Runtime support is
-        // deferred — this just keeps the type-checker honest about the
-        // shape.
+        // 0.5.3: `List<T>` lowers to a real `HirType::List` with its element
+        // type. Only `List<i64>` is supported at runtime in 0.5.3; other
+        // element types are rejected at list-literal lowering rather than
+        // silently miscompiled here.
         Type::List(inner) => {
             let inner_hir = ast_type_to_hir(inner, symbols, enum_names, generic_param_names);
-            let inner_sym = match inner_hir {
-                HirType::I64 => symbols.intern("i64"),
-                HirType::F64 => symbols.intern("f64"),
-                HirType::Bool => symbols.intern("bool"),
-                HirType::Str => symbols.intern("str"),
-                HirType::Unit => symbols.intern("unit"),
-                HirType::Struct(s) | HirType::Enum(s) | HirType::Generic(s) => s,
-                HirType::Apply { .. } => symbols.intern("list"),
-            };
-            HirType::Struct(inner_sym)
+            HirType::List(Box::new(inner_hir))
         }
     }
 }
@@ -2111,7 +2101,8 @@ impl HirLower {
                     return Err(CompilerError::semantic(
                         "empty list literal `[]` is not supported in 0.5.3; \
                          provide at least one element (e.g., `[1]`) so the \
-                         element type can be inferred".to_string(),
+                         element type can be inferred"
+                            .to_string(),
                     ));
                 }
                 let mut lowered_elements: Vec<HirExpr> = Vec::with_capacity(items.len());
@@ -2131,49 +2122,8 @@ impl HirLower {
                             if lowered.ty != *ct {
                                 return Err(CompilerError::semantic(format!(
                                     "mixed-type list literal: expected `{:?}`, \
-                                     found `{:?}`", ct, lowered.ty
-                                )));
-                            }
-                        }
-                        None => common_ty = Some(lowered.ty.clone()),
-                    }
-                    lowered_elements.push(lowered);
-                }
-                let ty = common_ty.unwrap_or(HirType::I64);
-                Ok(HirExpr {
-                    kind: HirExprKind::ListLiteral {
-                        elements: lowered_elements,
-                    },
-                    ty: HirType::List(Box::new(ty)),
-                    span: span_to_source_span(span),
-                })
-            }
-            Expr::ListLiteral { items, span } => {
-                if items.is_empty() {
-                    return Err(CompilerError::semantic(
-                        "empty list literal `[]` is not supported in 0.5.3; \
-                         provide at least one element (e.g., `[1]`) so the \
-                         element type can be inferred".to_string(),
-                    ));
-                }
-                let mut lowered_elements: Vec<HirExpr> = Vec::with_capacity(items.len());
-                let mut common_ty: Option<HirType> = None;
-                for item_expr in items {
-                    let lowered = self.lower_expr(item_expr, scope, return_type, ctx)?;
-                    // Only i64 elements supported in 0.5.3
-                    if lowered.ty != HirType::I64 {
-                        return Err(CompilerError::semantic(format!(
-                            "list literal: element type `{:?}` is not supported; \
-                             only `i64` is allowed in 0.5.3",
-                            lowered.ty
-                        )));
-                    }
-                    match &common_ty {
-                        Some(ct) => {
-                            if lowered.ty != *ct {
-                                return Err(CompilerError::semantic(format!(
-                                    "mixed-type list literal: expected `{:?}`, \
-                                     found `{:?}`", ct, lowered.ty
+                                     found `{:?}`",
+                                    ct, lowered.ty
                                 )));
                             }
                         }
@@ -2526,23 +2476,41 @@ mod tests {
     #[test]
     fn test_list_literal_lower_single_element() {
         let hir = lower_src("fn main() -> i64 { let a = [42] 0 }");
-        // Lowering completes; actual HIR structure inspection deferred to full pipeline.
+        let main = hir.function_by_name("main").expect("main");
+        assert!(
+            main.body
+                .iter()
+                .any(|s| matches!(&s.kind, HirStmtKind::Let { value, .. } if matches!(&value.kind, HirExprKind::ListLiteral { elements } if elements.len() == 1))),
+            "expected a ListLiteral HIR node with one element"
+        );
     }
 
     #[test]
     fn test_list_literal_lower_multiple_elements() {
         let hir = lower_src("fn main() -> i64 { let a = [1, 2, 3] 0 }");
+        let main = hir.function_by_name("main").expect("main");
+        assert!(
+            main.body
+                .iter()
+                .any(|s| matches!(&s.kind, HirStmtKind::Let { value, .. } if matches!(&value.kind, HirExprKind::ListLiteral { elements } if elements.len() == 3))),
+            "expected a ListLiteral HIR node with three elements"
+        );
     }
 
     #[test]
     fn test_list_literal_reject_empty() {
         let tokens: Vec<_> = Lexer::new("fn main() -> i64 { let a = [] 0 }")
-            .collect().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         let prog = parser::parse("fn main() -> i64 { let a = [] 0 }", tokens).expect("parse ok");
         let result = lower(&prog);
         assert!(result.is_err(), "empty list must be rejected");
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("empty list"), "expected empty list error, got: {}", err_msg);
+        assert!(
+            err_msg.contains("empty list"),
+            "expected empty list error, got: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -2551,14 +2519,23 @@ mod tests {
         // Here both are i64; to test rejection we would need a bool, which parser cannot easily mix
         // without syntax. This test documents the current state: same-type i64 lists pass.
         let hir = lower_src("fn main() -> i64 { let a = [1, 2] 0 }");
+        let main = hir.function_by_name("main").expect("main");
+        assert!(
+            main.body
+                .iter()
+                .any(|s| matches!(&s.kind, HirStmtKind::Let { value, .. } if matches!(&value.kind, HirExprKind::ListLiteral { elements } if elements.len() == 2))),
+            "expected a ListLiteral HIR node with two elements"
+        );
     }
 
     #[test]
     fn test_list_literal_reject_non_i64_element() {
         // `true` lowers to Bool, which should be rejected in list context.
         let tokens: Vec<_> = Lexer::new("fn main() -> i64 { let a = [true] 0 }")
-            .collect().unwrap();
-        let prog = parser::parse("fn main() -> i64 { let a = [true] 0 }", tokens).expect("parse ok");
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let prog =
+            parser::parse("fn main() -> i64 { let a = [true] 0 }", tokens).expect("parse ok");
         let result = lower(&prog);
         assert!(result.is_err(), "non-i64 list element must be rejected");
     }
@@ -2566,6 +2543,13 @@ mod tests {
     #[test]
     fn test_list_literal_nested_expr() {
         let hir = lower_src("fn main() -> i64 { let a = [1 + 2, 3 * 4] 0 }");
+        let main = hir.function_by_name("main").expect("main");
+        assert!(
+            main.body
+                .iter()
+                .any(|s| matches!(&s.kind, HirStmtKind::Let { value, .. } if matches!(&value.kind, HirExprKind::ListLiteral { elements } if elements.len() == 2))),
+            "expected a ListLiteral HIR node with two elements"
+        );
     }
 
     #[test]
@@ -2573,132 +2557,22 @@ mod tests {
         // Nested list `[ [1, 2], [3] ]` is deferred; first element `[1,2]` lowers to List(I64),
         // second also List(I64) — they match, so lowering succeeds. Full nested semantics deferred.
         let tokens: Vec<_> = Lexer::new("fn main() -> i64 { let a = [[1, 2], [3]] 0 }")
-            .collect().unwrap();
-        let prog = parser::parse("fn main() -> i64 { let a = [[1, 2], [3]] 0 }", tokens).expect("parse ok");
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let prog = parser::parse("fn main() -> i64 { let a = [[1, 2], [3]] 0 }", tokens)
+            .expect("parse ok");
         // Lowering may succeed (same inner type) but nested list runtime is deferred.
         let _ = lower(&prog);
-    }
-
-    #[test]
-    fn test_list_literal_lower_single_element() {
-        let hir = lower_src("fn main() -> i64 { let a = [42] 0 }");
-        // Lowering completes; actual HIR structure inspection deferred to full pipeline.
-    }
-
-    #[test]
-    fn test_list_literal_lower_multiple_elements() {
-        let hir = lower_src("fn main() -> i64 { let a = [1, 2, 3] 0 }");
-    }
-
-    #[test]
-    fn test_list_literal_reject_empty() {
-        let tokens: Vec<_> = Lexer::new("fn main() -> i64 { let a = [] 0 }")
-            .collect().unwrap();
-        let prog = parser::parse("fn main() -> i64 { let a = [] 0 }", tokens).expect("parse ok");
-        let result = lower(&prog);
-        assert!(result.is_err(), "empty list must be rejected");
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("empty list"), "expected empty list error, got: {}", err_msg);
-    }
-
-    #[test]
-    fn test_list_literal_reject_mixed_type() {
-        // Even though parser accepts mixed expressions, HIR should reject non-i64.
-        // Here both are i64; to test rejection we would need a bool, which parser cannot easily mix
-        // without syntax. This test documents the current state: same-type i64 lists pass.
-        let hir = lower_src("fn main() -> i64 { let a = [1, 2] 0 }");
-    }
-
-    #[test]
-    fn test_list_literal_reject_non_i64_element() {
-        // `true` lowers to Bool, which should be rejected in list context.
-        let tokens: Vec<_> = Lexer::new("fn main() -> i64 { let a = [true] 0 }")
-            .collect().unwrap();
-        let prog = parser::parse("fn main() -> i64 { let a = [true] 0 }", tokens).expect("parse ok");
-        let result = lower(&prog);
-        assert!(result.is_err(), "non-i64 list element must be rejected");
-    }
-
-    #[test]
-    fn test_list_literal_nested_expr() {
-        let hir = lower_src("fn main() -> i64 { let a = [1 + 2, 3 * 4] 0 }");
-    }
-
-    #[test]
-    fn test_list_literal_deferred_nested() {
-        // Nested list `[ [1, 2], [3] ]` is deferred; first element `[1,2]` lowers to List(I64),
-        // second also List(I64) — they match, so lowering succeeds. Full nested semantics deferred.
-        let tokens: Vec<_> = Lexer::new("fn main() -> i64 { let a = [[1, 2], [3]] 0 }")
-            .collect().unwrap();
-        let prog = parser::parse("fn main() -> i64 { let a = [[1, 2], [3]] 0 }", tokens).expect("parse ok");
-        // Lowering may succeed (same inner type) but nested list runtime is deferred.
-        let _ = lower(&prog);
-    }
-
-    // ---------------------------------------------------------------------------
-    // Phase 5B tests: lower_program_with_graph
-    // ---------------------------------------------------------------------------
-
-    /// Helper: build a minimal single-module ModuleGraph with the given AST
-    /// attached to the root module.
-    fn graph_with_root_ast(program: &Program) -> ModuleGraph {
-        let mut graph = ModuleGraph::new();
-        let root_module = Module::new(
-            ModuleId::ROOT,
-            crate::module::ModulePath::new(),
-            std::path::PathBuf::from("<root>"),
-        );
-        graph.add_module(root_module);
-        // Attach the AST to the root module.
-        graph.modules[0].ast = Some(program.clone());
-        graph
-    }
-
-    /// Helper: build a two-module graph (root + child) with the given ASTs.
-    fn graph_with_child(
-        root_program: &Program,
-        child_name: &str,
-        child_program: &Program,
-    ) -> ModuleGraph {
-        let mut graph = ModuleGraph::new();
-
-        // Root module
-        let mut root_module = Module::new(
-            ModuleId::ROOT,
-            crate::module::ModulePath::new(),
-            std::path::PathBuf::from("<root>"),
-        );
-        // Record the mod declaration so the child is discoverable.
-        root_module.mod_declarations = vec![child_name.to_string()];
-        root_module.ast = Some(root_program.clone());
-        graph.add_module(root_module);
-
-        // Child module
-        let segment = graph.symbol_interner.intern(child_name);
-        let child_path = crate::module::ModulePath::from_segments(vec![segment]);
-        let mut child_module = Module::new(
-            ModuleId(1),
-            child_path,
-            std::path::PathBuf::from(format!("<root>/{child_name}")),
-        );
-        child_module.parent = Some(ModuleId::ROOT);
-        child_module.ast = Some(child_program.clone());
-        graph.add_module(child_module);
-
-        graph
     }
 
     #[test]
     fn test_graph_lower_single_file_matches_lower_program() {
-        // For a single-file program (root-only graph), lower_program_with_graph
-        // should produce identical results to lower_program.
         let src = "fn main() -> i64 { 0 }";
         let tokens: Vec<_> = Lexer::new(src)
             .collect::<Result<Vec<_>, _>>()
             .expect("lexing should succeed");
         let program: Program = parser::parse(src, tokens).expect("parsing should succeed");
 
-        // Standard lowering
         let hir_standard = lower(&program).expect("standard lowering should succeed");
 
         // Graph-based lowering with a root-only graph
@@ -3156,5 +3030,53 @@ mod tests {
             *target_def_id, helper_func.def_id,
             "imported DefId should match helper's DefId"
         );
+    }
+    /// Helper: build a minimal single-module ModuleGraph with the given AST
+    /// attached to the root module.
+    fn graph_with_root_ast(program: &Program) -> ModuleGraph {
+        let mut graph = ModuleGraph::new();
+        let root_module = Module::new(
+            ModuleId::ROOT,
+            crate::module::ModulePath::new(),
+            std::path::PathBuf::from("<root>"),
+        );
+        graph.add_module(root_module);
+        // Attach the AST to the root module.
+        graph.modules[0].ast = Some(program.clone());
+        graph
+    }
+
+    /// Helper: build a two-module graph (root + child) with the given ASTs.
+    fn graph_with_child(
+        root_program: &Program,
+        child_name: &str,
+        child_program: &Program,
+    ) -> ModuleGraph {
+        let mut graph = ModuleGraph::new();
+
+        // Root module
+        let mut root_module = Module::new(
+            ModuleId::ROOT,
+            crate::module::ModulePath::new(),
+            std::path::PathBuf::from("<root>"),
+        );
+        // Record the mod declaration so the child is discoverable.
+        root_module.mod_declarations = vec![child_name.to_string()];
+        root_module.ast = Some(root_program.clone());
+        graph.add_module(root_module);
+
+        // Child module
+        let segment = graph.symbol_interner.intern(child_name);
+        let child_path = crate::module::ModulePath::from_segments(vec![segment]);
+        let mut child_module = Module::new(
+            ModuleId(1),
+            child_path,
+            std::path::PathBuf::from(format!("<root>/{child_name}")),
+        );
+        child_module.parent = Some(ModuleId::ROOT);
+        child_module.ast = Some(child_program.clone());
+        graph.add_module(child_module);
+
+        graph
     }
 }
