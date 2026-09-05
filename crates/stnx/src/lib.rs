@@ -24,6 +24,7 @@ pub mod codegen;
 pub mod config;
 pub mod error;
 pub mod hir;
+pub mod interop;
 pub mod lexer;
 pub mod mir;
 pub mod module;
