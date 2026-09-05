@@ -64,7 +64,7 @@ use crate::hir::stmt::{HirStmt, HirStmtKind};
 use crate::hir::symbol::{DefId, SymbolId, SymbolInterner};
 use crate::hir::types::HirType;
 use crate::mir::lower::MirLower;
-use crate::mir::{MirFunction, MirProgram};
+use crate::mir::{ExternalLibrary, MirExternalKind, MirFunction, MirProgram};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -288,6 +288,29 @@ impl<'hir> Monomorphizer<'hir> {
                 all
             },
             enums: self.hir.enums.clone(),
+            external_libraries: {
+                // Carry the declared external libraries through
+                // monomorphization unchanged (they are ABI metadata, not
+                // generic code).
+                let mut libs: Vec<ExternalLibrary> = Vec::new();
+                for ext in &self.hir.external_functions {
+                    let kind = match ext.kind {
+                        crate::ast::ExternalKind::Rust => MirExternalKind::Rust,
+                        crate::ast::ExternalKind::Python => MirExternalKind::Python,
+                        crate::ast::ExternalKind::Native => MirExternalKind::Native,
+                    };
+                    // All external kinds are tracked. Python needs the Python
+                    // library linked (-lpython, -lpthread, etc.) even though
+                    // it has no link-time staticlib artifact of its own.
+                    if !libs.iter().any(|l| l.name == ext.ecosystem) {
+                        libs.push(ExternalLibrary {
+                            name: ext.ecosystem.clone(),
+                            kind,
+                        });
+                    }
+                }
+                libs
+            },
         })
     }
 

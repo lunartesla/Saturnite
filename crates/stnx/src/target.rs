@@ -343,7 +343,7 @@ impl TargetConfig {
                 &self.cpu,
                 &self.features,
                 self.to_inkwell_opt_level(),
-                RelocMode::Default,
+                RelocMode::PIC,
                 CodeModel::Default,
             )
             .ok_or_else(|| {

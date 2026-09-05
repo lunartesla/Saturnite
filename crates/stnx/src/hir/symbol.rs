@@ -97,6 +97,10 @@ pub enum DefKind {
     Module,
     /// An import declaration (`use foo::bar`).
     Use,
+    /// An `external` declaration — a foreign function call across an
+    /// interoperability boundary (Rust crate, Python module, or native
+    /// C-ABI library).
+    External,
 }
 
 /// A single entry in the [`DefTable`].

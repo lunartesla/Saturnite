@@ -183,6 +183,7 @@ fn rvalue_operands(rvalue: &MirRvalue) -> Vec<MirOperand> {
         }
         MirRvalue::Length { list_local } => vec![MirOperand::Local(*list_local)],
         MirRvalue::StrLit(_) => vec![],
+        MirRvalue::ExternalCall { args, .. } => args.clone(),
     }
 }
 

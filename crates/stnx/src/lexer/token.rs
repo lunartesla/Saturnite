@@ -41,6 +41,11 @@ pub enum TokenKind {
     Text,
     /// `number` — type alias for `i64`.
     Number,
+    /// `external` — declares a foreign function call across an
+    /// interoperability boundary (Rust crate, Python module, or native
+    /// C-ABI library). The declaration is explicit metadata; the compiler
+    /// never parses arbitrary foreign source.
+    External,
 
     // --- Literals ---
     Ident(String),

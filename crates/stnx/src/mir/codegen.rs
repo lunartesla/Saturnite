@@ -8,8 +8,8 @@
 use crate::error::{CompilerError, CompilerResult};
 use crate::hir::types::HirType;
 use crate::mir::{
-    BlockId, LocalId, MirBinOp, MirConst, MirFunction, MirOperand, MirProgram, MirRvalue,
-    MirStmtKind, MirTerminator, MirType, MirUnOp,
+    BlockId, LocalId, MirBinOp, MirConst, MirExternalKind, MirFunction, MirOperand, MirProgram,
+    MirRvalue, MirStmtKind, MirTerminator, MirType, MirUnOp,
 };
 use crate::target::TargetConfig;
 use inkwell::builder::Builder as IRBuilder;
@@ -37,6 +37,14 @@ const CONCAT_STR_DEF_ID: crate::hir::symbol::DefId = crate::hir::symbol::DefId(u
 /// DefId sentinel for the runtime `str_i64` function (0.5.1 numeric string
 /// interpolation). Must match `hir::lower::STR_I64_DEF_ID`.
 const STR_I64_DEF_ID: crate::hir::symbol::DefId = crate::hir::symbol::DefId(u32::MAX - 4);
+
+/// `sat_py_value_kind` discriminators, matching `runtime/pyrt.h`.
+/// Used when emitting the flat `sat_py_call_flat` ABI.
+const SAT_PY_NONE: u64 = 0;
+const SAT_PY_BOOL: u64 = 1;
+const SAT_PY_I64: u64 = 2;
+const SAT_PY_F64: u64 = 3;
+const SAT_PY_STR: u64 = 4;
 
 /// A local alloca plus its LLVM type (needed for loading with the right type).
 type AllocaInfo<'ctx> = (PointerValue<'ctx>, BasicTypeEnum<'ctx>);
@@ -377,6 +385,12 @@ impl<'ctx> MirCodeGenContext<'ctx> {
                 Ok(ret
                     .basic()
                     .ok_or_else(|| CompilerError::codegen("list_get returned no value"))?)
+            }
+            MirRvalue::ExternalCall { kind, symbol, args, ret_ty } => {
+                gen_external_call(self, kind, symbol, args, ret_ty, prog)
+            }
+            MirRvalue::ExternalCall { kind, symbol, args, ret_ty } => {
+                gen_external_call(self, kind, symbol, args, ret_ty, prog)
             }
             MirRvalue::Length { list_local } => {
                 let (list_alloca, list_llvm_ty) = self.local_allocas.get(list_local).ok_or_else(|| {
@@ -899,6 +913,226 @@ impl<'ctx> MirCodeGenContext<'ctx> {
     }
 }
 
+/// Generate LLVM IR for an external call across an interoperability
+/// boundary.
+///
+/// Rust/Native calls are emitted as direct LLVM `call`s to the declared
+/// external symbol. The symbol is resolved by the linker against the
+/// wrapper static library (Rust) or shared library (Native).
+///
+/// Python calls are emitted as calls to the `sat_py_call_spec` runtime
+/// bridge helper, which initializes the interpreter, imports the module,
+/// resolves the callable, and invokes it. The result is then converted
+/// back into a Saturnite value.
+///
+/// Argument evaluation is performed left-to-right by the caller (the MIR
+/// lowering guarantees this), so side effects are not reordered.
+fn gen_external_call<'ctx>(
+    ctx: &mut MirCodeGenContext<'ctx>,
+    kind: &MirExternalKind,
+    symbol: &str,
+    args: &[MirOperand],
+    ret_ty: &MirType,
+    prog: &MirProgram,
+) -> CompilerResult<BasicValueEnum<'ctx>> {
+    let i64_ty = ctx.context.i64_type();
+    let ptr_ty = ctx.context.ptr_type(inkwell::AddressSpace::default());
+
+    match kind {
+        MirExternalKind::Rust | MirExternalKind::Native => {
+            // Rust/Native: direct external symbol call.
+            let mut arg_vals: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(args.len());
+            for arg in args {
+                let v = ctx.materialize_operand(arg)?;
+                arg_vals.push(v.into());
+            }
+            let llvm_ret = mir_type_to_llvm(ctx.context, prog, ret_ty);
+            let fn_ty = llvm_ret.fn_type(
+                &arg_vals
+                    .iter()
+                    .map(|v| v.get_type().into())
+                    .collect::<Vec<_>>(),
+                false,
+            );
+            let extern_fn = ctx.module.add_function(symbol, fn_ty, None);
+            let call = ctx
+                .builder
+                .build_call(
+                    extern_fn,
+                    &arg_vals
+                        .iter()
+                        .map(|v| (*v).into())
+                        .collect::<Vec<_>>(),
+                    "ext_call",
+                )
+                .map_err(|e| CompilerError::codegen(format!("failed to emit external call to '{}': {}", symbol, e)))?;
+            let result = call.try_as_basic_value();
+            if result.is_basic() {
+                Ok(result.basic().unwrap_or_else(|| {
+                    i64_ty.const_int(0, true).as_basic_value_enum()
+                }))
+            } else {
+                // Unit return: emit a zero value.
+                Ok(i64_ty.const_int(0, true).as_basic_value_enum())
+            }
+        }
+        MirExternalKind::Python => {
+            // Python: call the runtime bridge helper `sat_py_call_flat`
+            // with parallel int32 (kinds) / int64 (values) arrays. The
+            // result is read from the `out` struct.
+            let mut arg_vals: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(args.len());
+            for arg in args {
+                let v = ctx.materialize_operand(arg)?;
+                arg_vals.push(v.into());
+            }
+
+            // The Python spec is "module::func". The `symbol` field of the
+            // external declaration is the module-qualified function name.
+            let spec_ptr = ctx
+                .builder
+                .build_global_string_ptr(symbol, "py_spec")
+                .map_err(|e| CompilerError::codegen(format!("failed to emit Python spec: {}", e)))?;
+            let search_ptr = ctx
+                .builder
+                .build_global_string_ptr("", "py_search")
+                .map_err(|e| CompilerError::codegen(format!("failed to emit Python search path: {}", e)))?;
+
+            // Build parallel kinds/values arrays on the stack.
+            let kinds_alloca = ctx
+                .builder
+                .build_alloca(ctx.context.i32_type(), "py_kinds")
+                .map_err(|e| CompilerError::codegen(format!("failed to allocate py kinds: {}", e)))?;
+            let values_alloca = ctx
+                .builder
+                .build_alloca(i64_ty, "py_values")
+                .map_err(|e| CompilerError::codegen(format!("failed to allocate py values: {}", e)))?;
+            for (i, v) in arg_vals.iter().enumerate() {
+                let kind = match v {
+                    BasicValueEnum::IntValue(iv) => {
+                        if iv.get_type().get_bit_width() == 1 {
+                            SAT_PY_BOOL
+                        } else {
+                            SAT_PY_I64
+                        }
+                    }
+                    BasicValueEnum::FloatValue(_) => SAT_PY_F64,
+                    _ => SAT_PY_NONE,
+                };
+                let kind_slot = unsafe {
+                    ctx.builder
+                        .build_gep(
+                            ctx.context.i32_type(),
+                            kinds_alloca,
+                            &[i64_ty.const_int(i as u64, false)],
+                            &format!("py_kind_{}", i),
+                        )
+                        .map_err(|e| CompilerError::codegen(format!("failed to gep py kind: {}", e)))?
+                };
+                ctx.builder
+                    .build_store(kind_slot, ctx.context.i32_type().const_int(kind as u64, false))
+                    .map_err(|e| CompilerError::codegen(format!("failed to store py kind: {}", e)))?;
+
+                let v_i64 = match v {
+                    BasicValueEnum::IntValue(iv) => *iv,
+                    BasicValueEnum::FloatValue(fv) => ctx
+                        .builder
+                        .build_bit_cast(*fv, i64_ty, "py_arg_f2i")
+                        .map_err(|e| CompilerError::codegen(format!("failed to bitcast py arg: {}", e)))?
+                        .into_int_value(),
+                    other => other.into_int_value(),
+                };
+                let val_slot = unsafe {
+                    ctx.builder
+                        .build_gep(
+                            i64_ty,
+                            values_alloca,
+                            &[i64_ty.const_int(i as u64, false)],
+                            &format!("py_val_{}", i),
+                        )
+                        .map_err(|e| CompilerError::codegen(format!("failed to gep py val: {}", e)))?
+                };
+                ctx.builder
+                    .build_store(val_slot, v_i64)
+                    .map_err(|e| CompilerError::codegen(format!("failed to store py val: {}", e)))?;
+            }
+
+            // The `sat_py_result` struct layout (must match pyrt.h):
+            //   bool ok, i32 kind, i64 union, i64 str_len, ptr err_class,
+            //   ptr err_message, ptr handle
+            let sat_py_result_ty = ctx.context.struct_type(
+                &[
+                    ctx.context.bool_type().into(), // ok
+                    ctx.context.i32_type().into(), // kind
+                    ctx.context.i64_type().into(), // union
+                    ctx.context.i64_type().into(), // str_len
+                    ptr_ty.into(), // error_class
+                    ptr_ty.into(), // error_message
+                    ptr_ty.into(), // handle
+                ],
+                false,
+            );
+
+            let out_alloca = ctx
+                .builder
+                .build_alloca(sat_py_result_ty, "py_out")
+                .map_err(|e| CompilerError::codegen(format!("failed to allocate py out: {}", e)))?;
+            // Zero-initialize the result struct so all fields start clean.
+            ctx.builder
+                .build_store(out_alloca, sat_py_result_ty.const_zero())
+                .map_err(|e| CompilerError::codegen(format!("failed to zero py out: {}", e)))?;
+
+            let call_fn_ty = ptr_ty.fn_type(
+                &[
+                    ptr_ty.into(), // spec
+                    ptr_ty.into(), // search_path
+                    ptr_ty.into(), // kinds
+                    ptr_ty.into(), // values
+                    i64_ty.into(), // arg_count
+                    ptr_ty.into(), // out
+                ],
+                false,
+            );
+            let call_fn = ctx.module.add_function("sat_py_call_flat", call_fn_ty, None);
+            let call = ctx
+                .builder
+                .build_call(
+                    call_fn,
+                    &[
+                        spec_ptr.as_basic_value_enum().into(),
+                        search_ptr.as_basic_value_enum().into(),
+                        kinds_alloca.as_basic_value_enum().into(),
+                        values_alloca.as_basic_value_enum().into(),
+                        i64_ty.const_int(arg_vals.len() as u64, false).as_basic_value_enum().into(),
+                        out_alloca.as_basic_value_enum().into(),
+                    ],
+                    "py_call",
+                )
+                .map_err(|e| CompilerError::codegen(format!("failed to emit sat_py_call_flat: {}", e)))?;
+
+            // Read the result union field (index 2) out of the struct.
+            // inkwell requires an aggregate *value* (not the call site) for
+            // `build_extract_value`, so load the struct back from the alloca.
+            let out_loaded = ctx
+                .builder
+                .build_load(sat_py_result_ty, out_alloca, "py_out_val")
+                .map_err(|e| CompilerError::codegen(format!("failed to load py out: {}", e)))?;
+            let result_val = ctx
+                .builder
+                .build_extract_value(
+                    out_loaded.into_struct_value(),
+                    2,
+                    "py_val",
+                )
+                .map_err(|e| CompilerError::codegen(format!("failed to extract py_val: {}", e)))?;
+
+            // If the call failed, the runtime leaves the value field zero-
+            // initialized (we zero the struct before the call), so the
+            // result is well-defined even on failure.
+            Ok(result_val)
+        }
+    }
+}
+
 /// Convert a `MirType` to an LLVM `BasicTypeEnum`.
 pub fn mir_type_to_llvm<'ctx>(
     ctx: &'ctx LLVMContext,
@@ -1044,7 +1278,7 @@ pub fn compile_from_mir_ext(
                 emitter.emit_object(&obj_path)?;
             }
             let lk = Linker::new(&target_config);
-            lk.link(&obj_path, output_path)?;
+            lk.link_with_externals(&obj_path, output_path, &mir.external_libraries)?;
             if !save_temps {
                 let _ = std::fs::remove_file(&obj_path);
             }

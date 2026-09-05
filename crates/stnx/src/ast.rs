@@ -102,6 +102,41 @@ pub enum ItemKind {
     /// `main:` — 0.5 entry-point block. Lowered to a synthetic `Function`
     /// named `main` with empty parameters and `i64` return type.
     MainBlock(Vec<Stmt>, Range<usize>),
+    /// `external <kind> "<ecosystem>" "<symbol>"(params) -> ret` — declares
+    /// a foreign function call across an interoperability boundary.
+    ///
+    /// The declaration is explicit metadata: the compiler records the
+    /// ecosystem name, the foreign symbol, the ABI-safe parameter types, and
+    /// the return type. It does NOT parse arbitrary foreign source. The
+    /// runtime bridge resolves the symbol at link/runtime time.
+    ///
+    /// `kind` is one of `rust`, `python`, or `native` (case-sensitive).
+    ExternalFunction {
+        kind: ExternalKind,
+        /// The foreign ecosystem name: a Rust crate name, a Python module
+        /// name, or a native library name.
+        ecosystem: String,
+        /// The foreign symbol to bind to. For Rust/Native this is the
+        /// link-time symbol; for Python this is the module-qualified
+        /// function name.
+        symbol: String,
+        /// Parameters in declaration order.
+        params: Vec<(String, Type)>,
+        /// Return type.
+        return_type: Type,
+        span: Range<usize>,
+    },
+}
+
+/// The runtime kind of an `external` declaration.
+///
+/// Rust and Python are kept as separate bridges (per the campaign rules);
+/// `Native` is the path for plain C-ABI shared libraries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExternalKind {
+    Rust,
+    Python,
+    Native,
 }
 
 #[derive(Clone, Debug)]

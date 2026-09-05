@@ -130,6 +130,45 @@ pub struct HirModDecl {
     pub span: SourceSpan,
 }
 
+/// A lowered `external` declaration: an explicit foreign function call
+/// across an interoperability boundary.
+///
+/// The declaration is declarative: it records the runtime kind, the
+/// ecosystem name, the foreign symbol, the ABI-safe parameter types, and
+/// the return type. It does NOT parse arbitrary foreign source. The runtime
+/// bridge resolves the symbol at link/runtime time.
+///
+/// Rust and Python remain separate bridges (per the campaign rules);
+/// `Native` is the path for plain C-ABI shared libraries.
+#[derive(Debug, Clone)]
+pub struct HirExternalFunction {
+    /// The `DefId` assigned to this declaration during lowering. External
+    /// functions are registered in the function signature table after the
+    /// regular functions, so their `DefId`s are distinct from builtin
+    /// sentinels.
+    pub def_id: DefId,
+    /// The runtime kind (Rust / Python / Native).
+    pub kind: crate::ast::ExternalKind,
+    /// The foreign ecosystem name: a Rust crate name, a Python module
+    /// name, or a native library name.
+    pub ecosystem: String,
+    /// The foreign symbol to bind to. For Rust/Native this is the link-time
+    /// symbol; for Python this is the module-qualified function name.
+    pub symbol: String,
+    /// The interned symbol name (used as the call-site lookup key).
+    pub name: SymbolId,
+    /// Interned parameter names in declaration order.
+    pub param_names: Vec<SymbolId>,
+    /// Parameter types in declaration order.
+    pub param_types: Vec<HirType>,
+    /// Return type.
+    pub return_type: HirType,
+    /// Source span.
+    pub span: SourceSpan,
+    /// The module that owns this declaration.
+    pub module: ModuleId,
+}
+
 /// The top-level HIR program. Contains all lowered functions, struct
 /// definitions, enum definitions, the shared symbol table that
 /// maps [`SymbolId`] → `&str`, and module metadata.
@@ -139,6 +178,9 @@ pub struct HirProgram {
     pub structs: Vec<StructDef>,
     pub enums: Vec<EnumDef>,
     pub symbols: SymbolInterner,
+    /// All `external` declarations encountered during lowering, indexed
+    /// by their `DefId` (which is `functions.len() + index`).
+    pub external_functions: Vec<HirExternalFunction>,
     // --- new for modules ---
     /// All discovered modules (indexed by `ModuleId.0`).
     pub modules: Vec<Module>,

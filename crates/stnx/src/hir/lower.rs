@@ -11,7 +11,9 @@ use crate::ast::{
 };
 use crate::error::{CompilerError, CompilerResult};
 use crate::hir::expr::{HirExpr, HirExprKind};
-use crate::hir::function::{EnumDef, HirFunction, HirModDecl, HirProgram, HirUseDecl, StructDef};
+use crate::hir::function::{
+    EnumDef, HirExternalFunction, HirFunction, HirModDecl, HirProgram, HirUseDecl, StructDef,
+};
 use crate::hir::stmt::{HirStmt, HirStmtKind};
 use crate::hir::symbol::{
     DefEntry, DefId, DefKind, DefTable, SymbolId, SymbolInterner, Visibility as HirVisibility,
@@ -27,6 +29,16 @@ fn span_to_source_span(r: &std::ops::Range<usize>) -> SourceSpan {
 }
 
 /// Convert an AST [`Visibility`] to the HIR [`HirVisibility`].
+/// Whether a `HirType` is in the ABI-safe subset supported by external
+/// calls. Complex types (Str, Struct, Enum, List, Generic, Apply) are
+/// rejected at declaration time so an unsafe bridge can never be built.
+fn is_abi_safe(ty: &HirType) -> bool {
+    matches!(
+        ty,
+        HirType::I64 | HirType::F64 | HirType::Bool | HirType::Unit
+    )
+}
+
 fn ast_visibility_to_hir(vis: &Visibility) -> HirVisibility {
     match vis {
         Visibility::Private => HirVisibility::Private,
@@ -370,6 +382,14 @@ impl HirLower {
                     // `fn main() -> i64 { ... }`. Synthesised in a second
                     // pass below.
                 }
+                ItemKind::ExternalFunction { .. } => {
+                    // External declarations are processed in the function
+                    // signature pass below.
+                }
+                ItemKind::ExternalFunction { .. } => {
+                    // External declarations are processed in the function
+                    // signature pass below.
+                }
             }
         }
 
@@ -500,6 +520,79 @@ impl HirLower {
                         generic_params: gparams,
                     },
                 );
+                next_func_def_id += 1;
+            }
+        }
+        // Register external declarations in the function signature table.
+        // External functions are callable from Saturnite code by their
+        // declared symbol name; the runtime bridge resolves the symbol at
+        // link/runtime time. Their DefIds are assigned after the regular
+        // functions so they remain distinct from builtin sentinels.
+        let mut external_functions: Vec<HirExternalFunction> = Vec::new();
+        for item in &program.items {
+            if let ItemKind::ExternalFunction {
+                kind,
+                ecosystem,
+                symbol,
+                params,
+                return_type,
+                span,
+            } = &item.kind
+            {
+                let name_id = self.symbols.intern(symbol);
+                let def_id = DefId(next_func_def_id);
+                let param_types: Vec<HirType> = params
+                    .iter()
+                    .map(|(_, t)| ast_type_to_hir(t, &mut self.symbols, &enum_names, None))
+                    .collect();
+                let param_names: Vec<SymbolId> =
+                    params.iter().map(|(n, _)| self.symbols.intern(n)).collect();
+                let return_hir = ast_type_to_hir(return_type, &mut self.symbols, &enum_names, None);
+                // Validate that the declared types are ABI-safe. External
+                // calls only support the primitive ABI subset; complex types
+                // (Str, Struct, Enum, List, Generic, Apply) are rejected
+                // with a clear diagnostic rather than silently producing an
+                // unsafe bridge.
+                for (i, ty) in param_types.iter().enumerate() {
+                    if !is_abi_safe(ty) {
+                        return Err(CompilerError::semantic(format!(
+                            "external function `{}` parameter {} has type {:?}, which is not ABI-safe. \
+                             External calls only support the primitive ABI subset (i64, f64, bool).",
+                            symbol,
+                            i + 1,
+                            ty
+                        )));
+                    }
+                }
+                if !is_abi_safe(&return_hir) && !matches!(return_hir, HirType::Unit) {
+                    return Err(CompilerError::semantic(format!(
+                        "external function `{}` has return type {:?}, which is not ABI-safe. \
+                         External calls only support the primitive ABI subset (i64, f64, bool) and Unit.",
+                        symbol, return_hir
+                    )));
+                }
+                function_sigs.insert(
+                    name_id,
+                    FunctionSig {
+                        def_id,
+                        param_types: param_types.clone(),
+                        param_names: param_names.clone(),
+                        return_type: return_hir.clone(),
+                        generic_params: Vec::new(),
+                    },
+                );
+                external_functions.push(HirExternalFunction {
+                    def_id,
+                    kind: kind.clone(),
+                    ecosystem: ecosystem.clone(),
+                    symbol: symbol.clone(),
+                    name: name_id,
+                    param_names,
+                    param_types,
+                    return_type: return_hir,
+                    span: span_to_source_span(span),
+                    module: ModuleId::ROOT,
+                });
                 next_func_def_id += 1;
             }
         }
@@ -634,11 +727,24 @@ impl HirLower {
             std::path::PathBuf::from("<root>"),
         );
 
+        // Register external DefIds in the def_table and module_paths.
+        for (i, ext) in external_functions.iter().enumerate() {
+            let def_id = DefId(functions.len() as u32 + i as u32);
+            def_table.register(DefEntry {
+                module: ModuleId::ROOT,
+                local_index: i as u32,
+                kind: DefKind::External,
+            });
+            module_paths.insert(def_id, ModuleId::ROOT);
+            module_scopes[0].define_item(ext.name, def_id);
+        }
+
         Ok(HirProgram {
             functions,
             structs,
             enums,
             symbols: std::mem::take(&mut self.symbols),
+            external_functions,
             // Phase 5B: populate module-aware fields for single-file programs.
             // All items belong to the root module (ModuleId::ROOT).
             modules: vec![root_module_entry],
@@ -865,6 +971,12 @@ impl HirLower {
                     ItemKind::MainBlock(_stmts, _span) => {
                         // Synthesised in a second pass below.
                     }
+                    ItemKind::ExternalFunction { .. } => {
+                        // Handled in the signature pass below.
+                    }
+                    ItemKind::ExternalFunction { .. } => {
+                        // Handled in the signature pass below.
+                    }
                 }
             }
 
@@ -975,6 +1087,170 @@ impl HirLower {
                             generic_params: gparams,
                         },
                     );
+                    next_func_def_id += 1;
+                }
+            }
+        }
+
+        // Register external declarations in the function signature table.
+        // External functions are callable from Saturnite code by their
+        // declared symbol name; the runtime bridge resolves the symbol at
+        // link/runtime time. Their DefIds are assigned after the regular
+        // functions so they remain distinct from builtin sentinels.
+        let mut external_functions: Vec<HirExternalFunction> = Vec::new();
+        for module in &graph.modules {
+            let module_id = module.id;
+            let ast = module.ast.as_ref();
+            let ast = if ast.is_none() && module.is_root() {
+                Some(program)
+            } else {
+                ast
+            };
+            let Some(ast) = ast else {
+                continue
+            };
+            for item in &ast.items {
+                if let ItemKind::ExternalFunction {
+                    kind,
+                    ecosystem,
+                    symbol,
+                    params,
+                    return_type,
+                    span,
+                } = &item.kind
+                {
+                    let name_id = self.symbols.intern(symbol);
+                    let def_id = DefId(next_func_def_id);
+                    let param_types: Vec<HirType> = params
+                        .iter()
+                        .map(|(_, t)| ast_type_to_hir(t, &mut self.symbols, &enum_names, None))
+                        .collect();
+                    let param_names: Vec<SymbolId> =
+                        params.iter().map(|(n, _)| self.symbols.intern(n)).collect();
+                    let return_hir =
+                        ast_type_to_hir(return_type, &mut self.symbols, &enum_names, None);
+                    for (i, ty) in param_types.iter().enumerate() {
+                        if !is_abi_safe(ty) {
+                            return Err(CompilerError::semantic(format!(
+                                "external function `{}` parameter {} has type {:?}, which is not ABI-safe. \
+                                 External calls only support the primitive ABI subset (i64, f64, bool).",
+                                symbol,
+                                i + 1,
+                                ty
+                            )));
+                        }
+                    }
+                    if !is_abi_safe(&return_hir) && !matches!(return_hir, HirType::Unit) {
+                        return Err(CompilerError::semantic(format!(
+                            "external function `{}` has return type {:?}, which is not ABI-safe. \
+                             External calls only support the primitive ABI subset (i64, f64, bool) and Unit.",
+                            symbol, return_hir
+                        )));
+                    }
+                    function_sigs.insert(
+                        name_id,
+                        FunctionSig {
+                            def_id,
+                            param_types: param_types.clone(),
+                            param_names: param_names.clone(),
+                            return_type: return_hir.clone(),
+                            generic_params: Vec::new(),
+                        },
+                    );
+                    external_functions.push(HirExternalFunction {
+                        def_id,
+                        kind: kind.clone(),
+                        ecosystem: ecosystem.clone(),
+                        symbol: symbol.clone(),
+                        name: name_id,
+                        param_names,
+                        param_types,
+                        return_type: return_hir,
+                        span: span_to_source_span(span),
+                        module: module_id,
+                    });
+                    next_func_def_id += 1;
+                }
+            }
+        }
+
+        // Register external declarations in the function signature table.
+        // External functions are callable from Saturnite code by their
+        // declared symbol name; the runtime bridge resolves the symbol at
+        // link/runtime time. Their DefIds are assigned after the regular
+        // functions so they remain distinct from builtin sentinels.
+        let mut external_functions: Vec<HirExternalFunction> = Vec::new();
+        for module in &graph.modules {
+            let module_id = module.id;
+            let ast = module.ast.as_ref();
+            let ast = if ast.is_none() && module.is_root() {
+                Some(program)
+            } else {
+                ast
+            };
+            let Some(ast) = ast else {
+                continue
+            };
+            for item in &ast.items {
+                if let ItemKind::ExternalFunction {
+                    kind,
+                    ecosystem,
+                    symbol,
+                    params,
+                    return_type,
+                    span,
+                } = &item.kind
+                {
+                    let name_id = self.symbols.intern(symbol);
+                    let def_id = DefId(next_func_def_id);
+                    let param_types: Vec<HirType> = params
+                        .iter()
+                        .map(|(_, t)| ast_type_to_hir(t, &mut self.symbols, &enum_names, None))
+                        .collect();
+                    let param_names: Vec<SymbolId> =
+                        params.iter().map(|(n, _)| self.symbols.intern(n)).collect();
+                    let return_hir =
+                        ast_type_to_hir(return_type, &mut self.symbols, &enum_names, None);
+                    for (i, ty) in param_types.iter().enumerate() {
+                        if !is_abi_safe(ty) {
+                            return Err(CompilerError::semantic(format!(
+                                "external function `{}` parameter {} has type {:?}, which is not ABI-safe. \
+                                 External calls only support the primitive ABI subset (i64, f64, bool).",
+                                symbol,
+                                i + 1,
+                                ty
+                            )));
+                        }
+                    }
+                    if !is_abi_safe(&return_hir) && !matches!(return_hir, HirType::Unit) {
+                        return Err(CompilerError::semantic(format!(
+                            "external function `{}` has return type {:?}, which is not ABI-safe. \
+                             External calls only support the primitive ABI subset (i64, f64, bool) and Unit.",
+                            symbol, return_hir
+                        )));
+                    }
+                    function_sigs.insert(
+                        name_id,
+                        FunctionSig {
+                            def_id,
+                            param_types: param_types.clone(),
+                            param_names: param_names.clone(),
+                            return_type: return_hir.clone(),
+                            generic_params: Vec::new(),
+                        },
+                    );
+                    external_functions.push(HirExternalFunction {
+                        def_id,
+                        kind: kind.clone(),
+                        ecosystem: ecosystem.clone(),
+                        symbol: symbol.clone(),
+                        name: name_id,
+                        param_names,
+                        param_types,
+                        return_type: return_hir,
+                        span: span_to_source_span(span),
+                        module: module_id,
+                    });
                     next_func_def_id += 1;
                 }
             }
@@ -1134,6 +1410,22 @@ impl HirLower {
             mod_decl_idx += 1;
         }
 
+        // Register external DefIds in the def_table, module_paths, and module
+        // scopes. Their DefIds are assigned after the regular functions so
+        // they remain distinct from builtin sentinels.
+        for (i, ext) in external_functions.iter().enumerate() {
+            let def_id = DefId(functions.len() as u32 + i as u32);
+            def_table.register(DefEntry {
+                module: ext.module,
+                local_index: i as u32,
+                kind: DefKind::External,
+            });
+            module_paths.insert(def_id, ext.module);
+            if let Some(scope) = module_scopes.get_mut(ext.module.0 as usize) {
+                scope.define_item(ext.name, def_id);
+            }
+        }
+
         // Phase 4: build the module vec from the graph.
         let modules: Vec<Module> = graph.modules.clone();
 
@@ -1142,6 +1434,7 @@ impl HirLower {
             structs,
             enums,
             symbols: std::mem::take(&mut self.symbols),
+            external_functions,
             modules,
             root_module: ModuleId::ROOT,
             module_paths,

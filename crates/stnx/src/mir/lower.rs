@@ -21,8 +21,8 @@ use crate::hir::stmt::{HirStmt, HirStmtKind};
 use crate::hir::symbol::{DefId, SymbolId};
 use crate::hir::types::HirType;
 use crate::mir::{
-    BlockId, LocalId, MirBasicBlock, MirBinOp, MirConst, MirFunction, MirLocal, MirOperand,
-    MirProgram, MirRvalue, MirStmt, MirStmtKind, MirTerminator, MirType,
+    BlockId, LocalId, MirBasicBlock, MirBinOp, MirConst, MirExternalKind, MirFunction, MirLocal,
+    MirOperand, MirProgram, MirRvalue, MirStmt, MirStmtKind, MirTerminator, MirType,
 };
 
 /// `DefId` sentinel for the builtin `println` function.
@@ -43,6 +43,14 @@ pub fn lower_program(hir: &HirProgram) -> CompilerResult<MirProgram> {
         let param_types: Vec<HirType> = func.params.iter().map(|(_, t)| t.clone()).collect();
         sigs.insert(func.def_id, (param_types, func.return_type.clone()));
     }
+    // Register external declarations in the signature table so call sites
+    // can look up their ABI-safe return type by DefId.
+    for ext in &hir.external_functions {
+        sigs.insert(
+            ext.def_id,
+            (ext.param_types.clone(), ext.return_type.clone()),
+        );
+    }
 
     let mut funcs = Vec::new();
     for func in &hir.functions {
@@ -50,11 +58,32 @@ pub fn lower_program(hir: &HirProgram) -> CompilerResult<MirProgram> {
         funcs.push(lower.lower_function()?);
     }
 
+    // Collect the distinct declared external libraries so the build system
+    // can link their artifacts into the final executable.
+    let mut external_libraries: Vec<crate::mir::ExternalLibrary> = Vec::new();
+    for ext in &hir.external_functions {
+        let kind = match ext.kind {
+            crate::ast::ExternalKind::Rust => MirExternalKind::Rust,
+            crate::ast::ExternalKind::Python => MirExternalKind::Python,
+            crate::ast::ExternalKind::Native => MirExternalKind::Native,
+        };
+        // All external kinds are tracked. Python needs the Python library
+        // linked (-lpython, -lpthread, etc.) even though it has no
+        // link-time staticlib artifact of its own.
+        if !external_libraries.iter().any(|l| l.name == ext.ecosystem) {
+            external_libraries.push(crate::mir::ExternalLibrary {
+                name: ext.ecosystem.clone(),
+                kind,
+            });
+        }
+    }
+
     Ok(MirProgram {
         functions: funcs,
         symbols: hir.symbols.clone(),
         structs: hir.structs.clone(),
         enums: hir.enums.clone(),
+        external_libraries,
     })
 }
 
@@ -449,6 +478,15 @@ impl<'hir> MirLower<'hir> {
                 // and the explicit turbofish has been folded into the
                 // substituted callee's signature. We only need the
                 // resolved DefId here.
+                //
+                // If the callee is an `external` declaration, lower it as
+                // an `ExternalCall` rvalue rather than a normal call
+                // terminator. External calls are value-producing (they
+                // write their result into a destination local), so they
+                // fit naturally in the rvalue position.
+                if let Some(ext) = self.hir.external_functions.iter().find(|e| e.def_id == *def_id) {
+                    return self.lower_external_call(ext, args, expr.ty.clone());
+                }
                 self.lower_call(*def_id, args, expr.ty.clone())
             }
 
@@ -668,6 +706,57 @@ impl<'hir> MirLower<'hir> {
             next,
         });
         self.switch_to(next);
+
+        Ok(MirOperand::Local(dest))
+    }
+
+    /// Lower an `external` call as a value-producing rvalue.
+    ///
+    /// Arguments are lowered left-to-right (preserving Saturnite's normal
+    /// evaluation order), then the result is written into a destination
+    /// local via an `ExternalCall` rvalue. Unlike ordinary calls, external
+    /// calls are not terminators: the runtime bridge resolves the symbol
+    /// at link/runtime time and the result flows into the continuation
+    /// block normally.
+    fn lower_external_call(
+        &mut self,
+        ext: &crate::hir::function::HirExternalFunction,
+        args: &[HirExpr],
+        result_ty: MirType,
+    ) -> CompilerResult<MirOperand> {
+        let mut arg_ops: Vec<MirOperand> = Vec::with_capacity(args.len());
+        for arg in args {
+            arg_ops.push(self.lower_expr(arg)?);
+        }
+
+        let ret_ty = ext.return_type.clone();
+
+        let dest = self.new_local(ret_ty.clone(), self.temp_symbol, false);
+        self.emit(MirStmtKind::LocalDecl {
+            local: dest,
+            ty: ret_ty.clone(),
+            mutable: false,
+        });
+        // For Python externals, the symbol must be "module::function"
+        // so that sat_py_call_flat can split it correctly.
+        let codegen_symbol = if ext.kind == crate::ast::ExternalKind::Python {
+            format!("{}::{}", ext.ecosystem, ext.symbol)
+        } else {
+            ext.symbol.clone()
+        };
+        self.emit(MirStmtKind::Assign {
+            local: dest,
+            rvalue: MirRvalue::ExternalCall {
+                kind: match ext.kind {
+                    crate::ast::ExternalKind::Rust => MirExternalKind::Rust,
+                    crate::ast::ExternalKind::Python => MirExternalKind::Python,
+                    crate::ast::ExternalKind::Native => MirExternalKind::Native,
+                },
+                symbol: codegen_symbol,
+                args: arg_ops,
+                ret_ty,
+            },
+        });
 
         Ok(MirOperand::Local(dest))
     }

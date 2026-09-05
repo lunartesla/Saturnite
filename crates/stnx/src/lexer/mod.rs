@@ -74,6 +74,8 @@ pub enum LexicalToken {
     Text,
     #[token("number")]
     Number,
+    #[token("external")]
+    External,
 
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
@@ -282,6 +284,7 @@ fn convert(lt: LexicalToken) -> TokenKind {
         LexicalToken::Comma => TokenKind::Comma,
         LexicalToken::Colon => TokenKind::Colon,
         LexicalToken::RArrow => TokenKind::RArrow,
+        LexicalToken::External => TokenKind::External,
         LexicalToken::Error => TokenKind::Error,
     }
 }

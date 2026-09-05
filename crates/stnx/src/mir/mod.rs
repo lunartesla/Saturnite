@@ -180,11 +180,37 @@ impl From<AugOp> for MirBinOp {
 // Rvalues
 // ---------------------------------------------------------------------------
 
+/// The runtime kind of an external call. Mirrors
+/// [`crate::ast::ExternalKind`] so the MIR/codegen stages can dispatch on
+/// the runtime bridge without re-deriving it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MirExternalKind {
+    Rust,
+    Python,
+    Native,
+}
+
 /// A value-producing computation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MirRvalue {
     /// Copy/clone an operand into a local.
     Use(MirOperand),
+    /// An external call across an interoperability boundary.
+    ///
+    /// `kind` selects the runtime bridge; `symbol` is the foreign symbol
+    /// (link-time symbol for Rust/Native, module-qualified function name
+    /// for Python); `args` are the already-lowered operands; `ret_ty` is
+    /// the declared return type.
+    ///
+    /// Rust/Native calls are emitted as LLVM `call` to an external
+    /// declaration; Python calls are emitted as calls to the `sat_py_*`
+    /// runtime bridge functions.
+    ExternalCall {
+        kind: MirExternalKind,
+        symbol: String,
+        args: Vec<MirOperand>,
+        ret_ty: MirType,
+    },
     /// Binary operation on two operands.
     Binary {
         op: MirBinOp,
@@ -337,6 +363,22 @@ pub struct MirProgram {
     pub structs: Vec<StructDef>,
     /// Enum definitions (needed for enum tag resolution in codegen).
     pub enums: Vec<EnumDef>,
+    /// Declared external libraries that must be linked into the final
+    /// executable. Each entry is the *library name* from an `external`
+    /// declaration (e.g. `saturnite_interop` for
+    /// `external rust "saturnite_interop" ...`), plus the runtime kind so
+    /// the linker/build system can locate the right artifact
+    /// (`lib<name>.a` for Rust, `lib<name>.so` for Native).
+    pub external_libraries: Vec<ExternalLibrary>,
+}
+
+/// A declared external library that must be linked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalLibrary {
+    /// The declared ecosystem/library name.
+    pub name: String,
+    /// The runtime kind (determines the artifact type to link).
+    pub kind: MirExternalKind,
 }
 
 impl MirProgram {

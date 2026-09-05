@@ -196,7 +196,9 @@ fn item<'a>() -> impl Parser<'a, &'a [Token], Item, ParserExtra<'a>> {
                 // use declaration: use <path> [as <alias>]
                 .or(use_decl().map(|(name, kind, span)| (name, kind, span)))
                 // 0.5 native module declaration: module <ident> (advisory)
-                .or(module_decl().map(|(name, span)| (name.clone(), ItemKind::ModuleDecl, span))),
+                .or(module_decl().map(|(name, span)| (name.clone(), ItemKind::ModuleDecl, span)))
+                // external declaration: external rust|python|native "eco" "sym"(params) -> ret
+                .or(external_decl()),
         )
         .map(|(vis, (name, kind, span))| Item {
             name,
@@ -269,6 +271,59 @@ fn module_decl<'a>() -> impl Parser<'a, &'a [Token], (String, Range<usize>), Par
     kw_span("module")
         .ignore_then(t_ident())
         .map(|(name, span)| (name, span))
+}
+
+/// Match a string-literal token and return its inner value and span.
+fn str_lit<'a>() -> impl Parser<'a, &'a [Token], (String, Range<usize>), ParserExtra<'a>> {
+    any::<&[Token], _>()
+        .filter(|t: &Token| matches!(&t.kind, TokenKind::StrLit(_)))
+        .map(|t| match &t.kind {
+            TokenKind::StrLit(s) => (s.clone(), t.span.clone()),
+            _ => unreachable!(),
+        })
+}
+
+/// Parse an `external` declaration:
+///
+/// ```text
+/// external rust "crate_name" "symbol_name"(param: type, ...) -> ret
+/// external python "module_name" "function_name"(param: type, ...) -> ret
+/// external native "library_name" "symbol_name"(param: type, ...) -> ret
+/// ```
+///
+/// The declaration is explicit metadata: the compiler records the runtime
+/// kind, the ecosystem name, the foreign symbol, the parameter types, and
+/// the return type. It does NOT parse arbitrary foreign source.
+fn external_decl<'a>() -> impl Parser<'a, &'a [Token], (String, ItemKind, Range<usize>), ParserExtra<'a>> {
+    let kind = kw("rust")
+        .to(ExternalKind::Rust)
+        .or(kw("python").to(ExternalKind::Python))
+        .or(kw("native").to(ExternalKind::Native));
+    // Capture the `external` keyword span so the declaration span covers the
+    // whole declaration. `then` keeps both sides; we discard the kind value
+    // but keep its span via the outer `kw_span("external")` result.
+    kw_span("external")
+        .then(kind)
+        .then(str_lit())
+        .then(str_lit())
+        .then(params())
+        .then(ret_type())
+        .map(|((((((ext_span, _kind), (ecosystem, _eco_span)), (symbol, sym_span)), params), ret_type))| {
+            let span = ext_span.start..sym_span.end;
+            let name = symbol.clone();
+            (
+                name,
+                ItemKind::ExternalFunction {
+                    kind: _kind,
+                    ecosystem,
+                    symbol,
+                    params,
+                    return_type: ret_type,
+                    span: span.clone(),
+                },
+                span,
+            )
+        })
 }
 
 /// Parse a `use foo::bar::baz` declaration (no semicolon, with optional `as alias`).
@@ -1283,7 +1338,8 @@ fn kw_span<'a>(k: &'a str) -> Boxed<'a, 'a, &'a [Token], Range<usize>, ParserExt
                     | (TokenKind::Raise, "raise")
                     | (TokenKind::Text, "text")
                     | (TokenKind::Number, "number")
-            )
+                    | (TokenKind::External, "external"),
+            ) || matches!(&t.kind, TokenKind::Ident(s) if s == k)
         })
         .map(|t| t.span.clone())
         .boxed()
@@ -1332,6 +1388,7 @@ fn is_keyword(s: &str) -> bool {
             | "raise"
             | "text"
             | "number"
+            | "external"
     )
 }
 
