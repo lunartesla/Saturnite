@@ -61,7 +61,8 @@
       "Bash(/tmp/hello)",
       "Bash(claude *)",
       "Bash(npm ls *)",
-      "Bash(npm -g config get prefix)"
+      "Bash(npm -g config get prefix)",
+      "Bash(ls docs/PHASE9_*.md)"
     ],
     "additionalDirectories": [
       "/home/kali/saturn/rust"
