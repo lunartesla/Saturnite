@@ -1,3 +1,4 @@
+
 [workspace]
 members = ["crates/stnx"]
 resolver = "3"
@@ -6,12 +7,12 @@ resolver = "3"
 edition = "2021"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/saturnite-lang/stnx"
+repository = "https://github.com/lunartesla/Saturnite"
 
 [workspace.dependencies]
 logos = "0.16"
 chumsky = "0.13"
-inkwell = { version = "0.9", features = ["llvm21-1-prefer-dynamic"] }
+inkwell = { version = "0.9", default-features = false, features = ["llvm21-1-prefer-dynamic", "target-x86"] }
 miette = { version = "7", features = ["fancy"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
@@ -21,3 +22,4 @@ anyhow = "1"
 which = "5"
 cc = "1"
 tempfile = "3"
+
