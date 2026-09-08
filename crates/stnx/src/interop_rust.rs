@@ -7,9 +7,16 @@ use crate::interop::DependencyKind;
 /// Supported ABI primitive types for the Rust interoperability boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AbiPrimitive {
-    I8, I16, I32, I64,
-    U8, U16, U32, U64,
-    F32, F64,
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F32,
+    F64,
     Bool,
     Pointer,
 }

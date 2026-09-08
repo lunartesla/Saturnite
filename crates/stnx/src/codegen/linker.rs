@@ -56,7 +56,9 @@ impl<'cfg> Linker<'cfg> {
         // append them to the link line (after the runtime object so their
         // symbols are available).
         // Track if we have Python externals (need -lpython and -lpthread)
-        let has_python = externals.iter().any(|e| e.kind == crate::mir::MirExternalKind::Python);
+        let has_python = externals
+            .iter()
+            .any(|e| e.kind == crate::mir::MirExternalKind::Python);
 
         for ext in externals {
             match self.resolve_external_library(ext, output_path) {
@@ -140,11 +142,17 @@ impl<'cfg> Linker<'cfg> {
             args.push("-lm".to_string());
         }
 
+        let has_python = externals
+            .iter()
+            .any(|e| e.kind == crate::mir::MirExternalKind::Python);
+
         let linker_name = linker_cmd.first().map(|s| s.as_str()).unwrap_or("cc");
 
-        // Use `which` to locate the linker on PATH before spawning.
-        // If unavailable, fail with a clear diagnostic.
-        let linker_path = which::which(linker_name).map_err(|_| {
+        // Locate the linker binary. On Windows MSVC, `which::which` may find
+        // an MSYS2/MinGW `link.exe` (`/usr/bin/link.exe`) instead of the real
+        // MSVC linker — which doesn't understand MSVC-style `/DEFAULTLIB:` flags.
+        // Use `vswhere` to find the VS installation's `link.exe` first.
+        let linker_path = resolve_linker_path(linker_name, os, env).map_err(|_| {
             LinkError::linker_not_found(format!(
                 "{} (searched PATH for {:?})\n\
                  Target platform: {} with {} environment.\n\
@@ -173,13 +181,17 @@ impl<'cfg> Linker<'cfg> {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let details = if stderr.is_empty() && !stdout.is_empty() {
+                Some(stdout)
+            } else if stderr.is_empty() {
+                None
+            } else {
+                Some(stderr)
+            };
             return Err(LinkError::linking_failed(
                 output_path.display().to_string(),
-                if stderr.is_empty() {
-                    None
-                } else {
-                    Some(stderr)
-                },
+                details,
             ));
         }
 
@@ -202,7 +214,10 @@ impl<'cfg> Linker<'cfg> {
             crate::mir::MirExternalKind::Rust => vec![format!("lib{}.a", ext.name)],
             crate::mir::MirExternalKind::Native => match self.target_config.os() {
                 OperatingSystem::Darwin => {
-                    vec![format!("lib{}.dylib", ext.name), format!("lib{}.so", ext.name)]
+                    vec![
+                        format!("lib{}.dylib", ext.name),
+                        format!("lib{}.so", ext.name),
+                    ]
                 }
                 _ => vec![format!("lib{}.so", ext.name)],
             },
@@ -231,10 +246,7 @@ impl<'cfg> Linker<'cfg> {
                 // Rust wrapper crates are also searched as nested rustc
                 // build outputs: <dir>/<name>/target/release/lib<name>.a
                 if ext.kind == crate::mir::MirExternalKind::Rust {
-                    let nested = dir
-                        .join(&ext.name)
-                        .join("target/release")
-                        .join(file_name);
+                    let nested = dir.join(&ext.name).join("target/release").join(file_name);
                     searched.push_str(&format!("  {}\n", nested.display()));
                     if nested.is_file() {
                         return Ok(nested);
@@ -278,23 +290,56 @@ impl<'cfg> Linker<'cfg> {
                 // PIC object + non-PIE executable. The runtime object was built
                 // without PIE, so we must link with `-no-pie` to avoid
                 // "R_X86_64_32 against `.rodata' can not be used when making a PIE object".
-                vec![obj_str, "-o".to_string(), output_str, runtime_str, "-no-pie".to_string()]
-            }
-            (OperatingSystem::Windows, Environment::Msvc) => {
                 vec![
                     obj_str,
-                    format!("/OUT:{}", output_str),
-                    format!("/DEFAULTLIB:{}", runtime_str),
+                    "-o".to_string(),
+                    output_str,
+                    runtime_str,
+                    "-no-pie".to_string(),
                 ]
             }
+            (OperatingSystem::Windows, Environment::Msvc) => {
+                let mut args = vec![
+                    obj_str,
+                    format!("/OUT:{}", output_str),
+                    runtime_str,
+                    "/SUBSYSTEM:CONSOLE".to_string(),
+                    // Request the CRT libs so the linker resolves
+                    // mainCRTStartup and the C runtime symbols. The runtime C
+                    // code is compiled with the /MD default CRT (dynamic
+                    // linking), so we need the shared CRT and UCRT libs.
+                    "/DEFAULTLIB:msvcrt".to_string(),
+                    "/DEFAULTLIB:ucrt".to_string(),
+                    "/DEFAULTLIB:vcruntime".to_string(),
+                ];
+                // Add MSVC CRT and Windows SDK lib paths so the linker can
+                // find system libraries (libcmt, ucrt, etc.) without the LIB
+                // environment variable being set.
+                for dir in find_msvc_lib_dirs() {
+                    args.push(format!("/LIBPATH:{}", dir.display()));
+                }
+                args
+            }
             (OperatingSystem::Windows, Environment::Gnu) => {
-                vec![obj_str, "-o".to_string(), output_str, runtime_str, "-no-pie".to_string()]
+                vec![
+                    obj_str,
+                    "-o".to_string(),
+                    output_str,
+                    runtime_str,
+                    "-no-pie".to_string(),
+                ]
             }
             (OperatingSystem::Windows, _) => {
                 vec![obj_str, format!("/OUT:{}", output_str), runtime_str]
             }
             _ => {
-                vec![obj_str, "-o".to_string(), output_str, runtime_str, "-no-pie".to_string()]
+                vec![
+                    obj_str,
+                    "-o".to_string(),
+                    output_str,
+                    runtime_str,
+                    "-no-pie".to_string(),
+                ]
             }
         }
     }
@@ -307,8 +352,9 @@ pub fn check_linker_available(target_config: &TargetConfig) -> Result<(), Compil
     let linker = Linker::new(target_config);
     let linker_name = linker.select_linker(os, env)[0].clone();
 
-    // Use `which` to verify the linker binary is discoverable on PATH.
-    match which::which(&linker_name) {
+    // Resolve the linker path — on Windows MSVC, this may use `vswhere`
+    // to find the real MSVC `link.exe` (not the MSYS2 shim).
+    match resolve_linker_path(&linker_name, os, env) {
         Ok(path) => {
             // MSVC's `link.exe` uses `/?` for help; all others accept `--version`.
             let check_arg = match (os, env) {
@@ -351,6 +397,163 @@ pub fn check_linker_available(target_config: &TargetConfig) -> Result<(), Compil
             linker_name, linker_name
         )))),
     }
+}
+
+/// Locate a linker binary by name, with Windows MSVC special handling.
+///
+/// On Windows with the MSVC environment, `which::which("link.exe")` can find an
+/// MSYS2/MinGW `link.exe` at `/usr/bin/link.exe` instead of the real MSVC linker.
+/// The MSYS2 linker doesn't understand MSVC-style `/DEFAULTLIB:` flags. This
+/// function uses `vswhere` to find the Visual Studio installation's `link.exe`
+/// first, falling back to `which` if that fails.
+fn resolve_linker_path(
+    name: &str,
+    os: &OperatingSystem,
+    env: &Environment,
+) -> std::io::Result<PathBuf> {
+    // On Windows MSVC, try vswhere to find the real link.exe.
+    if matches!((os, env), (OperatingSystem::Windows, Environment::Msvc))
+        && name.eq_ignore_ascii_case("link.exe")
+    {
+        if let Some(path) = find_msvc_linker_via_vswhere() {
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+    }
+    which::which(name).map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))
+}
+
+/// Use `vswhere` to locate the Visual Studio installation path and return the
+/// MSVC version directory (`<installPath>/VC/Tools/MSVC/<ver>`).
+fn find_msvc_version_dir() -> Option<PathBuf> {
+    // vswhere is installed alongside Visual Studio at this well-known path.
+    let vswhere = Path::new("C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe");
+    if !vswhere.is_file() {
+        return None;
+    }
+
+    let output = std::process::Command::new(vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let install_path = String::from_utf8_lossy(&output.stdout);
+    let install_path = install_path.trim();
+    if install_path.is_empty() {
+        return None;
+    }
+
+    // MSVC version directory: <installPath>/VC/Tools/MSVC/<ver>
+    let msvc_dir = Path::new(install_path).join("VC/Tools/MSVC");
+    if !msvc_dir.is_dir() {
+        return None;
+    }
+
+    // Find the first MSVC version directory.
+    if let Ok(entries) = std::fs::read_dir(&msvc_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
+            {
+                return Some(entry.path());
+            }
+        }
+    }
+
+    None
+}
+
+/// Use `vswhere` to locate the MSVC `link.exe` inside a Visual Studio
+/// installation. Returns `None` if `vswhere` is not available or no suitable
+/// installation was found.
+fn find_msvc_linker_via_vswhere() -> Option<PathBuf> {
+    let version_dir = find_msvc_version_dir()?;
+
+    // The x64-hosted, x64-target MSVC tools live under:
+    //   <installPath>/VC/Tools/MSVC/<ver>/bin/HostX64/x64/
+    let link_path = version_dir.join("bin/HostX64/x64/link.exe");
+    if link_path.is_file() {
+        return Some(link_path);
+    }
+
+    // Fall back to HostX64/x86 and HostX86/x64.
+    let fallbacks = [
+        "bin/HostX64/x86/link.exe",
+        "bin/HostX86/x64/link.exe",
+        "bin/HostX86/x86/link.exe",
+    ];
+    for rel in &fallbacks {
+        let candidate = version_dir.join(rel);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+/// Discover the MSVC CRT library directory and the Windows SDK UCRT library
+/// directory for x64. Returns a list of paths suitable for `/LIBPATH:` flags.
+fn find_msvc_lib_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    // MSVC CRT libs: <msvc_version>/lib/spectre/x64
+    if let Some(version_dir) = find_msvc_version_dir() {
+        let crt_lib = version_dir.join("lib/spectre/x64");
+        if crt_lib.is_dir() {
+            dirs.push(crt_lib);
+        }
+    }
+
+    // Windows SDK libs: C:/Program Files (x86)/Windows Kits/10/Lib/<sdk_ver>/{um|x86|ucrt}/x64
+    let kits_root = Path::new("C:/Program Files (x86)/Windows Kits/10/Lib");
+    if kits_root.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(kits_root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+                {
+                    let sdk_dir = entry.path();
+                    // um/x64 has kernel32.lib, user32.lib, etc.
+                    let um_lib = sdk_dir.join("um/x64");
+                    if um_lib.is_dir() {
+                        dirs.push(um_lib);
+                    }
+                    // ucrt/x64 has ucrt.lib
+                    let ucrt_lib = sdk_dir.join("ucrt/x64");
+                    if ucrt_lib.is_dir() {
+                        dirs.push(ucrt_lib);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    dirs
 }
 
 fn describe_os(os: &OperatingSystem) -> &'static str {

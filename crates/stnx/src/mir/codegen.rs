@@ -141,11 +141,8 @@ impl<'ctx> MirCodeGenContext<'ctx> {
             i64_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
             None,
         );
-        self.module.add_function(
-            "list_len",
-            i64_ty.fn_type(&[ptr_ty.into()], false),
-            None,
-        );
+        self.module
+            .add_function("list_len", i64_ty.fn_type(&[ptr_ty.into()], false), None);
     }
 
     /// Declare all functions from the MIR program into the module.
@@ -355,10 +352,14 @@ impl<'ctx> MirCodeGenContext<'ctx> {
             }
             MirRvalue::Index { list_local, index } => {
                 // Lower the list expression first, then the index expression.
-                let (list_alloca, list_llvm_ty) = self.local_allocas.get(list_local).ok_or_else(|| {
-                    CompilerError::codegen(format!("list local {:?} not found", list_local))
-                })?;
-                let list_val = self.builder.build_load(*list_llvm_ty, *list_alloca, "list").unwrap();
+                let (list_alloca, list_llvm_ty) =
+                    self.local_allocas.get(list_local).ok_or_else(|| {
+                        CompilerError::codegen(format!("list local {:?} not found", list_local))
+                    })?;
+                let list_val = self
+                    .builder
+                    .build_load(*list_llvm_ty, *list_alloca, "list")
+                    .unwrap();
                 let idx = self.materialize_operand(index)?;
                 let idx_i64 = match idx {
                     BasicValueEnum::IntValue(v) => v,
@@ -375,28 +376,34 @@ impl<'ctx> MirCodeGenContext<'ctx> {
                     .ok_or_else(|| CompilerError::codegen("list_get not declared"))?;
                 let call = self
                     .builder
-                    .build_call(
-                        list_fn,
-                        &[list_val.into(), idx_i64.into()],
-                        "list_get",
-                    )
+                    .build_call(list_fn, &[list_val.into(), idx_i64.into()], "list_get")
                     .unwrap();
                 let ret = call.try_as_basic_value();
                 Ok(ret
                     .basic()
                     .ok_or_else(|| CompilerError::codegen("list_get returned no value"))?)
             }
-            MirRvalue::ExternalCall { kind, symbol, args, ret_ty } => {
-                gen_external_call(self, kind, symbol, args, ret_ty, prog)
-            }
-            MirRvalue::ExternalCall { kind, symbol, args, ret_ty } => {
-                gen_external_call(self, kind, symbol, args, ret_ty, prog)
-            }
+            MirRvalue::ExternalCall {
+                kind,
+                symbol,
+                args,
+                ret_ty,
+            } => gen_external_call(self, kind, symbol, args, ret_ty, prog),
+            MirRvalue::ExternalCall {
+                kind,
+                symbol,
+                args,
+                ret_ty,
+            } => gen_external_call(self, kind, symbol, args, ret_ty, prog),
             MirRvalue::Length { list_local } => {
-                let (list_alloca, list_llvm_ty) = self.local_allocas.get(list_local).ok_or_else(|| {
-                    CompilerError::codegen(format!("list local {:?} not found", list_local))
-                })?;
-                let list_val = self.builder.build_load(*list_llvm_ty, *list_alloca, "list").unwrap();
+                let (list_alloca, list_llvm_ty) =
+                    self.local_allocas.get(list_local).ok_or_else(|| {
+                        CompilerError::codegen(format!("list local {:?} not found", list_local))
+                    })?;
+                let list_val = self
+                    .builder
+                    .build_load(*list_llvm_ty, *list_alloca, "list")
+                    .unwrap();
                 let list_fn = self
                     .module
                     .get_function("list_len")
@@ -959,18 +966,20 @@ fn gen_external_call<'ctx>(
                 .builder
                 .build_call(
                     extern_fn,
-                    &arg_vals
-                        .iter()
-                        .map(|v| (*v).into())
-                        .collect::<Vec<_>>(),
+                    &arg_vals.iter().map(|v| (*v).into()).collect::<Vec<_>>(),
                     "ext_call",
                 )
-                .map_err(|e| CompilerError::codegen(format!("failed to emit external call to '{}': {}", symbol, e)))?;
+                .map_err(|e| {
+                    CompilerError::codegen(format!(
+                        "failed to emit external call to '{}': {}",
+                        symbol, e
+                    ))
+                })?;
             let result = call.try_as_basic_value();
             if result.is_basic() {
-                Ok(result.basic().unwrap_or_else(|| {
-                    i64_ty.const_int(0, true).as_basic_value_enum()
-                }))
+                Ok(result
+                    .basic()
+                    .unwrap_or_else(|| i64_ty.const_int(0, true).as_basic_value_enum()))
             } else {
                 // Unit return: emit a zero value.
                 Ok(i64_ty.const_int(0, true).as_basic_value_enum())
@@ -991,21 +1000,26 @@ fn gen_external_call<'ctx>(
             let spec_ptr = ctx
                 .builder
                 .build_global_string_ptr(symbol, "py_spec")
-                .map_err(|e| CompilerError::codegen(format!("failed to emit Python spec: {}", e)))?;
+                .map_err(|e| {
+                    CompilerError::codegen(format!("failed to emit Python spec: {}", e))
+                })?;
             let search_ptr = ctx
                 .builder
                 .build_global_string_ptr("", "py_search")
-                .map_err(|e| CompilerError::codegen(format!("failed to emit Python search path: {}", e)))?;
+                .map_err(|e| {
+                    CompilerError::codegen(format!("failed to emit Python search path: {}", e))
+                })?;
 
             // Build parallel kinds/values arrays on the stack.
             let kinds_alloca = ctx
                 .builder
                 .build_alloca(ctx.context.i32_type(), "py_kinds")
-                .map_err(|e| CompilerError::codegen(format!("failed to allocate py kinds: {}", e)))?;
-            let values_alloca = ctx
-                .builder
-                .build_alloca(i64_ty, "py_values")
-                .map_err(|e| CompilerError::codegen(format!("failed to allocate py values: {}", e)))?;
+                .map_err(|e| {
+                    CompilerError::codegen(format!("failed to allocate py kinds: {}", e))
+                })?;
+            let values_alloca = ctx.builder.build_alloca(i64_ty, "py_values").map_err(|e| {
+                CompilerError::codegen(format!("failed to allocate py values: {}", e))
+            })?;
             for (i, v) in arg_vals.iter().enumerate() {
                 let kind = match v {
                     BasicValueEnum::IntValue(iv) => {
@@ -1026,18 +1040,27 @@ fn gen_external_call<'ctx>(
                             &[i64_ty.const_int(i as u64, false)],
                             &format!("py_kind_{}", i),
                         )
-                        .map_err(|e| CompilerError::codegen(format!("failed to gep py kind: {}", e)))?
+                        .map_err(|e| {
+                            CompilerError::codegen(format!("failed to gep py kind: {}", e))
+                        })?
                 };
                 ctx.builder
-                    .build_store(kind_slot, ctx.context.i32_type().const_int(kind as u64, false))
-                    .map_err(|e| CompilerError::codegen(format!("failed to store py kind: {}", e)))?;
+                    .build_store(
+                        kind_slot,
+                        ctx.context.i32_type().const_int(kind as u64, false),
+                    )
+                    .map_err(|e| {
+                        CompilerError::codegen(format!("failed to store py kind: {}", e))
+                    })?;
 
                 let v_i64 = match v {
                     BasicValueEnum::IntValue(iv) => *iv,
                     BasicValueEnum::FloatValue(fv) => ctx
                         .builder
                         .build_bit_cast(*fv, i64_ty, "py_arg_f2i")
-                        .map_err(|e| CompilerError::codegen(format!("failed to bitcast py arg: {}", e)))?
+                        .map_err(|e| {
+                            CompilerError::codegen(format!("failed to bitcast py arg: {}", e))
+                        })?
                         .into_int_value(),
                     other => other.into_int_value(),
                 };
@@ -1049,11 +1072,13 @@ fn gen_external_call<'ctx>(
                             &[i64_ty.const_int(i as u64, false)],
                             &format!("py_val_{}", i),
                         )
-                        .map_err(|e| CompilerError::codegen(format!("failed to gep py val: {}", e)))?
+                        .map_err(|e| {
+                            CompilerError::codegen(format!("failed to gep py val: {}", e))
+                        })?
                 };
-                ctx.builder
-                    .build_store(val_slot, v_i64)
-                    .map_err(|e| CompilerError::codegen(format!("failed to store py val: {}", e)))?;
+                ctx.builder.build_store(val_slot, v_i64).map_err(|e| {
+                    CompilerError::codegen(format!("failed to store py val: {}", e))
+                })?;
             }
 
             // The `sat_py_result` struct layout (must match pyrt.h):
@@ -1062,12 +1087,12 @@ fn gen_external_call<'ctx>(
             let sat_py_result_ty = ctx.context.struct_type(
                 &[
                     ctx.context.bool_type().into(), // ok
-                    ctx.context.i32_type().into(), // kind
-                    ctx.context.i64_type().into(), // union
-                    ctx.context.i64_type().into(), // str_len
-                    ptr_ty.into(), // error_class
-                    ptr_ty.into(), // error_message
-                    ptr_ty.into(), // handle
+                    ctx.context.i32_type().into(),  // kind
+                    ctx.context.i64_type().into(),  // union
+                    ctx.context.i64_type().into(),  // str_len
+                    ptr_ty.into(),                  // error_class
+                    ptr_ty.into(),                  // error_message
+                    ptr_ty.into(),                  // handle
                 ],
                 false,
             );
@@ -1092,7 +1117,9 @@ fn gen_external_call<'ctx>(
                 ],
                 false,
             );
-            let call_fn = ctx.module.add_function("sat_py_call_flat", call_fn_ty, None);
+            let call_fn = ctx
+                .module
+                .add_function("sat_py_call_flat", call_fn_ty, None);
             let call = ctx
                 .builder
                 .build_call(
@@ -1102,12 +1129,17 @@ fn gen_external_call<'ctx>(
                         search_ptr.as_basic_value_enum().into(),
                         kinds_alloca.as_basic_value_enum().into(),
                         values_alloca.as_basic_value_enum().into(),
-                        i64_ty.const_int(arg_vals.len() as u64, false).as_basic_value_enum().into(),
+                        i64_ty
+                            .const_int(arg_vals.len() as u64, false)
+                            .as_basic_value_enum()
+                            .into(),
                         out_alloca.as_basic_value_enum().into(),
                     ],
                     "py_call",
                 )
-                .map_err(|e| CompilerError::codegen(format!("failed to emit sat_py_call_flat: {}", e)))?;
+                .map_err(|e| {
+                    CompilerError::codegen(format!("failed to emit sat_py_call_flat: {}", e))
+                })?;
 
             // Read the result union field (index 2) out of the struct.
             // inkwell requires an aggregate *value* (not the call site) for
@@ -1118,11 +1150,7 @@ fn gen_external_call<'ctx>(
                 .map_err(|e| CompilerError::codegen(format!("failed to load py out: {}", e)))?;
             let result_val = ctx
                 .builder
-                .build_extract_value(
-                    out_loaded.into_struct_value(),
-                    2,
-                    "py_val",
-                )
+                .build_extract_value(out_loaded.into_struct_value(), 2, "py_val")
                 .map_err(|e| CompilerError::codegen(format!("failed to extract py_val: {}", e)))?;
 
             // If the call failed, the runtime leaves the value field zero-

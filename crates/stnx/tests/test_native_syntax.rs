@@ -253,6 +253,235 @@ fn test_unknown_type_errors() {
     let _ = r;
 }
 
+// --- Ecosystem imports ---
+
+#[test]
+fn test_python_ecosystem_import_parses() {
+    let src = "use python:numpy\nmain:\n    give 0\n";
+    let prog = try_parse(src).expect("parse");
+    assert_eq!(prog.items.len(), 2);
+    match &prog.items[0].kind {
+        stnx::ast::ItemKind::UseDecl { ecosystem, .. } => {
+            assert_eq!(ecosystem, &Some(stnx::ast::ExternalKind::Python));
+        }
+        _ => panic!("expected UseDecl"),
+    }
+}
+
+#[test]
+fn test_rust_ecosystem_import_parses() {
+    let src = "use rust:serde\nmain:\n    give 0\n";
+    let prog = try_parse(src).expect("parse");
+    match &prog.items[0].kind {
+        stnx::ast::ItemKind::UseDecl { ecosystem, .. } => {
+            assert_eq!(ecosystem, &Some(stnx::ast::ExternalKind::Rust));
+        }
+        _ => panic!("expected UseDecl"),
+    }
+}
+
+#[test]
+fn test_native_ecosystem_import_parses() {
+    let src = "use native:sqlite\nmain:\n    give 0\n";
+    let prog = try_parse(src).expect("parse");
+    match &prog.items[0].kind {
+        stnx::ast::ItemKind::UseDecl { ecosystem, .. } => {
+            assert_eq!(ecosystem, &Some(stnx::ast::ExternalKind::Native));
+        }
+        _ => panic!("expected UseDecl"),
+    }
+}
+
+#[test]
+fn test_saturnite_native_use_import_parses() {
+    let src = "use math\nmain:\n    give 0\n";
+    let prog = try_parse(src).expect("parse");
+    match &prog.items[0].kind {
+        stnx::ast::ItemKind::UseDecl {
+            path, ecosystem, ..
+        } => {
+            assert_eq!(path, &vec!["math".to_string()]);
+            assert_eq!(ecosystem, &None);
+        }
+        _ => panic!("expected UseDecl"),
+    }
+}
+
+// --- Struct construction with colon syntax ---
+
+#[test]
+fn test_struct_construction_with_colon_syntax() {
+    let src = "struct Point:\n    x: number\n    y: number\nfn make_point(x: number, y: number) -> Point:\n    give Point:\n        x: x\n        y: y\n";
+    let prog = try_parse(src).expect("parse");
+    assert_eq!(prog.items.len(), 2);
+    // The second item is the function with a body containing a Give(StructLiteral).
+    match &prog.items[1].kind {
+        stnx::ast::ItemKind::Function(f) => {
+            assert!(matches!(f.body[0], stnx::ast::Stmt::Give(_, _)));
+        }
+        _ => panic!("expected Function"),
+    }
+}
+
+// --- Enum with colon syntax ---
+
+#[test]
+fn test_enum_with_colon_body() {
+    let src = "enum Color:\n    red\n    green\n    blue\n";
+    let prog = try_parse(src).expect("parse");
+    assert_eq!(prog.items.len(), 1);
+    match &prog.items[0].kind {
+        stnx::ast::ItemKind::EnumDef { name, variants, .. } => {
+            assert_eq!(name, "Color");
+            assert_eq!(variants.len(), 3);
+        }
+        _ => panic!("expected EnumDef"),
+    }
+}
+
+// --- elif branch ---
+
+#[test]
+fn test_elif_branch_parses() {
+    let src = "fn classify(n: i64) -> i64:\n    if n == 0:\n        give 0\n    elif n < 0:\n        give -1\n    else:\n        give 1\n";
+    let prog = try_parse(src).expect("parse");
+    match &prog.items[0].kind {
+        stnx::ast::ItemKind::Function(f) => {
+            assert!(matches!(
+                f.body[0],
+                stnx::ast::Stmt::Expr(stnx::ast::Expr::If { .. }, _)
+            ));
+        }
+        _ => panic!("expected Function"),
+    }
+}
+
+// --- while loop ---
+
+#[test]
+fn test_while_loop_with_colon_block() {
+    let src =
+        "fn count() -> i64:\n    let mut i = 0\n    while i < 10:\n        i = i + 1\n    give i\n";
+    let prog = try_parse(src).expect("parse");
+    match &prog.items[0].kind {
+        stnx::ast::ItemKind::Function(f) => {
+            // Body should contain a While statement.
+            let has_while = f
+                .body
+                .iter()
+                .any(|s| matches!(s, stnx::ast::Stmt::Expr(stnx::ast::Expr::While { .. }, _)));
+            assert!(has_while, "expected While expr in body");
+        }
+        _ => panic!("expected Function"),
+    }
+}
+
+// --- Range expressions ---
+
+#[test]
+fn test_exclusive_range_parses() {
+    let src = "main:\n    for i in 0..10:\n        say i\n    give 0\n";
+    let prog = try_parse(src).expect("parse");
+    let main = prog.functions.iter().find(|f| f.name == "main").unwrap();
+    let has_for = main
+        .body
+        .iter()
+        .any(|s| matches!(s, stnx::ast::Stmt::Expr(stnx::ast::Expr::For { .. }, _)));
+    assert!(has_for, "expected For expr in main");
+}
+
+#[test]
+fn test_inclusive_range_parses() {
+    let src = "main:\n    for i in 0...10:\n        say i\n    give 0\n";
+    let prog = try_parse(src).expect("parse");
+    let main = prog.functions.iter().find(|f| f.name == "main").unwrap();
+    let has_for = main
+        .body
+        .iter()
+        .any(|s| matches!(s, stnx::ast::Stmt::Expr(stnx::ast::Expr::For { .. }, _)));
+    assert!(has_for, "expected For expr with inclusive range");
+}
+
+// --- mut variables and compound assignment ---
+
+#[test]
+fn test_mut_and_compound_assignment() {
+    let src = "fn f() -> i64:\n    let mut x = 0\n    x += 5\n    give x\n";
+    let prog = try_parse(src).expect("parse");
+    match &prog.items[0].kind {
+        stnx::ast::ItemKind::Function(f) => {
+            assert!(f.body.iter().any(|s| matches!(
+                s,
+                stnx::ast::Stmt::Expr(stnx::ast::Expr::AugAssign { .. }, _)
+            )));
+        }
+        _ => panic!("expected Function"),
+    }
+}
+
+// --- Struct field access ---
+
+#[test]
+fn test_struct_field_access() {
+    let src = "struct Point:\n    x: number\n    y: number\nfn get_x(p: Point) -> number:\n    give p.x\n";
+    let prog = try_parse(src).expect("parse");
+    match &prog.items[1].kind {
+        stnx::ast::ItemKind::Function(f) => {
+            assert!(matches!(f.body[0], stnx::ast::Stmt::Give(_, _)));
+        }
+        _ => panic!("expected Function"),
+    }
+}
+
+// --- Native syntax e2e with all control flow ---
+
+#[test]
+fn test_e2e_native_control_flow_compiles_and_runs() {
+    use std::process::Command;
+    use stnx::mir::codegen::compile_from_mir_ext;
+    use stnx::mir::monomorphize::monomorphize;
+    use stnx::mir::opt::optimize;
+    use stnx::semantic::analyze_and_lower;
+    use stnx::target::TargetConfig;
+
+    let src = r#"
+fn count_even(start: number, end: number) -> number:
+    let mut count = 0
+    let mut i = start
+    while i < end:
+        if i % 2 == 0:
+            count = count + 1
+        i = i + 1
+    give count
+
+main:
+    let result = count_even(0, 10)
+    say result
+    give 0
+"#;
+
+    let toks = prepare(src).expect("lex");
+    let prog = parser::parse(src, toks).expect("parse");
+    let hir = analyze_and_lower(&prog).expect("semantic");
+    let mut mir = monomorphize(&hir).expect("mono");
+    optimize(&mut mir);
+
+    let tmp = tempfile::TempDir::new().expect("tmpdir");
+    let exe = tmp.path().join("control_flow");
+    let mut target = TargetConfig::host().expect("host target");
+    target.set_output_kind(stnx::target::OutputKind::Exe);
+    compile_from_mir_ext(&mir, exe.to_str().unwrap(), target, false).expect("codegen");
+
+    let out = Command::new(&exe).output().expect("execute");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(
+        stdout.trim_end(),
+        "5",
+        "count_even(0, 10) should produce 5 even numbers"
+    );
+}
+
 // --- End-to-end: full native-syntax program that compiles and runs ---
 
 #[test]

@@ -246,9 +246,7 @@ pub enum MirRvalue {
     },
     /// List length: `list_len(list)`. Returns the current logical length
     /// as an i64.
-    Length {
-        list_local: LocalId,
-    },
+    Length { list_local: LocalId },
     /// String literal → global string pointer cast to i64.
     StrLit(SymbolId),
 }

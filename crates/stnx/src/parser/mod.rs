@@ -13,8 +13,14 @@ pub type ParserExtra<'a> = extra::Err<Simple<'a, Token, SimpleSpan<usize>>>;
 
 /// Postfix operator kinds used by the postfix chain in `recursive_expr`.
 enum PostfixOp {
-    Field { name: String, span: Range<usize> },
-    Index { idx: Expr, lbracket_span: Range<usize> },
+    Field {
+        name: String,
+        span: Range<usize>,
+    },
+    Index {
+        idx: Expr,
+        lbracket_span: Range<usize>,
+    },
 }
 
 /// Postfix chain: field access (`a.b`) and list indexing (`a[i]`) applied
@@ -294,7 +300,8 @@ fn str_lit<'a>() -> impl Parser<'a, &'a [Token], (String, Range<usize>), ParserE
 /// The declaration is explicit metadata: the compiler records the runtime
 /// kind, the ecosystem name, the foreign symbol, the parameter types, and
 /// the return type. It does NOT parse arbitrary foreign source.
-fn external_decl<'a>() -> impl Parser<'a, &'a [Token], (String, ItemKind, Range<usize>), ParserExtra<'a>> {
+fn external_decl<'a>(
+) -> impl Parser<'a, &'a [Token], (String, ItemKind, Range<usize>), ParserExtra<'a>> {
     let kind = kw("rust")
         .to(ExternalKind::Rust)
         .or(kw("python").to(ExternalKind::Python))
@@ -308,35 +315,81 @@ fn external_decl<'a>() -> impl Parser<'a, &'a [Token], (String, ItemKind, Range<
         .then(str_lit())
         .then(params())
         .then(ret_type())
-        .map(|((((((ext_span, _kind), (ecosystem, _eco_span)), (symbol, sym_span)), params), ret_type))| {
-            let span = ext_span.start..sym_span.end;
-            let name = symbol.clone();
-            (
-                name,
-                ItemKind::ExternalFunction {
-                    kind: _kind,
-                    ecosystem,
-                    symbol,
-                    params,
-                    return_type: ret_type,
-                    span: span.clone(),
-                },
-                span,
-            )
-        })
+        .map(
+            |((
+                ((((ext_span, _kind), (ecosystem, _eco_span)), (symbol, sym_span)), params),
+                ret_type,
+            ))| {
+                let span = ext_span.start..sym_span.end;
+                let name = symbol.clone();
+                (
+                    name,
+                    ItemKind::ExternalFunction {
+                        kind: _kind,
+                        ecosystem,
+                        symbol,
+                        params,
+                        return_type: ret_type,
+                        span: span.clone(),
+                    },
+                    span,
+                )
+            },
+        )
 }
 
-/// Parse a `use foo::bar::baz` declaration (no semicolon, with optional `as alias`).
+/// Parse a `use` declaration (no semicolon, with optional `as alias`).
+///
+/// Supports three forms:
+///
+/// * **Ecosystem-boundary import**: `use <ecosystem>:<package> [as <alias>]`
+///   where `<ecosystem>` is `python`, `rust`, or `native`. The single colon
+///   distinguishes this from a regular path. The `ecosystem` field is set
+///   to `Some(...)` and the `path` contains only the package name.
+///
+/// * **Regular path import**: `use foo::bar::baz [as <alias>]` — Rust-style
+///   `::`-separated paths. The `ecosystem` field is `None`.
+///
+/// * **Plain identifier import**: `use math` — a single identifier with no
+///   colon or `::`. Treated as a regular path import with `ecosystem: None`.
+///
 /// Returns (name, ItemKind, span).
 fn use_decl<'a>() -> impl Parser<'a, &'a [Token], (String, ItemKind, Range<usize>), ParserExtra<'a>>
 {
     kw_span("use")
-        .then(path_with_span())
+        .then(
+            // Try ecosystem-boundary import first: <python|rust|native>:<package>
+            t_ident()
+                .filter(|(name, _): &(String, Range<usize>)| {
+                    matches!(name.as_str(), "python" | "rust" | "native")
+                })
+                .then_ignore(colon())
+                .then(t_ident())
+                .map(|((eco_name, eco_span), (pkg, pkg_span))| {
+                    let ecosystem = match eco_name.as_str() {
+                        "python" => Some(ExternalKind::Python),
+                        "rust" => Some(ExternalKind::Rust),
+                        "native" => Some(ExternalKind::Native),
+                        _ => unreachable!(),
+                    };
+                    (ecosystem, vec![pkg], eco_span.start..pkg_span.end)
+                })
+                // Fall back to a regular `::`-separated path (ecosystem = None).
+                .or(path_with_span().map(|(parts, span)| (None, parts, span))),
+        )
         .then(kw("as").ignore_then(t_ident().map(|(n, _)| n)).or_not())
-        .map(|((use_span, (parts, last_span)), alias)| {
+        .map(|((use_span, (ecosystem, parts, path_span)), alias)| {
             let name = parts.last().cloned().unwrap_or_default();
-            let full_span = use_span.start..last_span.end;
-            (name, ItemKind::UseDecl { path: parts, alias }, full_span)
+            let full_span = use_span.start..path_span.end;
+            (
+                name,
+                ItemKind::UseDecl {
+                    path: parts,
+                    alias,
+                    ecosystem,
+                },
+                full_span,
+            )
         })
 }
 
@@ -676,18 +729,22 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
             .or(lbracket_span()
                 .ignore_then(
                     // Empty list case: just close bracket.
-                    rbracket().to(vec![])
-                        .or(
-                            // Non-empty list: first element + zero or more (, element).
-                            expr.clone()
-                                .then(comma().ignore_then(expr.clone()).repeated().collect::<Vec<_>>())
-                                .then_ignore(rbracket())
-                                .map(|(first, rest)| {
-                                    let mut v = vec![first];
-                                    v.extend(rest);
-                                    v
-                                }),
-                        )
+                    rbracket().to(vec![]).or(
+                        // Non-empty list: first element + zero or more (, element).
+                        expr.clone()
+                            .then(
+                                comma()
+                                    .ignore_then(expr.clone())
+                                    .repeated()
+                                    .collect::<Vec<_>>(),
+                            )
+                            .then_ignore(rbracket())
+                            .map(|(first, rest)| {
+                                let mut v = vec![first];
+                                v.extend(rest);
+                                v
+                            }),
+                    ),
                 )
                 .map(|items| {
                     let start = items.first().map(stmt_span).map(|s| s.start).unwrap_or(0);
@@ -789,30 +846,33 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
                     span: s,
                 }
             }))
-            .or(primary.clone().then(postfix(expr.clone())).map(|(base, ops)| {
-                let mut expr = base;
-                for op in ops {
-                    match op {
-                        PostfixOp::Field { name, span } => {
-                            let expr_span = stmt_span(&expr);
-                            expr = Expr::FieldAccess {
-                                expr: Box::new(expr),
-                                field: name,
-                                span: expr_span.start..span.end,
-                            };
-                        }
-                        PostfixOp::Index { idx, lbracket_span } => {
-                            let idx_span = stmt_span(&idx);
-                            expr = Expr::Index {
-                                list: Box::new(expr),
-                                index: Box::new(idx),
-                                span: lbracket_span.start..idx_span.end,
-                            };
+            .or(primary
+                .clone()
+                .then(postfix(expr.clone()))
+                .map(|(base, ops)| {
+                    let mut expr = base;
+                    for op in ops {
+                        match op {
+                            PostfixOp::Field { name, span } => {
+                                let expr_span = stmt_span(&expr);
+                                expr = Expr::FieldAccess {
+                                    expr: Box::new(expr),
+                                    field: name,
+                                    span: expr_span.start..span.end,
+                                };
+                            }
+                            PostfixOp::Index { idx, lbracket_span } => {
+                                let idx_span = stmt_span(&idx);
+                                expr = Expr::Index {
+                                    list: Box::new(expr),
+                                    index: Box::new(idx),
+                                    span: lbracket_span.start..idx_span.end,
+                                };
+                            }
                         }
                     }
-                }
-                expr
-            }))
+                    expr
+                }))
             .boxed();
 
         // Multiplicative: * / %
@@ -1347,9 +1407,9 @@ fn kw_span<'a>(k: &'a str) -> Boxed<'a, 'a, &'a [Token], Range<usize>, ParserExt
 
 fn t_ident<'a>() -> impl Parser<'a, &'a [Token], (String, Range<usize>), ParserExtra<'a>> {
     any::<&[Token], _>()
-        .filter(|t: &Token| {
-            matches!(&t.kind, TokenKind::Ident(s) if !is_keyword(s) || s == "length")
-        })
+        .filter(
+            |t: &Token| matches!(&t.kind, TokenKind::Ident(s) if !is_keyword(s) || s == "length"),
+        )
         .map(|t| match &t.kind {
             TokenKind::Ident(s) => (s.clone(), t.span.clone()),
             _ => unreachable!(),
@@ -1766,7 +1826,11 @@ mod tests {
         assert_eq!(prog.items[0].name, "println");
         assert_eq!(prog.items[0].visibility, Visibility::Private);
         match &prog.items[0].kind {
-            ItemKind::UseDecl { path, alias } => {
+            ItemKind::UseDecl {
+                path,
+                alias,
+                ecosystem: _,
+            } => {
                 assert_eq!(path, &vec!["io".to_string(), "println".to_string()]);
                 assert_eq!(*alias, None);
             }
@@ -1779,7 +1843,11 @@ mod tests {
         let prog = parse_src("use utils::math::add\n");
         assert_eq!(prog.items.len(), 1);
         match &prog.items[0].kind {
-            ItemKind::UseDecl { path, alias } => {
+            ItemKind::UseDecl {
+                path,
+                alias,
+                ecosystem: _,
+            } => {
                 assert_eq!(
                     path,
                     &vec!["utils".to_string(), "math".to_string(), "add".to_string(),]
@@ -1796,7 +1864,11 @@ mod tests {
         assert_eq!(prog.items.len(), 1);
         assert_eq!(prog.items[0].visibility, Visibility::Public);
         match &prog.items[0].kind {
-            ItemKind::UseDecl { path, alias: _ } => {
+            ItemKind::UseDecl {
+                path,
+                alias: _,
+                ecosystem: _,
+            } => {
                 assert_eq!(path, &vec!["io".to_string(), "writer".to_string()]);
             }
             other => panic!("expected UseDecl, got {:?}", other),
@@ -1809,11 +1881,151 @@ mod tests {
         let prog = parse_src("use io::writer as w\n");
         assert_eq!(prog.items.len(), 1);
         match &prog.items[0].kind {
-            ItemKind::UseDecl { path, alias } => {
+            ItemKind::UseDecl {
+                path,
+                alias,
+                ecosystem: _,
+            } => {
                 assert_eq!(path, &vec!["io".to_string(), "writer".to_string()]);
                 assert_eq!(alias, &Some("w".to_string()));
                 // The item name is the last path segment (the original name).
                 assert_eq!(prog.items[0].name, "writer");
+            }
+            other => panic!("expected UseDecl, got {:?}", other),
+        }
+    }
+
+    // --- use with ecosystem-boundary syntax ---
+
+    #[test]
+    fn test_parse_use_ecosystem_python() {
+        let prog = parse_src("use python:numpy\n");
+        assert_eq!(prog.items.len(), 1);
+        assert_eq!(prog.items[0].name, "numpy");
+        match &prog.items[0].kind {
+            ItemKind::UseDecl {
+                path,
+                alias,
+                ecosystem,
+            } => {
+                assert_eq!(path, &vec!["numpy".to_string()]);
+                assert_eq!(*alias, None);
+                assert_eq!(*ecosystem, Some(ExternalKind::Python));
+            }
+            other => panic!("expected UseDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_use_ecosystem_rust() {
+        let prog = parse_src("use rust:serde\n");
+        assert_eq!(prog.items.len(), 1);
+        assert_eq!(prog.items[0].name, "serde");
+        match &prog.items[0].kind {
+            ItemKind::UseDecl {
+                path,
+                alias,
+                ecosystem,
+            } => {
+                assert_eq!(path, &vec!["serde".to_string()]);
+                assert_eq!(*alias, None);
+                assert_eq!(*ecosystem, Some(ExternalKind::Rust));
+            }
+            other => panic!("expected UseDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_use_ecosystem_native() {
+        let prog = parse_src("use native:libc\n");
+        assert_eq!(prog.items.len(), 1);
+        assert_eq!(prog.items[0].name, "libc");
+        match &prog.items[0].kind {
+            ItemKind::UseDecl {
+                path,
+                alias,
+                ecosystem,
+            } => {
+                assert_eq!(path, &vec!["libc".to_string()]);
+                assert_eq!(*alias, None);
+                assert_eq!(*ecosystem, Some(ExternalKind::Native));
+            }
+            other => panic!("expected UseDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_use_ecosystem_with_alias() {
+        let prog = parse_src("use python:numpy as np\n");
+        assert_eq!(prog.items.len(), 1);
+        assert_eq!(prog.items[0].name, "numpy");
+        match &prog.items[0].kind {
+            ItemKind::UseDecl {
+                path,
+                alias,
+                ecosystem,
+            } => {
+                assert_eq!(path, &vec!["numpy".to_string()]);
+                assert_eq!(alias, &Some("np".to_string()));
+                assert_eq!(*ecosystem, Some(ExternalKind::Python));
+            }
+            other => panic!("expected UseDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_use_ecosystem_pub() {
+        let prog = parse_src("pub use rust:serde\n");
+        assert_eq!(prog.items.len(), 1);
+        assert_eq!(prog.items[0].visibility, Visibility::Public);
+        match &prog.items[0].kind {
+            ItemKind::UseDecl {
+                path,
+                alias,
+                ecosystem,
+            } => {
+                assert_eq!(path, &vec!["serde".to_string()]);
+                assert_eq!(*alias, None);
+                assert_eq!(*ecosystem, Some(ExternalKind::Rust));
+            }
+            other => panic!("expected UseDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_use_regular_path_not_ecosystem() {
+        // When ecosystem keyword is followed by `::`, it's a regular path, not ecosystem
+        let prog = parse_src("use python::numpy\n");
+        assert_eq!(prog.items.len(), 1);
+        match &prog.items[0].kind {
+            ItemKind::UseDecl {
+                path,
+                alias,
+                ecosystem,
+            } => {
+                assert_eq!(path, &vec!["python".to_string(), "numpy".to_string()]);
+                assert_eq!(*alias, None);
+                assert_eq!(*ecosystem, None);
+            }
+            other => panic!("expected UseDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_use_plain_identifier_no_ecosystem() {
+        // A plain identifier without a colon is a regular path import.
+        let prog = parse_src("use math\n");
+        assert_eq!(prog.items.len(), 1);
+        assert_eq!(prog.items[0].name, "math");
+        match &prog.items[0].kind {
+            ItemKind::UseDecl {
+                path,
+                alias,
+                ecosystem,
+            } => {
+                assert_eq!(path, &vec!["math".to_string()]);
+                assert_eq!(*alias, None);
+                assert_eq!(*ecosystem, None);
             }
             other => panic!("expected UseDecl, got {:?}", other),
         }

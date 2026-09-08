@@ -1,5 +1,24 @@
-fn main() -> i64 {
-    let values = [10, 20, 30]
-    println(0)
-    return 0
-}
+// Saturnite list demo (native syntax).
+// Exercises: list literals, indexing, .length, iteration.
+
+module list_demo
+
+fn sum_list(items: List<number>) -> number:
+    let mut total = 0
+    for item in items:
+        total += item
+    give total
+
+fn first(items: List<text>) -> text:
+    give items[0]
+
+main:
+    let numbers = [10, 20, 30]
+    let total = sum_list(numbers)
+    say total
+    say numbers.length
+    for n in numbers:
+        say n
+    let words = ["alpha", "beta", "gamma"]
+    say first(words)
+    give 0

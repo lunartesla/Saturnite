@@ -1,54 +1,50 @@
-fn factorial(n: i64) -> i64 {
-    if n <= 1 {
-        return 1
-    }
-    return n * factorial(n - 1)
-}
+// Saturnite native syntax smoke test.
+// Exercises: module, functions, give, say, if/elif/else,
+// for, while, recursion, named args, string interpolation, main block.
 
-fn is_even(n: i64) -> bool {
-    return n % 2 == 0
-}
+module smoke_test
 
-fn sum_even_squares(limit: i64) -> i64 {
+fn factorial(n: number) -> number:
+    if n <= 1:
+        give 1
+    give n * factorial(n - 1)
+
+fn is_even(n: number) -> bool:
+    give n % 2 == 0
+
+fn sum_even_squares(limit: number) -> number:
     let mut sum = 0
     let mut i = 0
-    while i < limit {
-        if is_even(i) {
+    while i < limit:
+        if is_even(i):
             sum = sum + i * i
-        }
         i = i + 1
-    }
-    return sum
-}
+    give sum
 
-fn sum_range(start: i64, end: i64) -> i64 {
+fn sum_range(start: number, end: number) -> number:
     let mut sum = 0
-    for i in start..end {
+    for i in start..end:
         sum = sum + i
-    }
-    return sum
-}
+    give sum
 
-fn classify(n: i64) -> i64 {
-    if n == 0 {
-        return 0
-    } elif n < 0 {
-        return -1
-    } else {
-        return 1
-    }
-}
+fn classify(n: number) -> number:
+    if n == 0:
+        give 0
+    elif n < 0:
+        give -1
+    else:
+        give 1
 
-fn main() -> i64 {
+main:
     let fact5 = factorial(5)
     let even_sum = sum_range(0, 10)
     let squares = sum_even_squares(10)
     let sign = classify(0)
     let total = fact5 + even_sum + squares + sign
-    println(fact5)
-    println(even_sum)
-    println(squares)
-    println(sign)
-    println(total)
-    return total
-}
+    say fact5
+    say even_sum
+    say squares
+    say sign
+    say total
+    say "Total: {total}"
+    give total

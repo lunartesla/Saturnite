@@ -62,6 +62,7 @@ fn push_use(hir: &mut HirProgram, name: &str) {
         alias: sym,
         module: ModuleId::ROOT,
         visibility: Visibility::Private,
+        ecosystem: None,
         span: miette::SourceSpan::new(0.into(), 0),
     });
 }
@@ -173,6 +174,7 @@ fn test_resolver_empty_path_is_hard_error() {
         alias: hir.symbols.intern(""),
         module: ModuleId::ROOT,
         visibility: Visibility::Private,
+        ecosystem: None,
         span: miette::SourceSpan::new(0.into(), 0),
     });
 
@@ -271,5 +273,30 @@ fn test_resolver_detects_duplicate_struct_in_same_module() {
         msg.contains("duplicate definition") && msg.contains("Point"),
         "error should mention 'duplicate definition' and 'Point', got: {}",
         msg
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. Ecosystem imports are skipped by the resolver
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_resolver_skips_ecosystem_imports() {
+    // `use python:numpy` is an ecosystem-boundary import — the resolver
+    // should skip it (returns Ok(None) internally) and NOT mark it as
+    // unresolved. The legacy shim should also succeed.
+    let mut hir = lex_parse_lower("fn main() -> i64 { 0 }");
+    push_use(&mut hir, "numpy");
+    // Override the use decl to be an ecosystem import.
+    hir.use_decls[0].ecosystem = Some(stnx::ast::ExternalKind::Python);
+
+    let res = resolve(&mut hir).expect("resolve should skip ecosystem import");
+    assert_eq!(res.imports.len(), 1);
+    // Ecosystem imports resolve to None (skipped, not unresolved).
+    assert_eq!(res.imports[0], None);
+    assert_eq!(
+        res.unresolved_count(),
+        0,
+        "ecosystem imports should not be unresolved"
     );
 }

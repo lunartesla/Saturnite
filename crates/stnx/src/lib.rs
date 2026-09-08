@@ -11,8 +11,6 @@
 //! - [`semantic`] — semantic analysis (delegates to HIR lowering).
 //! - [`resolver`] — dedicated name-resolution pass (consumes HIR, runs
 //!   after lowering, before MIR).
-//! - [`resolver`] — dedicated name-resolution pass (consumes HIR, runs
-//!   after lowering, before MIR).
 //! - [`codegen`] — object emission and linking seams (MIR→LLVM via [`mir::codegen`]).
 //! - [`target`] — target configuration (triple, architecture, OS, etc.).
 //! - [`error`] — structured error types for every compilation stage.
@@ -25,8 +23,8 @@ pub mod config;
 pub mod error;
 pub mod hir;
 pub mod interop;
-pub mod interop_rust;
 pub mod interop_python;
+pub mod interop_rust;
 pub mod lexer;
 pub mod mir;
 pub mod module;
@@ -37,7 +35,7 @@ pub mod target;
 
 // --- AST re-exports ---
 
-pub use ast::Program;
+pub use ast::{ExternalKind, Program};
 
 // --- HIR re-exports ---
 //

@@ -308,10 +308,7 @@ fn test_mod_on_bool_rejected() {
 fn test_index_on_non_list_rejected() {
     let src = "fn main() -> i64 { let x = 5 let y = x[0] 0 }";
     let result = analyze_src(src);
-    assert!(
-        result.is_err(),
-        "indexing a non-list should be rejected"
-    );
+    assert!(result.is_err(), "indexing a non-list should be rejected");
     let err = result.unwrap_err();
     assert!(
         err.contains("List<T>"),
@@ -324,10 +321,7 @@ fn test_index_on_non_list_rejected() {
 fn test_length_on_non_list_rejected() {
     let src = "fn main() -> i64 { let x = 5 let y = x.length 0 }";
     let result = analyze_src(src);
-    assert!(
-        result.is_err(),
-        "length on a non-list should be rejected"
-    );
+    assert!(result.is_err(), "length on a non-list should be rejected");
     let err = result.unwrap_err();
     assert!(
         err.contains("non-struct type") || err.contains("List<T>"),
@@ -349,4 +343,3 @@ fn test_length_valid_list_passes() {
     let result = analyze_src(src);
     assert!(result.is_ok(), "length on a List<i64> should pass");
 }
-

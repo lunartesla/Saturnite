@@ -484,7 +484,12 @@ impl<'hir> MirLower<'hir> {
                 // terminator. External calls are value-producing (they
                 // write their result into a destination local), so they
                 // fit naturally in the rvalue position.
-                if let Some(ext) = self.hir.external_functions.iter().find(|e| e.def_id == *def_id) {
+                if let Some(ext) = self
+                    .hir
+                    .external_functions
+                    .iter()
+                    .find(|e| e.def_id == *def_id)
+                {
                     return self.lower_external_call(ext, args, expr.ty.clone());
                 }
                 self.lower_call(*def_id, args, expr.ty.clone())

@@ -322,7 +322,11 @@ impl HirLower {
                         visibility: ast_visibility_to_hir(&item.visibility),
                     });
                 }
-                ItemKind::UseDecl { path, alias } => {
+                ItemKind::UseDecl {
+                    path,
+                    alias,
+                    ecosystem,
+                } => {
                     // Build the HIR use declaration. The path segments are
                     // interned as SymbolIds. The alias (if present) is
                     // interned separately; otherwise the last path segment
@@ -346,6 +350,7 @@ impl HirLower {
                         alias: alias_sym,
                         module: ModuleId::ROOT,
                         visibility: ast_visibility_to_hir(&item.visibility),
+                        ecosystem: ecosystem.clone(),
                         span: span_to_source_span(&item.span),
                     });
                 }
@@ -381,10 +386,6 @@ impl HirLower {
                     // 0.5: `main:` is a syntactic shortcut for
                     // `fn main() -> i64 { ... }`. Synthesised in a second
                     // pass below.
-                }
-                ItemKind::ExternalFunction { .. } => {
-                    // External declarations are processed in the function
-                    // signature pass below.
                 }
                 ItemKind::ExternalFunction { .. } => {
                     // External declarations are processed in the function
@@ -917,7 +918,11 @@ impl HirLower {
                             visibility: ast_visibility_to_hir(&item.visibility),
                         });
                     }
-                    ItemKind::UseDecl { path, alias } => {
+                    ItemKind::UseDecl {
+                        path,
+                        alias,
+                        ecosystem,
+                    } => {
                         let path_syms: Vec<SymbolId> =
                             path.iter().map(|s| self.symbols.intern(s)).collect();
                         let alias_sym = match alias {
@@ -934,6 +939,7 @@ impl HirLower {
                             alias: alias_sym,
                             module: module_id,
                             visibility: ast_visibility_to_hir(&item.visibility),
+                            ecosystem: ecosystem.clone(),
                             span: span_to_source_span(&item.span),
                         });
                     }
@@ -970,9 +976,6 @@ impl HirLower {
                     }
                     ItemKind::MainBlock(_stmts, _span) => {
                         // Synthesised in a second pass below.
-                    }
-                    ItemKind::ExternalFunction { .. } => {
-                        // Handled in the signature pass below.
                     }
                     ItemKind::ExternalFunction { .. } => {
                         // Handled in the signature pass below.
@@ -1106,9 +1109,7 @@ impl HirLower {
             } else {
                 ast
             };
-            let Some(ast) = ast else {
-                continue
-            };
+            let Some(ast) = ast else { continue };
             for item in &ast.items {
                 if let ItemKind::ExternalFunction {
                     kind,
@@ -1188,9 +1189,7 @@ impl HirLower {
             } else {
                 ast
             };
-            let Some(ast) = ast else {
-                continue
-            };
+            let Some(ast) = ast else { continue };
             for item in &ast.items {
                 if let ItemKind::ExternalFunction {
                     kind,
@@ -2763,6 +2762,7 @@ mod tests {
             kind: ItemKind::UseDecl {
                 path: vec!["io".to_string(), "println".to_string()],
                 alias: None,
+                ecosystem: None,
             },
             span: 0..10,
         };

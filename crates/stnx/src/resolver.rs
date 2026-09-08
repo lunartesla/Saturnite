@@ -169,48 +169,6 @@ pub fn resolve(hir: &mut HirProgram) -> CompilerResult<Resolution> {
         }
     }
 
-    // --- Phase 0: detect duplicate definitions within each module ---
-    //
-    // We walk every kind of item (function, struct, enum, mod decl) and
-    // group by (module, name). If any group has more than one entry, the
-    // program contains a duplicate definition and we surface a semantic
-    // error pointing at the duplicated name.
-    //
-    // This catches cases that lowering's HashMap-insert silently overwrites,
-    // e.g. two `fn foo` in the same module, or a `fn foo` colliding with a
-    // `struct foo` in the same module.
-    {
-        use std::collections::HashMap;
-        let mut seen: HashMap<(crate::module::ModuleId, SymbolId), DefId> = HashMap::new();
-        let mut check = |module: crate::module::ModuleId,
-                         name: SymbolId,
-                         def_id: DefId|
-         -> Result<(), CompilerError> {
-            if let Some(prev) = seen.insert((module, name), def_id) {
-                if prev != def_id {
-                    let n = hir.symbols.lookup(name).unwrap_or("<unknown>");
-                    return Err(CompilerError::semantic(format!(
-                        "duplicate definition: '{}' is already defined in this module",
-                        n
-                    )));
-                }
-            }
-            Ok(())
-        };
-        for f in &hir.functions {
-            check(f.module, f.name, f.def_id)?;
-        }
-        for s in &hir.structs {
-            check(s.module, s.name, s.def_id)?;
-        }
-        for e in &hir.enums {
-            check(e.module, e.name, e.def_id)?;
-        }
-        for md in &hir.mod_decls {
-            check(md.module, md.name, md.def_id)?;
-        }
-    }
-
     // --- Phase 1: defensive re-registration of items in their scopes ---
     //
     // Lowering already populates module_scopes, but we re-register here
@@ -242,7 +200,14 @@ pub fn resolve(hir: &mut HirProgram) -> CompilerResult<Resolution> {
     // mutating `module_scopes`.
     let mut pending: Vec<(usize, SymbolId, DefId)> = Vec::new();
 
-    for (use_idx, _use_decl) in hir.use_decls.iter().enumerate() {
+    for (use_idx, use_decl) in hir.use_decls.iter().enumerate() {
+        // Ecosystem-boundary imports (`use python:numpy`) are not resolved by
+        // Saturnite's module graph — they are handled by the interop bridge
+        // at link/runtime. Skip them entirely (not unresolved, not resolved).
+        if use_decl.ecosystem.is_some() {
+            out.imports[use_idx] = None;
+            continue;
+        }
         match resolve_one_use(hir, use_idx) {
             Ok(Some((alias, def_id))) => {
                 out.imports[use_idx] = Some(def_id);
@@ -478,6 +443,7 @@ mod tests {
             alias: sym,
             module: crate::module::ModuleId::ROOT,
             visibility: crate::hir::Visibility::Private,
+            ecosystem: None,
             span: miette::SourceSpan::new(0.into(), 0),
         });
     }
@@ -525,6 +491,7 @@ mod tests {
             alias: hir.symbols.intern(""),
             module: crate::module::ModuleId::ROOT,
             visibility: crate::hir::Visibility::Private,
+            ecosystem: None,
             span: miette::SourceSpan::new(0.into(), 0),
         });
         let err = resolve(&mut hir).expect_err("empty path should error");

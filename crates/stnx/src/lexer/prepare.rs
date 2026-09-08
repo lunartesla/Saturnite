@@ -125,14 +125,27 @@ fn desugar_blocks(src: &str, tokens: Vec<Token>) -> CompilerResult<Vec<Token>> {
                     .map(|t| t.kind == TokenKind::Newline)
                     .unwrap_or(false);
                 if next_is_newline {
-                    let field_mode =
+                    let is_struct_or_enum =
                         matches!(last_kw, Some(TokenKind::Struct) | Some(TokenKind::Enum));
                     // `main:` desugars to `fn main() -> i64 {`.
+                    // Struct-literal construction (`Point:` ...) also becomes a
+                    // brace block in field mode so that field lines get comma
+                    // separators between them.
                     let prev_is_main = open.is_empty()
-                        && !field_mode
+                        && !is_struct_or_enum
                         && out.last().is_some_and(
                             |t: &Token| matches!(&t.kind, TokenKind::Ident(s) if s == "main"),
                         );
+                    // Struct literal construction: a bare `Ident:` (not preceded
+                    // by `struct`/`enum`/`fn`/etc.) with a newline body.
+                    // This works at any nesting depth (e.g. inside a function
+                    // body: `give Point:` → `give Point {`).
+                    let prev_is_struct_lit = !is_struct_or_enum
+                        && !prev_is_main
+                        && out
+                            .last()
+                            .is_some_and(|t: &Token| matches!(&t.kind, TokenKind::Ident(_)));
+                    let field_mode = is_struct_or_enum || prev_is_struct_lit;
                     if prev_is_main {
                         // Replace the bare `main` identifier with the
                         // equivalent legacy function header.

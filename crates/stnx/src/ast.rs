@@ -93,9 +93,15 @@ pub enum ItemKind {
     ModDecl,
     /// `use foo::bar` — imports `bar` into the current module's namespace.
     /// The last path segment becomes available as a local name.
+    ///
+    /// When `ecosystem` is `Some`, this is an ecosystem-boundary import
+    /// (`use <ecosystem>:<package>`, e.g. `use python:numpy`). The package
+    /// is resolved at link/runtime by the interop bridge, not by Saturnite
+    /// module resolution.
     UseDecl {
         path: Vec<String>,
         alias: Option<String>,
+        ecosystem: Option<ExternalKind>,
     },
     /// `module name` — 0.5 advisory module declaration (no semantic effect).
     ModuleDecl,

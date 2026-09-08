@@ -96,6 +96,10 @@ pub struct EnumDef {
 /// segment by default), and `module` is the `ModuleId` from which the
 /// import was declared.
 ///
+/// When `ecosystem` is `Some`, this is an ecosystem-boundary import
+/// (`use <ecosystem>:<package>`). These are skipped by Saturnite module
+/// resolution — they are resolved at link/runtime by the interop bridge.
+///
 /// Actual path resolution to a target `DefId` is deferred to Phase 6.
 #[derive(Debug, Clone)]
 pub struct HirUseDecl {
@@ -108,6 +112,9 @@ pub struct HirUseDecl {
     pub module: ModuleId,
     /// Visibility of this `use` declaration.
     pub visibility: Visibility,
+    /// The ecosystem for ecosystem-boundary imports (e.g.
+    /// `use python:numpy`). `None` for ordinary module-path imports.
+    pub ecosystem: Option<crate::ast::ExternalKind>,
     pub span: SourceSpan,
 }
 

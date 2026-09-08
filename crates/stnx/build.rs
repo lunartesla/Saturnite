@@ -106,10 +106,7 @@ fn main() {
                     println!("cargo:rustc-env:SAT_PYTHON_LIBDIR={}", lib_dir);
                 }
                 if !inc_dirs.is_empty() {
-                    println!(
-                        "cargo:rustc-env:SAT_PYTHON_INC={}",
-                        inc_dirs.join(",")
-                    );
+                    println!("cargo:rustc-env:SAT_PYTHON_INC={}", inc_dirs.join(","));
                 }
                 println!("cargo:rerun-if-changed={}", pyrt_h.display());
                 println!("cargo:rerun-if-changed={}", pyrt_impl.display());

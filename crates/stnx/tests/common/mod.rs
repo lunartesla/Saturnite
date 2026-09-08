@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use stnx::lexer::Lexer;
+use stnx::lexer::prepare;
 use stnx::mir::codegen::{compile_from_mir_ext, generate_ir_from_mir};
 use stnx::mir::lower::lower_program;
 use stnx::mir::monomorphize::monomorphize;
@@ -48,10 +48,10 @@ impl Artifact {
 }
 
 /// Build a verified, optimized MIR program from `src`.
+/// Uses `prepare` (lex + indent pre-pass + colon-block desugaring) so that
+/// both native colon-indented syntax and legacy brace syntax are accepted.
 pub fn to_mir(src: &str) -> stnx::mir::MirProgram {
-    let tokens: Vec<_> = Lexer::new(src)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("lexing failed");
+    let tokens = prepare(src).expect("prepare failed");
     let program = parser::parse(src, tokens).expect("parsing failed");
     let hir = analyze_and_lower(&program).expect("semantic analysis failed");
     lower_to_mir(&hir)
@@ -139,9 +139,7 @@ pub fn compile_src_mono(src: &str) -> Artifact {
     let temp_dir = TempDir::new().expect("failed to create isolated temp dir");
     let exe_path = temp_dir.path().join("program");
 
-    let tokens: Vec<_> = Lexer::new(src)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("lexing failed");
+    let tokens = prepare(src).expect("prepare failed");
     let program = parser::parse(src, tokens).expect("parsing failed");
     let hir = analyze_and_lower(&program).expect("semantic analysis failed");
     let mir = lower_to_mir_mono(&hir);
@@ -161,10 +159,9 @@ pub fn compile_src_mono(src: &str) -> Artifact {
 pub type AnalysisResult = Result<(), String>;
 
 /// Lex -> parse -> analyze, converting errors to plain strings.
+/// Uses `prepare` so both native and legacy syntax are accepted.
 pub fn analyze_src(src: &str) -> AnalysisResult {
-    let tokens: Vec<_> = Lexer::new(src)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("Lex error: {}", e))?;
+    let tokens = prepare(src).map_err(|e| format!("Lex error: {}", e))?;
     let program = parser::parse(src, tokens).map_err(|e| format!("Parse error: {}", e))?;
     analyze_and_lower(&program).map_err(|e| format!("Semantic error: {}", e))?;
     Ok(())
