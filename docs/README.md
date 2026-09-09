@@ -23,6 +23,7 @@
 | [`SATURNITE_CRATE_DEPENDENCY_AUDIT.md`](./SATURNITE_CRATE_DEPENDENCY_AUDIT.md) | Dependency audit — all crate dependencies, versions, purposes, risk levels. |
 | [`DEPENDENCIES.md`](./DEPENDENCIES.md) | Dependency model — `saturn.toml` configuration, version requirements, future resolver plan. |
 | [`README.md`](../README.md) | Top-level project README — quick start, language reference, CLI reference, project layout. |
+| [Toolchain reference](../crates/saturn/src/lib.rs) | The `saturn` toolchain — project-oriented build, profiles, project discovery. |
 
 ---
 

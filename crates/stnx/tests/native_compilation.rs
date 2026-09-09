@@ -368,11 +368,34 @@ fn test_emit_object_file() {
     assert!(artifact.path().exists(), "object file should be created");
     let bytes = std::fs::read(artifact.path()).expect("should read object file");
     assert!(bytes.len() > 4, "object file should not be empty");
-    assert_eq!(
-        &bytes[0..4],
-        b"\x7fELF",
-        "object file should be a valid ELF"
-    );
+
+    // Verify the object file has a valid magic number for the current platform.
+    // Windows (PE/COFF): starts with 0x00 0x64 0xBA 0x00 (machine type)
+    // Linux (ELF): starts with \x7fELF
+    // macOS (Mach-O): starts with 0xCF 0xFA 0xED 0xFE (64-bit) or 0xCE 0xFA 0xED 0xFE (32-bit)
+    if cfg!(windows) {
+        // COFF object files start with a 2-byte machine type (e.g. 0x8664 for x86_64)
+        assert!(
+            bytes[0] != 0 || bytes[1] != 0,
+            "object file should have a non-zero machine type field (COFF)"
+        );
+        // Verify it's a valid COFF: the first two bytes are the machine type.
+        // For x86_64, this is 0x8664 (little-endian: 0x64, 0x86).
+        assert!(
+            (bytes[0] == 0x64 && bytes[1] == 0x86) || // x86_64
+            (bytes[0] == 0x4c && bytes[1] == 0x01) || // x86
+            (bytes[0] == 0xb7 && bytes[1] == 0x01) || // ARM64
+            (bytes[0] == 0x26 && bytes[1] == 0x02),   // ARM
+            "object file should be a valid COFF (Windows), got machine bytes: {:02x} {:02x}",
+            bytes[0], bytes[1]
+        );
+    } else {
+        assert_eq!(
+            &bytes[0..4],
+            b"\x7fELF",
+            "object file should be a valid ELF on non-Windows platforms"
+        );
+    }
 }
 
 // IR generation

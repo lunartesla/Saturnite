@@ -32,6 +32,9 @@ pub struct SaturnConfig {
     /// External dependencies, keyed by crate name.
     #[serde(default)]
     pub dependencies: BTreeMap<String, DependencySpec>,
+    /// Build configuration: source directory, entry file, etc.
+    #[serde(default)]
+    pub build: BuildConfig,
 }
 
 impl SaturnConfig {
@@ -75,6 +78,40 @@ edition = "2026"
         );
         Self::from_toml_str(&config_str)
     }
+}
+
+/// Build configuration section: `[build]`.
+///
+/// Controls where the compiler looks for source files and what the default
+/// entry point name is.  All fields are optional — sensible defaults are
+/// provided so that a minimal `saturn.toml` with just `[package]` works
+/// out of the box.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildConfig {
+    /// The source root directory relative to the project root (default: `src`).
+    #[serde(default = "default_source_dir")]
+    pub source: String,
+    /// The entry point file stem relative to the source root (default: `main`).
+    /// The toolchain appends `.stn` (canonical) and falls back to `.stnx`.
+    #[serde(default = "default_entry")]
+    pub entry: String,
+}
+
+impl Default for BuildConfig {
+    fn default() -> Self {
+        Self {
+            source: default_source_dir(),
+            entry: default_entry(),
+        }
+    }
+}
+
+fn default_source_dir() -> String {
+    "src".to_string()
+}
+
+fn default_entry() -> String {
+    "main".to_string()
 }
 
 /// Package metadata section: `[package]`.
@@ -212,6 +249,7 @@ dep-c = "0.5"
                 edition: "2026".to_string(),
             },
             dependencies: BTreeMap::new(),
+            build: BuildConfig::default(),
         };
         let toml_str = toml::to_string(&config).unwrap();
         let config2: SaturnConfig = toml::from_str(&toml_str).unwrap();

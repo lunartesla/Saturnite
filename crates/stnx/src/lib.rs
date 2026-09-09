@@ -82,7 +82,7 @@ pub use error::{
 //
 // `saturn.toml` configuration types and parsing logic.
 
-pub use config::{DependencySpec, Package, SaturnConfig};
+pub use config::{BuildConfig, DependencySpec, Package, SaturnConfig};
 
 // --- Module system re-exports ---
 //

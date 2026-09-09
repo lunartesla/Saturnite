@@ -631,23 +631,38 @@ impl Default for ModuleGraph {
 /// Resolve a `mod foo;` declaration to a file on disk.
 ///
 /// Given the directory of the current module's source file and a module name,
-/// try the following files in order:
+/// try the following files in order (canonical `.stn` first, legacy `.stnx`
+/// as fallback):
 ///
-/// 1. `<dir>/<name>.stnx` (single file)
-/// 2. `<dir>/<name>/mod.stnx` (directory module)
+/// 1. `<dir>/<name>.stn` (single file, canonical)
+/// 2. `<dir>/<name>.stnx` (single file, legacy fallback)
+/// 3. `<dir>/<name>/mod.stn` (directory module, canonical)
+/// 4. `<dir>/<name>/mod.stnx` (directory module, legacy fallback)
 ///
-/// Returns the first existing file, or `None` if neither exists.
+/// Returns the first existing file, or `None` if none exist.
 fn resolve_module_file(dir: &Path, name: &str) -> Option<PathBuf> {
-    // Rule 1: `<dir>/<name>.stnx`
-    let single_file = dir.join(format!("{}.stnx", name));
+    // Rule 1: `<dir>/<name>.stn` (canonical)
+    let single_file = dir.join(format!("{}.stn", name));
     if single_file.is_file() {
         return Some(single_file);
     }
 
-    // Rule 2: `<dir>/<name>/mod.stnx`
-    let mod_file = dir.join(name).join("mod.stnx");
+    // Rule 2: `<dir>/<name>.stnx` (legacy fallback)
+    let single_file_legacy = dir.join(format!("{}.stnx", name));
+    if single_file_legacy.is_file() {
+        return Some(single_file_legacy);
+    }
+
+    // Rule 3: `<dir>/<name>/mod.stn` (canonical)
+    let mod_file = dir.join(name).join("mod.stn");
     if mod_file.is_file() {
         return Some(mod_file);
+    }
+
+    // Rule 4: `<dir>/<name>/mod.stnx` (legacy fallback)
+    let mod_file_legacy = dir.join(name).join("mod.stnx");
+    if mod_file_legacy.is_file() {
+        return Some(mod_file_legacy);
     }
 
     None
@@ -760,6 +775,9 @@ fn parse_source(source: &str) -> CompilerResult<Program> {
 ///
 /// A `Project` bundles together the parsed [`SaturnConfig`], the project root
 /// directory, the source root directory, and the fully-discovered [`ModuleGraph`].
+///
+/// The entry point defaults to `<source_root>/main.stn` (with `.stnx` as a
+/// legacy fallback), resolving via the config's `[build]` section.
 pub struct Project {
     /// The parsed `saturn.toml` configuration.
     pub config: SaturnConfig,
@@ -841,14 +859,16 @@ impl Project {
 
     /// Load all modules for this project.
     ///
-    /// Determines the entry point (defaults to `<source_root>/main.stnx` if it
-    /// exists), then runs module discovery to build the complete [`ModuleGraph`].
+    /// Determines the entry point (from the config's `[build]` section, defaulting
+    /// to `<source_root>/main.stn`), then runs module discovery to build the
+    /// complete [`ModuleGraph`].
     pub fn load(&mut self) -> CompilerResult<Program> {
-        // Determine the entry point file.
-        let entry = self.source_root.join("main.stnx");
+        // Determine the entry point file from the config, trying canonical
+        // .stn first then legacy .stnx as fallback.
+        let entry = self.resolve_entry_point()?;
         if !entry.is_file() {
             return Err(CompilerError::config(format!(
-                "no entry point found: expected {} (create a saturn.toml project with src/main.stnx or pass a file explicitly)",
+                "no entry point found: expected {} (create a saturn.toml project with src/main.stn or pass a file explicitly)",
                 entry.display()
             )));
         }
@@ -863,6 +883,39 @@ impl Project {
             functions: Vec::new(),
             items: Vec::new(),
         }))
+    }
+
+    /// Resolve the project entry point from the config's `[build]` section.
+    ///
+    /// Tries the canonical `.stn` extension first, then falls back to `.stnx`
+    /// for backward compatibility with legacy projects.
+    pub fn resolve_entry_point(&self) -> CompilerResult<PathBuf> {
+        let entry = self.config.build.entry.clone();
+
+        // If the config entry already has an extension, try it as-is first.
+        let canonical_entry = self.source_root.join(&entry);
+
+        // Try the entry as-is (may already have .stn or .stnx).
+        if canonical_entry.is_file() {
+            return Ok(canonical_entry);
+        }
+
+        // If the entry has no extension, try .stn then .stnx.
+        let stem = &entry;
+        if !stem.ends_with(".stn") && !stem.ends_with(".stnx") {
+            let stn = self.source_root.join(format!("{}.stn", stem));
+            if stn.is_file() {
+                return Ok(stn);
+            }
+            let stnx = self.source_root.join(format!("{}.stnx", stem));
+            if stnx.is_file() {
+                return Ok(stnx);
+            }
+        }
+
+        // Return the canonical .stn path (even if it doesn't exist — the
+        // caller will report the "not found" error with a useful path).
+        Ok(self.source_root.join(format!("{}.stn", entry)))
     }
 
     /// Load the project from a specific file path (not necessarily the default entry).

@@ -5,3 +5,7 @@ edition = "2026"
 
 [dependencies]
 saturnite-stdlib = "0.1"
+
+[build]
+source = "src"
+entry = "main"

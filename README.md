@@ -33,22 +33,31 @@ Saturnite is:
 ## Quick start
 
 ```sh
-# Build the compiler (requires a system C compiler for the runtime)
+# Build the toolchain (requires a system C compiler for the runtime)
 cargo build --release
 
-# Run a Saturnite program (builds to a temp exe, then executes)
-./target/release/stnx run examples/hello.stn
+# Create a new project
+./target/release/saturn init myproj
+cd myproj
 
-# Or build it as a standalone executable
-./target/release/stnx build examples/hello.stn
-./target/debug/test_build  # the compiled binary
+# Build the project (debug profile by default)
+./target/release/saturn build
 
-# Type-check a program without producing code
-./target/release/stnx check examples/smoke_test.stnx
+# Run the project
+./target/release/saturn run
 
-# Scaffold a new project (creates ./myproj/saturn.toml + src/main.stnx)
-./target/release/stnx init myproj
+# Build the project with optimizations
+./target/release/saturn build --release
+
+# Type-check a project without producing code
+./target/release/saturn check
+
+# Remove build artifacts
+./target/release/saturn clean
 ```
+
+For quick single-file compilation (advanced usage), you can still pass a source file
+to `stnx build <file>` directly.
 
 ### Hello, world
 
@@ -262,7 +271,7 @@ let result = numbers
   `link.exe`/`gcc` (Windows)
 - **Diagnostics** — every compile stage has a `thiserror` error type
   rendered via `miette`
-- **Multi-module projects** — `saturn.toml` discovery, `src/main.stnx`
+- **Multi-module projects** — `saturn.toml` discovery, `src/main.stn`
   default entry, recursive module resolution
 
 ---
@@ -323,36 +332,38 @@ Saturnite source (.stn / .stnx)
 | Target config      | `src/target.rs`                | triple validation, optimization & debug levels      |
 | Runtime            | `crates/stnx/runtime/`         | C runtime compiled at build time via `build.rs`     |
 | Module system      | `src/module.rs`                | `ModuleGraph`, `Project`, discovery                 |
-| CLI                | `src/main.rs`                  | `build` / `check` / `run` / `doctor` / `init`       |
+| CLI                | `crates/stnx/src/main.rs`      | `build` / `check` / `run` / `doctor` / `init` (legacy, single-file) |
+| Toolchain          | `crates/saturn/src/`           | `build` / `run` / `check` / `test` / `clean` / `init` (project-oriented) |
 | Errors             | `src/error.rs`                 | `thiserror` + `miette::Diagnostic`                  |
 
 ---
 
 ## CLI reference
 
-```
-stnx build <FILE> [OPTIONS]      # Build to an executable, object, or IR
-  --debug                         # Debug profile (opt 0, debug info)
-  --release                       # Release profile (opt 3, no debug info)
-  --target <TRIPLE>               # Cross-compilation target (host-only in current release)
-  --opt-level <0|1|2|3>           # Override optimization level
-  --emit-ir <FILE>                # Emit LLVM IR text
-  --emit-object <FILE>           # Emit object file only
-  --emit-exe <FILE>              # Emit executable
-  --no-link                      # Stop after object emission
-  --save-temps                   # Keep intermediate .o files
-  --json                         # Structured build report
-  --verbose                      # Verbose output
-  --print-target                 # Print host triple and exit
+The `saturn` binary is the user-facing toolchain command:
 
-stnx check <FILE>                # Type & semantic check (no codegen)
-stnx run <FILE>                  # Build then execute
-stnx doctor                      # Print environment diagnostics
-stnx init [NAME]                 # Scaffold a new project
+```
+saturn build                        # Build the project (default: debug profile)
+saturn build --release              # Build with optimizations (release profile)
+saturn run                          # Build and run the project
+saturn check                        # Type-check without producing an executable
+saturn test                         # Run project tests
+saturn clean                        # Remove the current profile's build artifacts
+saturn clean --all                  # Remove the entire target/ directory
+saturn init [NAME]                  # Scaffold a new project
+saturn doctor                       # Print environment diagnostics
+
+saturn init --in-place              # Initialize in the current directory
 ```
 
-If `<FILE>` is omitted, the CLI looks for a `saturn.toml` project and
-defaults to `src/main.stnx`.
+When no source file is specified, `saturn` discovers the project by walking
+upward from the current directory to find `saturn.toml`, then uses the config's
+`[build]` section (defaulting to `src/main.stn` as the entry point).
+
+### stnx (legacy compiler binary)
+
+The `stnx` binary remains as the internal compiler library entry point.
+For normal project development, use `saturn` instead.
 
 ---
 
@@ -365,9 +376,9 @@ defaults to `src/main.stnx`.
 ├── examples/
 │   ├── hello.stn             # minimal "hello world"
 │   ├── interpolation_demo.stn # string interpolation demo
-│   ├── list_demo.stnx        # list literals, indexing, iteration
+│   ├── list_demo.stnx        # list literals, indexing, iteration (legacy)
 │   ├── native_demo.stn       # native syntax feature showcase
-│   └── smoke_test.stnx       # full native syntax demo
+│   └── smoke_test.stnx       # full native syntax demo (legacy)
 ├── docs/                     # canonical language docs
 │   ├── SATURNITE_SYNTAX.md   # canonical language syntax spec
 │   ├── INTEROPERABILITY.md   # Rust/Python native interop
@@ -376,28 +387,40 @@ defaults to `src/main.stnx`.
 │   ├── SATURNITE_0_4_ARCHITECTURE.md        # compiler architecture
 │   ├── README.md             # documentation index
 │   └── legacy/               # archived (NOT canonical) documentation
-└── crates/stnx/
-    ├── Cargo.toml
-    ├── build.rs              # compiles the C runtime via cc
-    ├── runtime/              # C runtime (println, lists, Python bridge)
-    └── src/
-        ├── main.rs           # CLI entry point
-        ├── lib.rs            # public API re-exports
-        ├── ast.rs            # AST nodes
-        ├── lexer/            # logos tokenizer + indent pre-pass
-        ├── parser/           # chumsky parser
-        ├── semantic.rs       # AST → HIR entry point
-        ├── hir/              # typed HIR (types, exprs, stmts, symbols)
-        ├── resolver.rs       # dedicated name-resolution pass
-        ├── mir/              # typed CFG (lower, verify, optimize)
-        ├── codegen/          # ObjectEmitter, Linker (shared seams)
-        ├── target.rs         # Profile, TargetConfig, triple handling
-        ├── module.rs         # ModuleGraph, Project, discovery
-        ├── config.rs         # saturn.toml parsing
-        ├── interop.rs        # dependency model + external-call contract
-        ├── interop_rust.rs   # Rust ABI bridge
-        ├── interop_python.rs # Python runtime bridge
-        └── error.rs          # CompilerError + miette Diagnostic
+├── crates/
+│   ├── stnx/                 # Saturnite compiler (library + CLI)
+│   │   ├── Cargo.toml
+│   │   ├── build.rs          # compiles the C runtime via cc
+│   │   ├── runtime/          # C runtime (println, lists, Python bridge)
+│   │   └── src/
+│   │       ├── main.rs       # CLI entry point (legacy: builds single files)
+│   │       ├── lib.rs        # public API re-exports
+│   │       ├── ast.rs        # AST nodes
+│   │       ├── lexer/        # logos tokenizer + indent pre-pass
+│   │       ├── parser/       # chumsky parser
+│   │       ├── semantic.rs   # AST → HIR entry point
+│   │       ├── hir/          # typed HIR (types, exprs, stmts, symbols)
+│   │       ├── resolver.rs   # dedicated name-resolution pass
+│   │       ├── mir/          # typed CFG (lower, verify, optimize)
+│   │       ├── codegen/      # ObjectEmitter, Linker (shared seams)
+│   │       ├── target.rs     # Profile, TargetConfig, triple handling
+│   │       ├── module.rs     # ModuleGraph, Project, discovery
+│   │       ├── config.rs     # saturn.toml parsing
+│   │       ├── interop.rs    # dependency model + external-call contract
+│   │       ├── interop_rust.rs # Rust ABI bridge
+│   │       ├── interop_python.rs # Python runtime bridge
+│   │       └── error.rs      # CompilerError + miette Diagnostic
+│   └── saturn/               # Saturnite toolchain (user-facing CLI)
+│       ├── Cargo.toml
+│       └── src/
+│           ├── main.rs       # `saturn` CLI entry point
+│           ├── lib.rs        # public API
+│           ├── cli.rs        # CLI argument definition (clap)
+│           ├── build.rs      # build orchestration (profiles, target dir)
+│           ├── cmd.rs        # init, doctor commands
+│           ├── discover.rs   # project discovery (walk-up for saturn.toml)
+│           ├── manifest.rs   # saturn.toml manifest representation
+│           └── profile.rs    # build profiles (debug/release), platform info
 ```
 
 ---
@@ -422,6 +445,18 @@ defaults to `src/main.stnx`.
 ---
 
 ## Build configuration
+
+`saturn.toml` is the project manifest (Saturnite's equivalent of `Cargo.toml`).
+The `[build]` section controls source layout:
+
+```toml
+[build]
+source = "src"      # source root directory (default: "src")
+entry = "main"      # entry file stem (default: "main")
+```
+
+The toolchain resolves the entry point by trying `<source>/<entry>.stn`
+first (canonical), then `<source>/<entry>.stnx` (legacy fallback).
 
 - **Debug profile:** `target/debug/<name>` — optimization off, debug info on.
 - **Release profile:** `target/release/<name>` — optimization level 3, no debug info.

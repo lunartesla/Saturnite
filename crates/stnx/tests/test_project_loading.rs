@@ -96,7 +96,7 @@ fn test_project_loading_single_file_executable() {
 
     // Lay out a real project: saturn.toml + src/main.stnx.
     write_saturn_toml(root, "proj_single", "0.1.0", "2026");
-    let main_file = write_file(root, "src/main.stnx", println_program());
+    let main_file = write_file(root, "src/main.stn", println_program());
 
     // Mirror the main.rs driver exactly: discover then load_from.
     let mut project = Project::discover(&main_file).expect("Project::discover should succeed");
@@ -131,7 +131,7 @@ fn test_project_discovery_from_subdirectory_full_pipeline() {
     let root = tmp.path();
 
     write_saturn_toml(root, "subdir_project", "0.2.0", "2026");
-    let main_file = write_file(root, "src/main.stnx", println_program());
+    let main_file = write_file(root, "src/main.stn", println_program());
 
     // Create a file located in a subdirectory of the source root so that
     // Project::discover must walk upward to locate the real project root.
@@ -179,11 +179,11 @@ fn test_project_discovery_no_saturn_toml_full_pipeline() {
     let root = tmp.path();
 
     // No saturn.toml — discover() should synthesize a config from the starting
-    // directory name and still work end-to-end.  We place main.stnx directly in
+    // directory name and still work end-to-end.  We place main.stn directly in
     // `root` (not in `src/`) so that `discover` from the file path uses `root`
     // as the start directory and synthesizes the package name from the temp
     // dir's random name.
-    let main_file = write_file(root, "main.stnx", println_program());
+    let main_file = write_file(root, "main.stn", println_program());
 
     let mut project = Project::discover(&main_file).expect("synthesized discovery should succeed");
     // The synthesized name comes from the directory name (TempDir's random name).

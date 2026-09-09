@@ -1,6 +1,6 @@
 
 [workspace]
-members = ["crates/stnx"]
+members = ["crates/stnx", "crates/saturn"]
 resolver = "3"
 
 [workspace.package]
