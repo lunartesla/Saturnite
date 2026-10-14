@@ -43,7 +43,19 @@ pub fn analyze_and_lower_with_graph(
     program: &Program,
     graph: &crate::module::ModuleGraph,
 ) -> CompilerResult<hir::HirProgram> {
-    let mut hir = hir::lower::lower_with_graph(program, graph)?;
+    analyze_and_lower_with_graph_and_root(program, graph, None)
+}
+
+/// Like [`analyze_and_lower_with_graph`], but also passes a project root
+/// directory for ecosystem wrapper metadata resolution. When `project_root`
+/// is `Some`, ecosystem `use` declarations (e.g. `use rust:crate`) trigger
+/// auto-generation of external function entries from wrapper metadata files.
+pub fn analyze_and_lower_with_graph_and_root(
+    program: &Program,
+    graph: &crate::module::ModuleGraph,
+    project_root: Option<std::path::PathBuf>,
+) -> CompilerResult<hir::HirProgram> {
+    let mut hir = hir::lower::lower_with_graph_and_root(program, graph, project_root)?;
     crate::resolver::resolve_modules(&mut hir)?;
     Ok(hir)
 }

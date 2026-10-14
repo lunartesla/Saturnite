@@ -127,12 +127,16 @@ impl BuildContext {
         let program = project.load()?;
 
         // Semantic analysis: AST → HIR (graph-aware for multi-module).
-        let hir = stnx::semantic::analyze_and_lower_with_graph(&program, &project.graph)
-            .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
+        let hir = stnx::semantic::analyze_and_lower_with_graph_and_root(
+            &program,
+            &project.graph,
+            Some(project.root.clone()),
+        )
+        .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
 
         // HIR → MIR (with monomorphization for generics).
-        let mut mir = monomorphize(&hir)
-            .map_err(|e| anyhow::anyhow!("monomorphization failed: {}", e))?;
+        let mut mir =
+            monomorphize(&hir).map_err(|e| anyhow::anyhow!("monomorphization failed: {}", e))?;
 
         // Verify MIR CFG.
         if let Err(errs) = mir.verify() {
@@ -164,10 +168,7 @@ impl BuildContext {
     pub fn check(&self) -> Result<()> {
         let entry = &self.entry;
         if !entry.is_file() {
-            anyhow::bail!(
-                "no entry point found: expected {}",
-                entry.display()
-            );
+            anyhow::bail!("no entry point found: expected {}", entry.display());
         }
 
         let mut project = Project::discover(entry)?;
@@ -176,8 +177,12 @@ impl BuildContext {
         // This runs lexing, parsing, HIR lowering, and module resolution —
         // but does NOT generate code or emit an object/executable.
 
-        stnx::semantic::analyze_and_lower_with_graph(&program, &project.graph)
-            .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
+        stnx::semantic::analyze_and_lower_with_graph_and_root(
+            &program,
+            &project.graph,
+            Some(project.root.clone()),
+        )
+        .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
 
         Ok(())
     }
@@ -190,9 +195,7 @@ impl BuildContext {
         // Execute the resulting binary.
         let status = std::process::Command::new(&result.output)
             .status()
-            .map_err(|e| {
-                anyhow::anyhow!("failed to execute {}: {}", result.output.display(), e)
-            })?;
+            .map_err(|e| anyhow::anyhow!("failed to execute {}: {}", result.output.display(), e))?;
 
         Ok(status.code().unwrap_or(1))
     }
@@ -230,12 +233,8 @@ pub fn needs_rebuild(source: &Path, output: &Path) -> bool {
     if !output.exists() {
         return true;
     }
-    let src_mtime = std::fs::metadata(source)
-        .and_then(|m| m.modified())
-        .ok();
-    let out_mtime = std::fs::metadata(output)
-        .and_then(|m| m.modified())
-        .ok();
+    let src_mtime = std::fs::metadata(source).and_then(|m| m.modified()).ok();
+    let out_mtime = std::fs::metadata(output).and_then(|m| m.modified()).ok();
 
     match (src_mtime, out_mtime) {
         (Some(s), Some(o)) => s > o,

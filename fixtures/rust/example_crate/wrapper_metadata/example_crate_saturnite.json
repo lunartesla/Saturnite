@@ -1,0 +1,23 @@
+{
+  "crate_name": "example_crate",
+  "functions": [
+    {
+      "name": "add",
+      "symbol": "sat_example_crate_add_i64",
+      "params": ["i64", "i64"],
+      "ret": "i64"
+    },
+    {
+      "name": "multiply",
+      "symbol": "sat_example_crate_multiply_i64",
+      "params": ["i64", "i64"],
+      "ret": "i64"
+    },
+    {
+      "name": "greet",
+      "symbol": "sat_example_crate_greet",
+      "params": ["c_str"],
+      "ret": "c_str"
+    }
+  ]
+}

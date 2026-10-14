@@ -385,9 +385,10 @@ fn test_emit_object_file() {
             (bytes[0] == 0x64 && bytes[1] == 0x86) || // x86_64
             (bytes[0] == 0x4c && bytes[1] == 0x01) || // x86
             (bytes[0] == 0xb7 && bytes[1] == 0x01) || // ARM64
-            (bytes[0] == 0x26 && bytes[1] == 0x02),   // ARM
+            (bytes[0] == 0x26 && bytes[1] == 0x02), // ARM
             "object file should be a valid COFF (Windows), got machine bytes: {:02x} {:02x}",
-            bytes[0], bytes[1]
+            bytes[0],
+            bytes[1]
         );
     } else {
         assert_eq!(

@@ -24,13 +24,13 @@ pub use build::BuildContext;
 pub use cli::SaturnCli;
 pub use discover::ProjectDiscovery;
 pub use manifest::Manifest;
-pub use profile::{BuildProfile, PlatformInfo, executable_name, platform_triple};
+pub use profile::{executable_name, platform_triple, BuildProfile, PlatformInfo};
 
 pub mod prelude {
     pub use crate::build::BuildContext;
     pub use crate::cli::SaturnCli;
     pub use crate::discover::ProjectDiscovery;
     pub use crate::manifest::Manifest;
-    pub use crate::profile::{BuildProfile, PlatformInfo, executable_name, platform_triple};
+    pub use crate::profile::{executable_name, platform_triple, BuildProfile, PlatformInfo};
     pub use clap::{Parser, Subcommand};
 }

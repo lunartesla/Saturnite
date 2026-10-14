@@ -256,8 +256,12 @@ fn main() -> anyhow::Result<()> {
             // (mod decls, use decls) are correctly resolved. The
             // single-file case is a graph with just the root module, so
             // this works for both single- and multi-file programs.
-            let hir = stnx::semantic::analyze_and_lower_with_graph(&program, &project.graph)
-                .map_err(render_diagnostic)?;
+            let hir = stnx::semantic::analyze_and_lower_with_graph_and_root(
+                &program,
+                &project.graph,
+                Some(project.root.clone()),
+            )
+            .map_err(render_diagnostic)?;
 
             // Lower HIR → MIR (the single production codegen seam).
             let mut mir = monomorphize(&hir)
@@ -501,8 +505,12 @@ fn build_run_file(
     // Use the graph-aware lowering path so multi-module projects
     // (mod decls, use decls) are correctly resolved. The single-file
     // case is a graph with just the root module, so this works for both.
-    let hir = stnx::semantic::analyze_and_lower_with_graph(&program, &project.graph)
-        .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
+    let hir = stnx::semantic::analyze_and_lower_with_graph_and_root(
+        &program,
+        &project.graph,
+        Some(project.root.clone()),
+    )
+    .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
 
     // Lower HIR → MIR (the single production codegen seam).
     let mut mir =
@@ -558,8 +566,12 @@ fn check_file(input: &std::path::Path) -> anyhow::Result<()> {
     let program = project.load_from(input)?;
     // Use the graph-aware lowering path so multi-module projects get the
     // same `use` / `mod` resolution as Build and Run.
-    stnx::semantic::analyze_and_lower_with_graph(&program, &project.graph)
-        .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
+    stnx::semantic::analyze_and_lower_with_graph_and_root(
+        &program,
+        &project.graph,
+        Some(project.root.clone()),
+    )
+    .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
 
     Ok(())
 }

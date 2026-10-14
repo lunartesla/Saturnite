@@ -46,6 +46,24 @@ fn ast_visibility_to_hir(vis: &Visibility) -> HirVisibility {
     }
 }
 
+/// Convert a type name string (from wrapper metadata JSON) to a `HirType`.
+/// This is the reverse of interning — we map known ABI-safe type names
+/// to their `HirType` equivalents.
+fn type_str_to_hir(s: &str) -> HirType {
+    match s {
+        "i64" => HirType::I64,
+        "i32" => HirType::I64,
+        "i16" => HirType::I64,
+        "i8" => HirType::I64,
+        "f64" => HirType::F64,
+        "f32" => HirType::F64,
+        "bool" => HirType::Bool,
+        "unit" => HirType::Unit,
+        "str" | "c_str" | "string" => HirType::Str,
+        _ => HirType::Str, // Unknown types default to Str (opaque)
+    }
+}
+
 /// A lightweight function signature for call-site checking.
 struct FunctionSig {
     def_id: DefId,
@@ -179,9 +197,44 @@ fn ast_type_to_hir(
     }
 }
 
+/// Metadata for an auto-generated ecosystem function (from a wrapper crate).
+/// This is the JSON-deserialized form of the wrapper metadata file.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct EcosystemFunctionMeta {
+    pub name: String,
+    pub symbol: String,
+    pub params: Vec<String>,
+    pub ret: String,
+}
+
+/// Wrapper metadata file for an ecosystem dependency.
+/// For Rust: `crate_name` is the crate name; for Python: `module` is the module name.
+/// Both are deserialized into `ecosystem_name` for unified access.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct WrapperMetadata {
+    #[serde(default, alias = "module")]
+    pub crate_name: String,
+    pub functions: Vec<EcosystemFunctionMeta>,
+}
+
+impl WrapperMetadata {
+    /// The ecosystem name (crate name for Rust, module name for Python).
+    pub fn ecosystem_name(&self) -> &str {
+        if self.crate_name.is_empty() {
+            ""
+        } else {
+            &self.crate_name
+        }
+    }
+}
+
 /// The HIR lowering driver.
 pub struct HirLower {
     pub symbols: SymbolInterner,
+    /// Optional project root directory for resolving wrapper metadata files.
+    /// When set, ecosystem `use` declarations trigger auto-generation of
+    /// external function entries from wrapper metadata.
+    pub project_root: Option<std::path::PathBuf>,
 }
 
 impl Default for HirLower {
@@ -194,7 +247,20 @@ impl HirLower {
     pub fn new() -> Self {
         Self {
             symbols: SymbolInterner::default(),
+            project_root: None,
         }
+    }
+
+    /// Set the project root directory for wrapper metadata resolution.
+    pub fn with_project_root(mut self, root: std::path::PathBuf) -> Self {
+        self.project_root = Some(root);
+        self
+    }
+
+    /// Set the project root directory from an optional `PathBuf`.
+    pub fn with_project_root_flag(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.project_root = root;
+        self
     }
 
     /// Allocate a fresh `DefId` for a use/mod declaration.
@@ -609,6 +675,20 @@ impl HirLower {
                 generic_params: Vec::new(),
             },
         );
+
+        // --- Ecosystem namespace registration ---
+        // Process `use rust:crate`, `use python:module`, etc. by reading
+        // wrapper metadata and auto-generating external function entries.
+        // Each discovered function is registered in `function_sigs` under
+        // `alias.member_name` (e.g. `rust_lib.add`) so that qualified call
+        // syntax resolves through the existing Expr::Call path.
+        self.process_ecosystem_imports(
+            &use_decls,
+            &mut function_sigs,
+            &mut external_functions,
+            &mut next_func_def_id,
+        )?;
+
         // Check for main
         let main_sym = self.symbols.intern("main");
         if !function_sigs.contains_key(&main_sym) {
@@ -1268,6 +1348,14 @@ impl HirLower {
             },
         );
 
+        // --- Ecosystem namespace registration (same as lower_program) ---
+        self.process_ecosystem_imports(
+            &use_decls,
+            &mut function_sigs,
+            &mut external_functions,
+            &mut next_func_def_id,
+        )?;
+
         // Check for main — it must exist in at least one module (typically root).
         let main_sym = self.symbols.intern("main");
         if !function_sigs.contains_key(&main_sym) {
@@ -1442,6 +1530,158 @@ impl HirLower {
             use_decls,
             mod_decls,
         })
+    }
+
+    /// Process ecosystem imports (`use rust:crate`, `use python:module`) by
+    /// reading wrapper metadata JSON and auto-generating external function
+    /// entries. Each discovered function is registered in `function_sigs`
+    /// under `alias.member_name` so qualified calls resolve through the
+    /// existing `Expr::Call` path.
+    fn process_ecosystem_imports(
+        &mut self,
+        use_decls: &[HirUseDecl],
+        function_sigs: &mut std::collections::HashMap<SymbolId, FunctionSig>,
+        external_functions: &mut Vec<HirExternalFunction>,
+        next_def_id: &mut u32,
+    ) -> CompilerResult<()> {
+        if self.project_root.is_none() {
+            // No project root set — skip ecosystem metadata loading.
+            // Ecosystem imports are still registered as use_decls but
+            // qualified calls to unknown members will error at call-site
+            // resolution.
+            return Ok(());
+        }
+
+        let root = self.project_root.as_ref().unwrap();
+        let wrapper_dir = root.join("target").join("saturnite").join("wrappers");
+
+        // Phase 1: collect ecosystem import info and read metadata files.
+        // We separate reading/interning from mutation to satisfy the borrow
+        // checker: self.symbols.lookup() borrows self.symbols immutably,
+        // while self.symbols.intern() borrows it mutably.
+        let mut ecosystem_info: Vec<(
+            SymbolId,
+            crate::ast::ExternalKind,
+            Vec<EcosystemFunctionMeta>,
+            String,
+        )> = Vec::new();
+
+        for ud in use_decls {
+            let Some(eco) = &ud.ecosystem else {
+                continue;
+            };
+
+            let alias_str = self.symbols.lookup(ud.alias).unwrap_or("");
+            let pkg_str = ud
+                .path
+                .iter()
+                .filter_map(|s| self.symbols.lookup(*s))
+                .next()
+                .unwrap_or("");
+
+            // Read wrapper metadata JSON from target/saturnite/wrappers/
+            let meta_path = wrapper_dir.join(format!("{}_saturnite.json", pkg_str));
+            if !meta_path.exists() {
+                continue;
+            }
+
+            let meta_contents = std::fs::read_to_string(&meta_path).map_err(|e| {
+                CompilerError::semantic(format!(
+                    "failed to read ecosystem wrapper metadata for '{}': {}",
+                    pkg_str, e
+                ))
+            })?;
+
+            let metadata: WrapperMetadata = serde_json::from_str(&meta_contents).map_err(|e| {
+                CompilerError::semantic(format!(
+                    "invalid ecosystem wrapper metadata for '{}': {}",
+                    pkg_str, e
+                ))
+            })?;
+
+            let ecosystem_name = metadata.ecosystem_name().to_string();
+            ecosystem_info.push((ud.alias, eco.clone(), metadata.functions, ecosystem_name));
+        }
+
+        // Phase 2: generate external function entries from collected metadata.
+        // This phase only calls self.symbols.intern (mutable), which is safe
+        // since the immutable borrows above are done.
+        for (alias_sym, eco, funcs, ecosystem_name) in ecosystem_info {
+            let alias_str = self.symbols.lookup(alias_sym).unwrap_or("").to_string();
+
+            let ext_kind = eco.clone();
+
+            for func_meta in &funcs {
+                let qualified_name = format!("{}.{}", alias_str, func_meta.name);
+                let name_sym = self.symbols.intern(&qualified_name);
+
+                let def_id = DefId(*next_def_id);
+                *next_def_id += 1;
+
+                // Convert type strings to HirType
+                let param_types: Vec<HirType> = func_meta
+                    .params
+                    .iter()
+                    .map(|t| type_str_to_hir(t))
+                    .collect();
+                let return_type = type_str_to_hir(&func_meta.ret);
+
+                // Validate ABI safety (only i64, f64, bool, unit, str are allowed)
+                for (i, ty) in param_types.iter().enumerate() {
+                    if !is_abi_safe(ty) && !matches!(ty, HirType::Str) {
+                        return Err(CompilerError::semantic(format!(
+                            "ecosystem function `::{}' parameter {} has unsupported type {:?}. \
+                             External calls only support i64, f64, bool, and str.",
+                            func_meta.name,
+                            i + 1,
+                            ty
+                        )));
+                    }
+                }
+                if !is_abi_safe(&return_type)
+                    && !matches!(return_type, HirType::Str)
+                    && !matches!(return_type, HirType::Unit)
+                {
+                    return Err(CompilerError::semantic(format!(
+                        "ecosystem function `::{}' has unsupported return type {:?}. \
+                         External calls only support i64, f64, bool, str, and Unit.",
+                        func_meta.name, return_type
+                    )));
+                }
+
+                let param_names: Vec<SymbolId> = (0..param_types.len())
+                    .map(|i| self.symbols.intern(&format!("arg{}", i)))
+                    .collect();
+
+                let span = miette::SourceSpan::new(0.into(), 0);
+
+                function_sigs.insert(
+                    name_sym,
+                    FunctionSig {
+                        def_id,
+                        param_types: param_types.clone(),
+                        param_names: param_names.clone(),
+                        return_type: return_type.clone(),
+                        generic_params: Vec::new(),
+                    },
+                );
+
+                external_functions.push(HirExternalFunction {
+                    def_id,
+                    kind: ext_kind.clone(),
+                    ecosystem: ecosystem_name.clone(),
+                    symbol: func_meta.symbol.clone(),
+                    name: name_sym,
+                    param_names,
+                    param_types,
+                    return_type,
+                    span,
+                    module: ModuleId::ROOT,
+                });
+            }
+        }
+
+        Ok(())
     }
 
     fn lower_function(
@@ -2586,6 +2826,21 @@ pub fn lower_unit(program: &Program) -> CompilerResult<()> {
 /// to child module IDs.
 pub fn lower_with_graph(program: &Program, graph: &ModuleGraph) -> CompilerResult<HirProgram> {
     let mut hir_lower = HirLower::new();
+    hir_lower.lower_program_with_graph(program, graph)
+}
+
+/// Lower an `ast::Program` using a [`ModuleGraph`] with an optional project
+/// root for ecosystem wrapper metadata resolution.
+///
+/// When `project_root` is `Some`, ecosystem `use` declarations (e.g.
+/// `use rust:crate`) trigger auto-generation of external function entries
+/// from wrapper metadata files in `<root>/target/saturnite/wrappers/`.
+pub fn lower_with_graph_and_root(
+    program: &Program,
+    graph: &ModuleGraph,
+    project_root: Option<std::path::PathBuf>,
+) -> CompilerResult<HirProgram> {
+    let mut hir_lower = HirLower::new().with_project_root_flag(project_root);
     hir_lower.lower_program_with_graph(program, graph)
 }
 

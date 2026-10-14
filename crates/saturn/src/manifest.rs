@@ -83,11 +83,66 @@ impl Default for BuildSection {
     }
 }
 
-/// A dependency specification (version requirement).
+/// The runtime that services an external call. Mirrors `stnx::interop::DependencyKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DependencyKind {
+    #[serde(rename = "saturnite")]
+    Saturnite,
+    #[serde(rename = "rust")]
+    Rust,
+    #[serde(rename = "python")]
+    Python,
+    #[serde(rename = "native")]
+    Native,
+}
+
+/// A dependency specification.
+///
+/// Supports two TOML forms:
+/// - Simple: `name = "0.1"` (defaults to `Saturnite` kind)
+/// - Full: `name = { kind = "rust", version = "1.0" }`
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(transparent)]
-pub struct DependencySpec {
-    pub version: String,
+#[serde(untagged)]
+pub enum DependencySpec {
+    /// Simple string form: `"0.1"` → version with default `Saturnite` kind.
+    Simple(String),
+    /// Full struct form: `{ kind = "rust", version = "1.0" }`.
+    Full {
+        kind: DependencyKind,
+        version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+    },
+}
+
+impl DependencySpec {
+    pub fn kind(&self) -> DependencyKind {
+        match self {
+            DependencySpec::Simple(_) => DependencyKind::Saturnite,
+            DependencySpec::Full { kind, .. } => *kind,
+        }
+    }
+
+    pub fn version(&self) -> &str {
+        match self {
+            DependencySpec::Simple(v) => v,
+            DependencySpec::Full { version, .. } => version,
+        }
+    }
+
+    pub fn target(&self) -> Option<&str> {
+        match self {
+            DependencySpec::Simple(_) => None,
+            DependencySpec::Full { target, .. } => target.as_deref(),
+        }
+    }
+}
+
+impl std::str::FromStr for DependencySpec {
+    type Err = toml::de::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::Simple(s.to_string()))
+    }
 }
 
 impl Manifest {
@@ -166,7 +221,7 @@ entry = "main"
         } else {
             self.dependencies
                 .iter()
-                .map(|(k, v)| format!("{} = \"{}\"", k, v.version))
+                .map(|(k, v)| format!("{} = \"{}\"", k, v.version()))
                 .collect::<Vec<_>>()
                 .join("\n")
         };

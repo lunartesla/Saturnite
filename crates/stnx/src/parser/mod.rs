@@ -789,6 +789,36 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
                     span: name_span,
                 },
             ))
+            // Qualified call: `namespace.member(args)` or `namespace.member::<T>(args)`.
+            // This is the syntax for calling functions from ecosystem imports
+            // (e.g. `rust_lib.add(20, 22)` after `use rust:crate as rust_lib`).
+            // We require the parens so that bare `namespace.member` field access
+            // is still handled by the postfix operator below.
+            .or(t_ident()
+                .then(dot().ignore_then(t_ident()))
+                .then(
+                    double_colon()
+                        .ignore_then(lt())
+                        .ignore_then(type_atom().separated_by(comma()).collect::<Vec<_>>())
+                        .then_ignore(gt())
+                        .or_not(),
+                )
+                .then(
+                    lparen()
+                        .ignore_then(call_args(expr.clone()))
+                        .then_ignore(rparen()),
+                )
+                .map(|((((ns, ns_span), (member, _)), type_args), parsed)| {
+                    let (args, named_args) = parsed;
+                    let func = format!("{}.{}", ns, member);
+                    Expr::Call {
+                        func,
+                        args,
+                        named_args,
+                        type_args: type_args.unwrap_or_default(),
+                        span: ns_span,
+                    }
+                }))
             // Call or variable: `f` or `f(args)` or `f::<T>(args)`.
             //
             // The turbofish `::<T1, T2>` is consumed before the optional
@@ -2028,6 +2058,52 @@ mod tests {
                 assert_eq!(*ecosystem, None);
             }
             other => panic!("expected UseDecl, got {:?}", other),
+        }
+    }
+
+    // --- qualified call syntax (ecosystem interop) ---
+
+    #[test]
+    fn test_parse_qualified_call() {
+        // `rust_lib.add(20, 22)` should parse as a Call with func="rust_lib.add"
+        let prog = parse_src("fn main() -> i64 { let x = rust_lib.add(20, 22) return x }\n");
+        // Find the call in the function body
+        let func = &prog.functions[0];
+        // The let stmt should contain an Expr::Call with func "rust_lib.add"
+        match &func.body[0] {
+            Stmt::Let { value, .. } => match value {
+                Expr::Call { func, args, .. } => {
+                    assert_eq!(func, "rust_lib.add");
+                    assert_eq!(args.len(), 2);
+                }
+                other => panic!("expected Call, got {:?}", other),
+            },
+            other => panic!("expected Let, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_qualified_call_no_parens_is_field_access() {
+        // `rust_lib.add` without parens should NOT be a qualified call.
+        // It should fall through to Var + postfix FieldAccess.
+        let prog = parse_src("fn main() -> i64 { let x = rust_lib.add return 0 }\n");
+        let func = &prog.functions[0];
+        match &func.body[0] {
+            Stmt::Let { value, .. } => match value {
+                Expr::FieldAccess {
+                    expr,
+                    field,
+                    span: _,
+                } => {
+                    assert_eq!(field, "add");
+                    match expr.as_ref() {
+                        Expr::Var(name, _) => assert_eq!(name, "rust_lib"),
+                        other => panic!("expected Var, got {:?}", other),
+                    }
+                }
+                other => panic!("expected FieldAccess, got {:?}", other),
+            },
+            other => panic!("expected Let, got {:?}", other),
         }
     }
 

@@ -133,14 +133,8 @@ fn test_build_config_defaults() {
 #[test]
 fn test_platform_aware_executable_naming() {
     if cfg!(windows) {
-        assert_eq!(
-            saturn::profile::executable_name("myapp"),
-            "myapp.exe"
-        );
+        assert_eq!(saturn::profile::executable_name("myapp"), "myapp.exe");
     } else {
-        assert_eq!(
-            saturn::profile::executable_name("myapp"),
-            "myapp"
-        );
+        assert_eq!(saturn::profile::executable_name("myapp"), "myapp");
     }
 }

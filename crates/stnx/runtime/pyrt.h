@@ -156,6 +156,46 @@ bool sat_py_call(sat_py_object_handle *callable, const sat_py_value *args, size_
 /// bridge itself failed (e.g. the interpreter could not be initialized).
 bool sat_py_call_flat(const char *spec, const char *search_path, const int32_t *kinds, const int64_t *values, size_t arg_count, sat_py_result *out);
 
+/// Set or replace the search path for Python module imports. `search_path` is
+/// a PATH-style list of directories separated by the platform path separator.
+/// This is useful for `use python:module` — the module handle is cached so
+/// subsequent calls reuse it without re-importing.
+void sat_py_set_search_path(const char *search_path);
+
+/// Get a cached module handle by name. Returns NULL if the module has not
+/// been imported yet or the import failed. The returned handle is owned by
+/// the caller and must be released with `sat_py_release_handle`.
+sat_py_object_handle *sat_py_get_cached_module(const char *name);
+
+/// Import a module and cache its handle for later use by `sat_py_call_handle`.
+/// Returns an owned handle on success, NULL on failure.
+sat_py_object_handle *sat_py_import_and_cache(const char *name, const char *search_path);
+
+/// Get an attribute (e.g. a method) from an opaque Python object handle.
+/// Returns an owned handle representing the attribute value, or NULL on
+/// failure (attribute missing, Python exception, etc.).
+sat_py_object_handle *sat_py_get_attr(sat_py_object_handle *object, const char *name);
+
+/// Call a method on an opaque Python object handle. This is the handle-based
+/// equivalent of `sat_py_call_flat` — the callable and all arguments are
+/// passed as handles, and the spec is `"class::method"` or just `"method"`
+/// (for method calls on an object, the object itself is passed as the
+/// receiver via `self` in Python's convention).
+///
+/// `handle` is the object whose method is being called.
+/// `method_name` is the attribute name to look up on the object.
+/// `kinds`/`values`/`arg_count` describe the additional arguments (the
+/// receiver is implicit — it's `handle` itself).
+/// `search_path` is used for any module imports the method triggers.
+///
+/// Returns `true` on success (including when the Python code raised, which
+/// is reported in `out` with `ok == false`). Returns `false` only when the
+/// bridge itself failed.
+bool sat_py_call_method(sat_py_object_handle *handle, const char *method_name,
+                        const char *search_path,
+                        const int32_t *kinds, const int64_t *values,
+                        size_t arg_count, sat_py_result *out);
+
 /// Release a Python object handle, decrementing its reference count.
 /// Safe to call with NULL.
 void sat_py_release_handle(void *handle);

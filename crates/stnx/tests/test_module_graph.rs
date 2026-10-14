@@ -541,7 +541,7 @@ my-local-crate = "2.0"
             .dependencies
             .get("saturnite-stdlib")
             .unwrap()
-            .version,
+            .version(),
         "0.1"
     );
     assert_eq!(
@@ -550,7 +550,7 @@ my-local-crate = "2.0"
             .dependencies
             .get("my-local-crate")
             .unwrap()
-            .version,
+            .version(),
         "2.0"
     );
 }

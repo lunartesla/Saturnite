@@ -1,0 +1,862 @@
+================================================================================
+SATURNITE COMPILER — CODEGEN MODULE TECHNICAL SPECIFICATION
+================================================================================
+
+Location:  crates/stnx/src/codegen/
+Files:     mod.rs, emitter.rs, linker.rs
+Crate:     stnx (the Saturnite compiler, crates/stnx/Cargo.toml)
+Version:   0.1.0 (edition 2021)
+
+External Dependencies (from Cargo.toml):
+  - inkwell 0.9.0   (LLVM bindings, features: llvm21-1-prefer-dynamic, target-x86)
+  - which 5.0.0      (executable lookup on PATH)
+  - cc 1.x (build-dependency; compiles runtime/*.c into libsaturnite_runtime.a)
+  - miette 7, thiserror 2 (error infrastructure)
+
+================================================================================
+MODULE PURPOSE AND PIPELINE POSITION
+================================================================================
+
+The `codegen` module provides the *backend seams* for the Saturnite compiler
+pipeline:
+
+  Source -> Lexer -> Parser -> AST -> HIR -> MIR -> [mir::codegen] -> LLVM IR
+          -> [codegen::emitter] -> Object File -> [codegen::linker] -> Executable
+
+Specifically, this module owns:
+  1. Object emission: translating an in-memory LLVM `Module` into an on-disk
+     `.o` object file (or emitting IR text).
+  2. Linking: invoking a platform-appropriate system linker to combine the
+     object file with the Saturnite runtime and any declared external
+     interop libraries into a final executable.
+
+The MIR->LLVM-IR translation itself lives in `crate::mir::codegen`
+(mir/codegen.rs). That module produces the `inkwell::module::Module`, then
+delegates to this module's `ObjectEmitter` and `Linker` for the final
+backend stages.
+
+================================================================================
+FILE-BY-FILE BREAKDOWN
+================================================================================
+
+------------------------------------------------------------------------------
+1. mod.rs  (module root)
+------------------------------------------------------------------------------
+
+Purpose:
+  Re-exports types and provides two convenience free functions.
+
+Module-level documentation (rustdoc):
+  Describes the module as providing "LLVM backend seams" — object emission
+  and linking stages that `mir::codegen` delegates to.
+
+Re-exports:
+  - `pub mod emitter;`  — the ObjectEmitter submodule.
+  - `pub mod linker;`   — the Linker submodule.
+  - `pub use emitter::ObjectEmitter;`
+  - `pub use linker::Linker;`
+  - `pub use crate::target::TargetConfig;`  — re-exported so callers can
+    refer to it as `codegen::TargetConfig`.
+
+  Also: `use crate::error::CompilerResult;` (private, used in the free
+  functions below).
+
+Free Functions:
+
+  /// Check that a linker is available for the given target configuration.
+  pub fn check_linker(target_config: &TargetConfig) -> CompilerResult<()>
+  - Delegates to `linker::check_linker_available(target_config)`.
+  - Returns Ok(()) if the platform-appropriate linker binary is found and
+    responds to `--version` (or `/?` on MSVC).
+  - Returns Err(CompilerError::Link(...)) if the linker is not found or
+    exits with a non-success status.
+  - Called from main.rs `info` command to report linker availability.
+
+  /// Return the host platform's target triple as a string.
+  pub fn host_triple() -> CompilerResult<String>
+  - Calls `TargetConfig::host()` to build a config for the host platform.
+  - Returns the triple string via `config.triple_str()`.
+  - Propagates `TargetError` as `CompilerError::Target`.
+  - Called from main.rs for --print-target, cross-compilation guards,
+    and diagnostics.
+
+------------------------------------------------------------------------------
+2. emitter.rs — ObjectEmitter
+------------------------------------------------------------------------------
+
+Imports:
+  - crate::error::CompilerError
+  - crate::target::TargetConfig
+  - inkwell::module::Module<'ctx>
+  - inkwell::targets::{FileType, TargetMachine, TargetTriple}
+  - std::path::Path
+
+Struct Definition:
+
+  /// Wraps an LLVM Module and its TargetMachine for object/IR emission.
+  pub struct ObjectEmitter<'ctx> {
+      module: Module<'ctx>,          // the LLVM IR module to emit from
+      target_machine: TargetMachine,  // LLVM target machine (owns the codegen)
+  }
+
+  Lifetime note: 'ctx is tied to the LLVMContext that created the Module.
+  The ObjectEmitter borrows the module for 'ctx but does NOT hold a
+  reference to the context itself. The caller must keep the LLVMContext
+  alive for the lifetime of the ObjectEmitter.
+
+Methods:
+
+  /// Create a new ObjectEmitter from a Module and TargetConfig.
+  pub fn new(
+      module: Module<'ctx>,
+      target_config: &TargetConfig,
+  ) -> Result<Self, CompilerError>
+
+  Semantics:
+  - Calls `target_config.create_target_machine()` to obtain a TargetMachine.
+    This initializes the native LLVM target (via `Target::initialize_native`)
+    and creates a machine with the config's triple, CPU, features, opt level,
+    RelocMode::PIC, and CodeModel::Default.
+  - Sets the module's triple to match the target config's triple string.
+    This is critical: inkwell modules are created without a triple by default;
+    setting it tells LLVM which target to generate code for.
+  - Wraps any TargetError as CompilerError::Target.
+  - Returns Ok(Self { module, target_machine }).
+
+  /// Emit the module as a native object file (.o).
+  pub fn emit_object(&self, path: &Path) -> Result<(), CompilerError>
+
+  Semantics:
+  - Calls `self.target_machine.write_to_file(&self.module, FileType::Object, path)`.
+  - This is the core "MIR -> LLVM IR -> object file" final step.
+    The TargetMachine performs instruction selection, register allocation,
+    and emits machine code packaged as a relocatable object file.
+  - FileType::Object means a platform-native object file (.o / .obj).
+  - On failure, wraps with CompilerError::codegen("failed to write object file: {e}").
+  - The output path must be writable; parent directories should be created
+    by the caller (see compile_from_mir_ext in mir/codegen.rs).
+
+  /// Emit the module's IR as a string.
+  pub fn emit_ir(&self) -> String
+
+  Semantics:
+  - Calls `self.module.print_to_string().to_string()`.
+  - Returns the full LLVM IR text (human-readable bitcode assembly).
+  - No error path (print_to_string returns Result but .unwrap() is implicit
+    via the inkwell API's String return).
+  - Used for debugging and for the OutputKind::Ir path (though
+    compile_from_mir_ext uses module.print_to_file directly for that case).
+
+  /// Emit the module's IR to a file.
+  pub fn emit_ir_to_file(&self, path: &Path) -> Result<(), CompilerError>
+
+  Semantics:
+  - Calls `self.module.print_to_file(path)`.
+  - Writes LLVM IR text to the given path.
+  - On failure, wraps with CompilerError::codegen("failed to write IR file: {e}").
+
+------------------------------------------------------------------------------
+3. linker.rs — Linker
+------------------------------------------------------------------------------
+
+Imports:
+  - crate::error::{CompilerError, LinkError, LinkResult}
+  - crate::target::{Environment, OperatingSystem, TargetConfig}
+  - crate::mir (references: ExternalLibrary, MirExternalKind)
+  - std::path::{Path, PathBuf}
+  - std::process::Command
+  - (env! macro for OUT_DIR at compile time)
+
+Constants:
+
+  /// Path to the Saturnite runtime support static library.
+  /// Computed at compile time via `env!("OUT_DIR")`.
+  fn runtime_object_path() -> PathBuf
+  - Returns `<OUT_DIR>/libsaturnite_runtime.a`.
+  - OUT_DIR is set by Cargo during the build script (build.rs).
+  - The build script compiles runtime/println_i64.c and runtime/list.c (and
+    optionally rsrt and pyrt shims) via the `cc` crate's `try_compile()`.
+  - This static archive provides:
+      * println_i64 (i64 -> prints to stdout)
+      * println_str (i8* -> prints to stdout)
+      * concat_str, str_i64 (string interpolation helpers)
+      * list_new_from, list_get, list_len, list_set (List<i64> runtime)
+      * sat_py_* (Python bridge, if Python was found at build time)
+      * sat_rust_* (Rust interop shim, if present)
+
+Struct Definition:
+
+  /// Selects and invokes a platform-appropriate system linker.
+  pub struct Linker<'cfg> {
+      target_config: &'cfg TargetConfig,
+  }
+
+  Lifetime note: 'cfg borrows the TargetConfig for the Linker's lifetime.
+  The Linker is cheap to construct (just stores a reference).
+
+Methods:
+
+  /// Create a new Linker referencing the given TargetConfig.
+  pub fn new(target_config: &'cfg TargetConfig) -> Self
+  - Returns Self { target_config }.
+
+  /// Link an object file into an executable, with no external libraries.
+  pub fn link(&self, obj_path: &Path, output_path: &Path) -> LinkResult<()>
+  - Delegates to `self.link_with_externals(obj_path, output_path, &[])`.
+  - Simplest entry point: only the Saturnite runtime + object file.
+
+  /// Link an object file into an executable, resolving and linking
+  /// declared external interop libraries.
+  pub fn link_with_externals(
+      &self,
+      obj_path: &Path,
+      output_path: &Path,
+      externals: &[crate::mir::ExternalLibrary],
+  ) -> LinkResult<()>
+
+  Semantics (high level):
+  1. Extract `os` and `env` from the TargetConfig.
+  2. Select the linker binary via `self.select_linker(os, env)`.
+  3. Build base linker arguments via `self.build_linker_args(os, env, obj_path, output_path)`.
+  4. Determine if any Python externals are declared (has_python check).
+  5. For each external library:
+     a. Call `self.resolve_external_library(ext, output_path)` to find the
+        concrete artifact file on disk.
+     b. If Rust or Native kind: append the resolved artifact path to args.
+     c. If Python kind: skip (the artifact path is empty; Python linking
+        is handled separately by adding -lpython etc.)
+     d. If resolution fails: return Err(LinkError::linking_failed(...)) with
+        a message naming the missing library, its kind, and all searched paths.
+  6. If has_python:
+     a. Resolve the Python library name from SAT_PYTHON_LIB env var, or
+        fall back to running `python3-config --ldflags --embed` at link time,
+        or default to "python3.13".
+     b. Resolve the Python library search path from SAT_PYTHON_LIBDIR env var,
+        or from `python3-config --ldflags --embed` output, or skip.
+     c. Append: `-l<py_lib>`, `-lpthread`, `-ldl`, `-lutil`, `-lm`.
+  7. Resolve the linker binary path (with Windows MSVC vswhere special handling).
+  8. Spawn the linker process with the assembled arguments.
+  9. If the process exits non-success:
+     a. Capture stderr and stdout.
+     b. Prefer stderr, fall back to stdout, or None if both empty.
+     c. Return Err(LinkError::linking_failed(output_path, details)).
+  10. Return Ok(()) on success.
+
+  NOTE: There is a redundant second `has_python` computation on ~line 145
+  (identical to the one on ~line 59). This is a code smell / dead computation
+  but does not affect correctness.
+
+  Private helper called within link_with_externals:
+
+  /// Search for the linkable artifact of a declared external library.
+  fn resolve_external_library(
+      &self,
+      ext: &crate::mir::ExternalLibrary,
+      output_path: &Path,
+  ) -> Result<PathBuf, String>
+
+  Semantics:
+  - Determines candidate filenames based on the external kind:
+      * Rust:   `lib<name>.a`
+      * Native: `lib<name>.dylib` on macOS, `lib<name>.so` on other Unix,
+        `lib<name>.so` as fallback.
+      * Python: returns Ok(PathBuf::from("")) immediately (no link-time artifact).
+  - Builds a search directory list:
+      1. Parent of output_path (the project target/ directory).
+      2. Current working directory (cwd).
+      3. `<cwd>/libs/<name>`  (conventional per-project interop dir).
+      4. `<cwd>/libs`         (general libs dir).
+      5. `/usr/local/lib`     (system fallback).
+  - For each (dir, filename) pair, checks if the file exists.
+  - For Rust kind, additionally checks `<dir>/<name>/target/release/lib<name>.a`
+    (rustc build output of a wrapper crate).
+  - Builds a `searched` string listing every candidate path examined.
+  - Returns the first matching PathBuf, or Err(searched) listing all
+    candidates checked.
+
+  /// Select the linker binary name for the given OS and environment.
+  fn select_linker(&self, os: &OperatingSystem, env: &Environment) -> Vec<String>
+
+  Returns:
+      (Linux, _)          -> ["cc"]
+      (Darwin, _)         -> ["clang"]
+      (Windows, Msvc)     -> ["link.exe"]
+      (Windows, Gnu)      -> ["gcc"]
+      (Windows, _)        -> ["cc"]     (fallback)
+      (_, _)              -> ["cc"]     (catch-all fallback)
+
+  NOTE: The first element of the returned Vec is the linker binary name;
+  subsequent elements (if any) would be additional command tokens, but
+  in practice only index [0] is used as the binary name and [1..] as
+  leading arguments. Currently all cases produce a single-element Vec.
+
+  /// Build the base linker argument list (before external libraries).
+  fn build_linker_args(
+      &self,
+      os: &OperatingSystem,
+      env: &Environment,
+      obj_path: &Path,
+      output_path: &Path,
+  ) -> Vec<String>
+
+  Returns platform-specific argument vectors:
+
+  Linux / Darwin:
+    [<obj_path>, "-o", <output_path>, <runtime_path>, "-no-pie"]
+    - The "-no-pie" flag is required because the runtime object is compiled
+      without PIE support; linking default-PIE would cause:
+      "R_X86_64_32 against `.rodata' can not be used when making a PIE object".
+    - Runtime is statically linked via the .a archive.
+
+  Windows MSVC:
+    [<obj_path>, "/OUT:<output_path>", <runtime_path>,
+     "/SUBSYSTEM:CONSOLE",
+     "/DEFAULTLIB:msvcrt", "/DEFAULTLIB:ucrt", "/DEFAULTLIB:vcruntime",
+     "/LIBPATH:<dir>" for each dir in find_msvc_lib_dirs()]
+    - MSVC CRT and Windows SDK lib paths are discovered via vswhere
+      (find_msvc_lib_dirs) so the linker can find system libs without
+      the LIB environment variable being set.
+
+  Windows GNU:
+    [<obj_path>, "-o", <output_path>, <runtime_path>, "-no-pie"]
+
+  Windows (other/unknown env):
+    [<obj_path>, "/OUT:<output_path>", <runtime_path>]
+    (Minimal — MSVC-style output flag, no CRT libs. This is a fallback
+    case; real Windows targets are Msvc or Gnu.)
+
+  Catch-all fallback (same as Linux/Darwin):
+    [<obj_path>, "-o", <output_path>, <runtime_path>, "-no-pie"]
+
+Free Functions (module-level, not methods):
+
+  /// Check that the platform-appropriate linker is installed and working.
+  pub fn check_linker_available(target_config: &TargetConfig) -> Result<(), CompilerError>
+
+  Semantics:
+  - Creates a Linker from the config.
+  - Gets the linker binary name via `linker.select_linker(os, env)[0]`.
+  - Resolves the actual binary path via `resolve_linker_path(name, os, env)`.
+  - Determines the help flag: "/?" for MSVC link.exe, "--version" for all others.
+  - Runs the linker with the help flag and checks for success exit status.
+  - Returns Ok(()) on success.
+  - Returns Err(CompilerError::Link(LinkError::linking_failed(...))) if the
+    linker was found but exited with an error, or
+    Err(CompilerError::Link(LinkError::linker_not_found(...))) if the linker
+    binary could not be found.
+  - Called from main.rs `info` command and from `check_linker()`.
+
+  /// Locate a linker binary by name, with Windows MSVC vswhere special handling.
+  fn resolve_linker_path(name: &str, os: &OperatingSystem, env: &Environment) -> std::io::Result<PathBuf>
+
+  Semantics:
+  - On Windows + MSVC + name "link.exe": tries `find_msvc_linker_via_vswhere()`
+    first to get the real MSVC linker (not an MSYS2/MinGW shim at
+    /usr/bin/link.exe that doesn't understand MSVC /DEFAULTLIB flags).
+  - Falls back to `which::which(name)` for all platforms.
+  - Maps Not Found to io::ErrorKind::NotFound.
+
+  /// Use vswhere to find the Visual Studio MSVC version directory.
+  fn find_msvc_version_dir() -> Option<PathBuf>
+
+  Semantics:
+  - Checks for vswhere at the well-known path:
+    `C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe`.
+  - Runs: `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`.
+  - Takes the install path and joins `VC/Tools/MSVC`.
+  - Reads the directory and returns the first entry that starts with a digit
+    (the MSVC version, e.g. "14.40.33807").
+  - Returns None if vswhere is missing, the command fails, or no version dir found.
+
+  /// Use vswhere to find the MSVC link.exe binary.
+  fn find_msvc_linker_via_vswhere() -> Option<PathBuf>
+
+  Semantics:
+  - Calls `find_msvc_version_dir()` to get `<installPath>/VC/Tools/MSVC/<ver>`.
+  - Tries these paths in order (returns first that is_file):
+      1. `<version_dir>/bin/HostX64/x64/link.exe`
+      2. `<version_dir>/bin/HostX64/x86/link.exe`
+      3. `<version_dir>/bin/HostX86/x64/link.exe`
+      4. `<version_dir>/bin/HostX86/x86/link.exe`
+  - Returns None if none found.
+
+  /// Discover MSVC CRT library directories and Windows SDK UCRT lib directories.
+  fn find_msvc_lib_dirs() -> Vec<PathBuf>
+
+  Semantics:
+  - Adds `<msvc_version>/lib/spectre/x64` (MSVC CRT libs with spectre guard).
+  - Adds `<windows_kits_root>/<sdk_ver>/um/x64` (kernel32.lib, user32.lib, etc.).
+  - Adds `<windows_kits_root>/<sdk_ver>/ucrt/x64` (ucrt.lib).
+  - Windows Kits root is: `C:/Program Files (x86)/Windows Kits/10/Lib`.
+  - Reads the directory; uses the first SDK version entry starting with a digit.
+  - Returns an empty Vec if directories are not found (graceful degradation).
+
+  /// Human-readable name for an OperatingSystem enum value.
+  fn describe_os(os: &OperatingSystem) -> &'static str
+  - Linux -> "Linux"
+  - Darwin -> "macOS"
+  - Windows -> "Windows"
+  - FreeBSD -> "FreeBSD"
+  - Unknown -> "Unknown"
+
+  /// Human-readable name for an Environment enum value.
+  fn describe_env(env: &Environment) -> &'static str
+  - Msvc -> "MSVC"
+  - Gnu -> "GNU"
+  - Musl -> "Musl"
+  - Unknown -> "Unknown"
+
+================================================================================
+DEPENDENCY INTERFACE — TargetConfig (crate::target)
+================================================================================
+
+Location: crates/stnx/src/target.rs
+
+The codegen module depends on TargetConfig for all target-specific decisions.
+Key methods used:
+
+  pub fn create_target_machine(&self) -> TargetResult<TargetMachine>
+  - Initializes the native LLVM target.
+  - Creates a TargetMachine with: triple, cpu, features, opt_level (as
+    InkwellOptLevel), RelocMode::PIC, CodeModel::Default.
+  - Returns Err(TargetError) on failure.
+  - Used by ObjectEmitter::new and by compile_from_mir_ext (in mir/codegen.rs)
+    for the optimization pass.
+
+  pub fn triple(&self) -> &TargetTriple
+  - Returns reference to the inkwell TargetTriple.
+  - Used by compile_from_mir_ext to set ctx.module.set_triple(triple).
+
+  pub fn triple_str(&self) -> String
+  - Returns the target triple as a String (cloned).
+  - Used by ObjectEmitter::new to set the module triple.
+  - Used by host_triple() in mod.rs.
+
+  pub fn os(&self) -> &OperatingSystem
+  - Returns the parsed OS enum.
+  - Used by Linker for linker selection, linker args, and MSVC path discovery.
+
+  pub fn environment(&self) -> &Environment
+  - Returns the parsed environment enum.
+  - Used by Linker similarly to os().
+
+  pub fn to_inkwell_opt_level(&self) -> InkwellOptLevel
+  - Maps OptimizationLevel -> inkwell::OptimizationLevel.
+  - Used by compile_from_mir_ext to decide whether to run optimization passes.
+
+  pub fn opt_pass_name(&self) -> &'static str
+  - Maps OptimizationLevel -> LLVM pass manager pipeline name:
+      None       -> "default<O0>"
+      Less       -> "default<O1>"
+      Default    -> "default<O2>"
+      Aggressive -> "default<O3>"
+  - Used by compile_from_mir_ext to run `module.run_passes(opt_passes, ...)`.
+
+  pub fn output_kind(&self) -> &OutputKind
+  - Returns Ir | Object | Exe.
+  - Used by compile_from_mir_ext to select the emission path.
+
+  pub fn host() -> TargetResult<Self>
+  - Detects the host platform via TargetMachine::get_default_triple().
+  - Parses the triple into Architecture, OS, Environment via parse_triple.
+  - Initializes native LLVM target.
+
+  pub fn from_triple(triple_str: &str) -> TargetResult<Self>
+  - Creates a TargetConfig for an explicit triple string.
+  - Validates the triple via Target::from_triple().
+
+  pub fn with_profile(profile: Profile) -> TargetResult<Self>
+  - Creates a host config and applies a Profile (Debug/Release).
+
+  pub fn apply_profile(&mut self, profile: Profile)
+  - Sets opt_level and debug_info from the Profile:
+      Debug    -> opt_level=None,    debug_info=Yes
+      Release  -> opt_level=Aggressive, debug_info=No
+
+TargetConfig struct fields (private):
+  triple: TargetTriple       — inkwell target triple
+  triple_str: String          — string form of the triple
+  architecture: Architecture  — X86_64, Aarch64, X86, Arm, Riscv64, Mips, Powerpc64, Wasm32, Unknown
+  os: OperatingSystem        — Windows, Linux, Darwin, FreeBSD, Unknown
+  environment: Environment   — Msvc, Gnu, Musl, Unknown
+  opt_level: OptimizationLevel — None, Less, Default, Aggressive
+  debug_info: DebugInfo      — Yes, No
+  output_kind: OutputKind     — Ir, Object, Exe
+  cpu: String                 — e.g. "generic"
+  features: String            — LLVM feature string, empty by default
+
+================================================================================
+DEPENDENCY INTERFACE — Error Types (crate::error)
+================================================================================
+
+Location: crates/stnx/src/error.rs
+
+Relevant types:
+
+  pub enum CompilerError {
+      Lexer(LexError),
+      Parse(ParseError),
+      Semantic(String),
+      Type(String),
+      Codegen(String),          // used in compile_from_mir_ext for opt failures
+      Target(#[from] TargetError),  // used by ObjectEmitter::new
+      Link(#[from] LinkError),      // used by check_linker_available
+      Io(#[from] std::io::Error),    // used by linker process spawn
+      Process(String),
+      Config(String),
+      IrEmissionError { message: String },
+  }
+
+  impl CompilerError {
+      pub fn codegen(message: impl Into<String>) -> Self  // creates Codegen variant
+      pub fn semantic(message: impl Into<String>) -> Self
+      pub fn config(message: impl Into<String>) -> Self
+  }
+
+  pub type CompilerResult<T> = Result<T, CompilerError>;
+
+  pub struct LinkError {
+      pub message: String,
+      pub details: Option<String>,
+  }
+
+  impl LinkError {
+      pub fn linker_not_found(linker: impl Into<String>) -> Self
+      pub fn linking_failed(output: impl Into<String>, details: Option<String>) -> Self
+  }
+
+  pub type LinkResult<T> = Result<T, LinkError>;
+
+================================================================================
+DEPENDENCY INTERFACE — MIR Types (crate::mir)
+================================================================================
+
+Location: crates/stnx/src/mir/mod.rs
+
+The codegen module references two MIR types:
+
+  pub struct ExternalLibrary {
+      pub name: String,        // the declared ecosystem/library name
+      pub kind: MirExternalKind,  // Rust, Python, or Native
+  }
+
+  pub enum MirExternalKind {
+      Rust,    // links lib<name>.a (staticlib from rustc --crate-type=staticlib)
+      Python,  // no link-time artifact; needs -lpython at link time
+      Native,  // links lib<name>.so (Linux), lib<name>.dylib (macOS)
+  }
+
+These are populated by mir::lower::lower_program() which iterates over
+hir.external_functions and deduplicates by ecosystem name.
+
+The full MIR type set (defined in mir/mod.rs, consumed by mir/codegen.rs which
+then delegates to this codegen module):
+
+  pub struct BlockId(pub u32)              — basic block identifier
+  pub struct LocalId(pub u32)              — local variable/temporary identifier
+  pub type MirType = HirType              — reuses HirType (no parallel type system)
+
+  pub enum MirConst { I64(i64), F64(f64), Bool(bool) }
+  pub enum MirOperand { Const(MirConst), Local(LocalId) }
+
+  pub enum MirBinOp { Add, Sub, Mul, Div, Mod, Eq, Ne, Lt, Gt, Le, Ge, And, Or }
+  pub enum MirUnOp { Neg, Not }
+  pub enum MirExternalKind { Rust, Python, Native }
+  pub enum MirRvalue {
+      Use(MirOperand),
+      ExternalCall { kind, symbol: String, args: Vec<MirOperand>, ret_ty: MirType },
+      Binary { op: MirBinOp, lhs: MirOperand, rhs: MirOperand },
+      Unary { op:MirUnOp, operand: MirOperand },
+      StructLit { struct_def: SymbolId, fields: Vec<(SymbolId, MirOperand)> },
+      FieldAccess { local: LocalId, field: SymbolId },
+      EnumCtor { enum_def: SymbolId, variant: SymbolId },
+      ListLiteral { elements: Vec<MirOperand> },
+      Index { list_local: LocalId, index: MirOperand },
+      Length { list_local: LocalId },
+      StrLit(SymbolId),
+  }
+
+  pub struct MirStmt { pub kind: MirStmtKind }
+  pub enum MirStmtKind { LocalDecl { local, ty, mutable }, Assign { local, rvalue } }
+
+  pub enum MirTerminator {
+      Goto { target: BlockId },
+      SwitchInt { scrutinee, ty, branches: Vec<(u64, BlockId)>, else_target: BlockId },
+      Call { func: DefId, args: Vec<MirOperand>, destination: LocalId, next: BlockId },
+      Return(Option<MirOperand>),
+      Unreachable,
+  }
+
+  pub struct MirBasicBlock { id: BlockId, name: String, stmts: Vec<MirStmt>, terminator: MirTerminator }
+
+  pub struct MirFunction {
+      def_id: DefId, name: SymbolId, params: Vec<(SymbolId, MirType)>,
+      return_type: MirType, locals: Vec<MirLocal>, param_locals: Vec<LocalId>,
+      blocks: Vec<MirBasicBlock>, start_block: BlockId,
+  }
+
+  pub struct MirProgram {
+      functions: Vec<MirFunction>, symbols: SymbolInterner,
+      structs: Vec<StructDef>, enums: Vec<EnumDef>,
+      external_libraries: Vec<ExternalLibrary>,
+  }
+
+================================================================================
+DEPENDENCY INTERFACE — MIR::codegen (crate::mir::codegen)
+================================================================================
+
+Location: crates/stnx/src/mir/codegen.rs
+
+This is the module that PRODUCES the LLVM Module and then delegates to this
+codegen module for emission and linking. Key functions:
+
+  pub fn generate_ir_from_mir(mir: &MirProgram) -> CompilerResult<String>
+  - Creates an LLVMContext, MirCodeGenContext, declares builtins + functions,
+    generates IR for each function, returns the IR as a string.
+  - Does NOT use ObjectEmitter/Linker — standalone IR output path.
+
+  pub fn compile_from_mir(mir, output_path, target_config) -> CompilerResult<()>
+  - Delegates to compile_from_mir_ext(mir, output_path, target_config, false).
+
+  pub fn compile_from_mir_ext(
+      mir: &MirProgram,
+      output_path: &str,
+      target_config: TargetConfig,  // NOTE: by value, not reference
+      save_temps: bool,
+  ) -> CompilerResult<()>
+  - Creates LLVMContext, MirCodeGenContext, declares builtins/functions,
+    generates IR for each function.
+  - Sets module triple from target_config.triple().
+  - If opt_level != None: creates a TargetMachine, runs LLVM optimization
+    passes via module.run_passes(opt_pass_name, target_machine, opts).
+  - Dispatch on target_config.output_kind():
+    * Ir:    module.print_to_file(output_path)
+    * Object: ObjectEmitter::new(ctx.module, &target_config)?.emit_object(output_path)
+    * Exe:   emit object to output_path.with_extension("o"), then
+             Linker::new(&target_config).link_with_externals(&obj_path, output_path,
+                 &mir.external_libraries)?, then remove obj if !save_temps.
+  - This is where ObjectEmitter and Linker are called from.
+
+  The MirCodeGenContext struct (in mir/codegen.rs, NOT in this module):
+    pub struct MirCodeGenContext<'ctx> {
+        pub context: &'ctx LLVMContext,
+        pub module: inkwell::module::Module<'ctx>,
+        pub builder: IRBuilder<'ctx>,
+        local_allocas: HashMap<LocalId, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)>,
+    }
+  It contains the LLVM IR generation logic (gen_stmt, gen_rvalue, materialize_operand,
+  gen_binop, gen_unop, gen_struct_lit, gen_field_access, gen_terminator,
+  gen_external_call). The codegen module (this module) provides the ObjectEmitter
+  and Linker that MirCodeGenContext's output flows through.
+
+  Builtin function declarations (in MirCodeGenContext::declare_builtin_functions):
+    - println_i64(i64) -> i64       (runtime: println_i64.c)
+    - println_str(ptr) -> i64       (runtime: println_i64.c)
+    - concat_str(ptr, ptr) -> ptr   (runtime: println_i64.c, string interpolation)
+    - str_i64(i64) -> ptr           (runtime: println_i64.c, numeric stringify)
+    - list_new_from(ptr, i64) -> ptr (runtime: list.c, List<i64> construction)
+    - list_get(ptr, i64) -> i64     (runtime: list.c, list indexing)
+    - list_len(ptr) -> i64          (runtime: list.c, list length)
+
+  Builtin DefId sentinels (in mir/codegen.rs):
+    const PRINTLN_DEF_ID   = DefId(u32::MAX - 1)  // -> println_i64 runtime fn
+    const PRINTLN_STR_DEF_ID = DefId(u32::MAX - 2)  // -> println_str runtime fn
+    const CONCAT_STR_DEF_ID = DefId(u32::MAX - 3)  // -> concat_str runtime fn
+    const STR_I64_DEF_ID    = DefId(u32::MAX - 4)  // -> str_i64 runtime fn
+
+  Python runtime bridge constants (in mir/codegen.rs):
+    const SAT_PY_NONE  = 0u64
+    const SAT_PY_BOOL  = 1u64
+    const SAT_PY_I64   = 2u64
+    const SAT_PY_F64   = 3u64
+    const SAT_PY_STR   = 4u64
+
+================================================================================
+DATA FLOW: END-TO-END COMPILATION
+================================================================================
+
+1. main.rs calls mir::lower::lower_program(&hir) to produce a MirProgram.
+   - ExternalLibrary entries are populated from hir.external_functions.
+2. main.rs calls compile_from_mir_ext(&mir, output, config, save_temps).
+3. compile_from_mir_ext:
+   a. Creates LLVMContext, MirCodeGenContext.
+   b. Declares builtin functions and all MIR functions in the LLVM module.
+   c. Generates LLVM IR for each MIR function.
+   d. Sets module triple.
+   e. Optionally runs optimization passes.
+   f. If OutputKind::Exe:
+      i. Creates ObjectEmitter::new(ctx.module, &target_config)?
+         - This creates a TargetMachine via target_config.create_target_machine().
+         - Sets the module triple to match the target config.
+      ii. Calls emitter.emit_object(&obj_path)?
+          - TargetMachine.write_to_file(module, FileType::Object, path)
+          - Produces a .o relocatable object file.
+      iii. Creates Linker::new(&target_config)
+      iv. Calls linker.link_with_externals(&obj_path, output_path, &mir.external_libraries)?
+          - Selects linker binary (cc, clang, link.exe, gcc).
+          - Builds linker args (object, output, runtime, flags).
+          - Resolves and appends external library artifacts.
+          - Resolves and appends Python library flags if needed.
+          - Resolves the linker binary path (vswhere on Windows MSVC).
+          - Spawns the linker process.
+      v. Optionally removes the .o file if !save_temps.
+   g. If OutputKind::Object: uses ObjectEmitter directly, no linker.
+   h. If OutputKind::Ir: writes IR text directly, no emitter/linker.
+
+================================================================================
+PLATFORM MATRIX
+================================================================================
+
+Linker binary selection by (OS, Environment):
+
+  | OS        | Environment | Linker Binary | Linker Args Style |
+  |-----------|-------------|---------------|-------------------|
+  | Linux     | any         | cc            | Unix-style (-o, -no-pie)  |
+  | Darwin    | any         | clang         | Unix-style (-o, -no-pie)  |
+  | Windows   | Msvc        | link.exe      | MSVC-style (/OUT:, /SUBSYSTEM:, /DEFAULTLIB:, /LIBPATH:) |
+  | Windows   | Gnu         | gcc           | Unix-style (-o, -no-pie) |
+  | Windows   | Unknown     | cc            | Minimal (/OUT:) |
+  | FreeBSD   | any         | cc            | Unix-style |
+  | Unknown   | any         | cc            | Unix-style |
+
+External library artifact resolution by kind:
+
+  | MirExternalKind | Artifact Pattern         | Searched Locations         |
+  |------------------|--------------------------|----------------------------|
+  | Rust             | lib<name>.a              | output_dir, cwd, cwd/libs/<name>, cwd/libs, /usr/local/lib, + nested rustc target/release |
+  | Native           | lib<name>.so (Linux/Win) | same 5 dirs                |
+  | Native           | lib<name>.dylib (macOS)  | same 5 dirs                |
+  | Python           | (none — empty path)      | N/A; adds -l<py_lib> + -lpthread + -ldl + -lutil + -lm |
+
+================================================================================
+RUNTIME DEPENDENCIES
+================================================================================
+
+The build script (build.rs) compiles the following C files from
+crates/stnx/runtime/ into `libsaturnite_runtime.a` (placed in Cargo's OUT_DIR):
+
+  - println_i64.c  — provides println_i64, println_str, concat_str, str_i64,
+                     and the string interpolation arena.
+  - list.c         — provides list_new_from, list_len, list_get, list_set
+                     (List<i64> runtime ABI).
+  - rsrt.c + rsrt_impl.c (optional) — Rust interop shim (sat_rust_register_artifact, etc.)
+  - pyrt_impl.c (optional) — Python interop shim (sat_py_call_flat, etc.)
+
+The linker.rs `runtime_object_path()` function references this archive by
+the compile-time constant `env!("OUT_DIR")` + "/libsaturnite_runtime.a".
+
+Python library is resolved at link time via:
+  1. SAT_PYTHON_LIB env var (set by build.rs from python3-config)
+  2. `python3-config --ldflags --embed` (runtime fallback)
+  3. Default "python3.13"
+
+================================================================================
+CODE QUALITY NOTES / OBSERVATIONS
+================================================================================
+
+1. Redundant has_python check: link_with_externals computes `has_python`
+   twice (line ~59 and line ~145 identical code). The second is dead.
+
+2. Duplicate ExternalCall match arm: In mir/codegen.rs, the gen_rvalue
+   match has two identical `MirRvalue::ExternalCall` arms (lines ~386-391
+   and ~392-397). This is a copy-paste; it compiles (first arm always wins)
+   but the second is dead code.
+
+3. select_linker returns Vec<String> but only [0] is used as the binary name.
+   The Vec design allows for pre-args but no current case uses them.
+
+4. resolve_external_library returns Ok(PathBuf::from("")) for Python kind —
+   an empty path that is then explicitly skipped in link_with_externals.
+
+5. The runtime archive is statically linked into every executable (via .a
+   on Unix, via .lib on Windows). This is why "-no-pie" is needed on Unix:
+   the runtime's global data is not PIE-compatible.
+
+6. MSVC lib path discovery (find_msvc_lib_dirs) is best-effort: returns
+   empty Vec if vswhere or Windows Kits are not found. The linker may then
+   fail with missing system libs, but the error message is clear.
+
+================================================================================
+SUMMARY OF PUBLIC API SURFACE
+================================================================================
+
+From mod.rs:
+  - pub use emitter::ObjectEmitter;
+  - pub use linker::Linker;
+  - pub use crate::target::TargetConfig;
+  - pub fn check_linker(target_config: &TargetConfig) -> CompilerResult<()>
+  - pub fn host_triple() -> CompilerResult<String>
+
+From emitter.rs:
+  - pub struct ObjectEmitter<'ctx>  { module: Module<'ctx>, target_machine: TargetMachine }
+  - impl<'ctx> ObjectEmitter<'ctx> {
+      pub fn new(module, &TargetConfig) -> Result<Self, CompilerError>
+      pub fn emit_object(&self, &Path) -> Result<(), CompilerError>
+      pub fn emit_ir(&self) -> String
+      pub fn emit_ir_to_file(&self, &Path) -> Result<(), CompilerError>
+    }
+
+From linker.rs:
+  - pub struct Linker<'cfg> { target_config: &'cfg TargetConfig }
+  - impl<'cfg> Linker<'cfg> {
+      pub fn new(&'cfg TargetConfig) -> Self
+      pub fn link(&self, obj_path: &Path, output_path: &Path) -> LinkResult<()>
+      pub fn link_with_externals(&self, obj_path: &Path, output_path: &Path,
+                                  externals: &[ExternalLibrary]) -> LinkResult<()>
+      // private:
+      fn resolve_external_library(&self, &ExternalLibrary, &Path) -> Result<PathBuf, String>
+      fn select_linker(&self, &OperatingSystem, &Environment) -> Vec<String>
+      fn build_linker_args(&self, &OperatingSystem, &Environment,
+                           &Path, &Path) -> Vec<String>
+    }
+  - pub fn check_linker_available(&TargetConfig) -> Result<(), CompilerError>
+  - // private free functions:
+  - fn resolve_linker_path(&str, &OperatingSystem, &Environment) -> io::Result<PathBuf>
+  - fn find_msvc_version_dir() -> Option<PathBuf>
+  - fn find_msvc_linker_via_vswhere() -> Option<PathBuf>
+  - fn find_msvc_lib_dirs() -> Vec<PathBuf>
+  - fn describe_os(&OperatingSystem) -> &'static str
+  - fn describe_env(&Environment) -> &'static str
+
+================================================================================
+REIMPLEMENTATION NOTES FOR SATURNITE
+================================================================================
+
+To reimplement this module in a Saturnite-native toolchain:
+
+1. ObjectEmitter:
+   - Requires an LLVM binding (inkwell or direct libclang). The ObjectEmitter is
+     a thin wrapper: it stores an LLVM Module and a TargetMachine, and exposes
+     write_to_file with FileType::Object. The TargetMachine must be created from
+     the TargetConfig (triple, CPU, features, opt level, PIC relocation, default
+     code model).
+
+2. Linker:
+   - The linker logic is platform-dispatched via (OperatingSystem, Environment).
+   - On Unix (Linux/Darwin): use `cc` (or `clang` on Darwin) with -o, -no-pie,
+     appending the runtime .a and any resolved external artifacts.
+   - On Windows MSVC: use `link.exe` with /OUT:, /SUBSYSTEM:CONSOLE, and
+     /DEFAULTLIB for msvcrt/ucrt/vcruntime, plus /LIBPATH for discovered MSVC
+     and Windows SDK lib directories.
+   - On Windows GNU: use `gcc` with -o, -no-pie.
+   - External library resolution: linear search through 5 fixed directories.
+     Rust uses static .a; Native uses shared .so/.dylib; Python uses -l flags.
+   - The linker is invoked as a subprocess; stderr/stdout are captured for
+     error reporting.
+
+3. No public trait or abstract interface: ObjectEmitter and Linker are
+   concrete structs with no trait bounds. To reimplement, the same concrete
+   API shape must be provided because mir/codegen.rs calls ObjectEmitter::new,
+   emit_object, Linker::new, and link_with_externals by fully-qualified path.
+
+4. The build-time contract: the runtime archive (libsaturnite_runtime.a)
+   must be at $OUT_DIR/libsaturnite_runtime.a, compiled from
+   runtime/println_i64.c and runtime/list.c. This is established by build.rs
+   and consumed by runtime_object_path() in linker.rs.
+
+5. The compile_from_mir_ext function in mir/codegen.rs is the sole caller
+   of ObjectEmitter and Linker. It owns the LLVMContext and Module creation,
+   declares builtins, generates per-function IR, then dispatches:
+     - Ir  -> module.print_to_file
+     - Obj -> ObjectEmitter::new + emit_object
+     - Exe -> emit_object (to .o) + Linker::link_with_externals + cleanup

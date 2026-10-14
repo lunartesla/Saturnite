@@ -1,0 +1,17 @@
+{
+  "module": "math",
+  "functions": [
+    {
+      "name": "add",
+      "symbol": "add",
+      "params": ["i64", "i64"],
+      "ret": "i64"
+    },
+    {
+      "name": "sqrt",
+      "symbol": "sqrt",
+      "params": ["f64"],
+      "ret": "f64"
+    }
+  ]
+}

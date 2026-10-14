@@ -12,11 +12,7 @@ use std::path::PathBuf;
 /// `name` may be a simple project name (creates `./name/`) or a path
 /// (`mkdir -p` style). The package name is derived from the final directory
 /// component of the resolved path.
-pub fn init_project(
-    name: Option<&str>,
-    in_place: bool,
-    pkg_version: Option<&str>,
-) -> Result<()> {
+pub fn init_project(name: Option<&str>, in_place: bool, pkg_version: Option<&str>) -> Result<()> {
     let version = pkg_version.unwrap_or("0.1.0").to_string();
     let edition = "2026".to_string();
 
@@ -125,12 +121,10 @@ pub fn run_doctor() -> Result<()> {
 
     // Linker availability
     match stnx::target::TargetConfig::host() {
-        Ok(config) => {
-            match stnx::codegen::check_linker(&config) {
-                Ok(()) => println!("Linker: available"),
-                Err(e) => println!("WARNING: Linker not available: {}", e),
-            }
-        }
+        Ok(config) => match stnx::codegen::check_linker(&config) {
+            Ok(()) => println!("Linker: available"),
+            Err(e) => println!("WARNING: Linker not available: {}", e),
+        },
         Err(e) => {
             println!("WARNING: Failed to initialize target config: {}", e);
         }

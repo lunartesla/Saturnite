@@ -18,6 +18,7 @@
 //! ```
 
 use crate::error::CompilerError;
+use crate::interop::DependencyKind;
 use crate::CompilerResult;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -146,25 +147,74 @@ impl Default for Package {
     }
 }
 
-/// A dependency specification.
+/// A dependency specification in `saturn.toml`.
 ///
-/// In `saturn.toml`, dependencies are written as key-value pairs:
+/// Supports two TOML forms:
+///
+/// **Simple form** (backward compatible — defaults to `Saturnite` kind):
 /// ```toml
 /// [dependencies]
 /// saturnite-stdlib = "0.1"
 /// ```
+///
+/// **Full form** (with explicit ecosystem kind):
+/// ```toml
+/// [dependencies]
+/// serde = { kind = "rust", version = "1.0" }
+/// numpy = { kind = "python", version = "1.24" }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(transparent)]
-pub struct DependencySpec {
-    pub version: String,
+#[serde(untagged)]
+pub enum DependencySpec {
+    /// Simple string form: `"0.1"` → version with default `Saturnite` kind.
+    Simple(String),
+    /// Full struct form: `{ kind = "rust", version = "1.0" }`.
+    Full {
+        /// Explicit dependency kind (rust, python, native, or saturnite).
+        kind: DependencyKind,
+        /// Version / requirement string.
+        version: String,
+        /// Optional target restriction (e.g. "linux", "windows").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+    },
+}
+
+impl DependencySpec {
+    /// Return the dependency kind.
+    pub fn kind(&self) -> DependencyKind {
+        match self {
+            DependencySpec::Simple(_) => DependencyKind::Saturnite,
+            DependencySpec::Full { kind, .. } => *kind,
+        }
+    }
+
+    /// Return the version string.
+    pub fn version(&self) -> &str {
+        match self {
+            DependencySpec::Simple(v) => v,
+            DependencySpec::Full { version, .. } => version,
+        }
+    }
+
+    /// Return the target restriction, if any.
+    pub fn target(&self) -> Option<&str> {
+        match self {
+            DependencySpec::Simple(_) => None,
+            DependencySpec::Full { target, .. } => target.as_deref(),
+        }
+    }
+
+    /// Return the version string (for backward-compatible `.version` field access).
+    pub fn version_string(&self) -> String {
+        self.version().to_string()
+    }
 }
 
 impl std::str::FromStr for DependencySpec {
     type Err = CompilerError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self {
-            version: s.to_string(),
-        })
+        Ok(Self::Simple(s.to_string()))
     }
 }
 
@@ -187,8 +237,16 @@ saturnite-stdlib = "0.1"
         assert_eq!(config.package.version, "0.1.0");
         assert_eq!(config.package.edition, "2026");
         assert_eq!(
-            config.dependencies.get("saturnite-stdlib").unwrap().version,
+            config
+                .dependencies
+                .get("saturnite-stdlib")
+                .unwrap()
+                .version(),
             "0.1"
+        );
+        assert_eq!(
+            config.dependencies.get("saturnite-stdlib").unwrap().kind(),
+            DependencyKind::Saturnite
         );
     }
 
@@ -235,9 +293,57 @@ dep-c = "0.5"
 "#;
         let config = SaturnConfig::from_toml_str(toml_content).unwrap();
         assert_eq!(config.dependencies.len(), 3);
-        assert_eq!(config.dependencies.get("dep-a").unwrap().version, "1.0");
-        assert_eq!(config.dependencies.get("dep-b").unwrap().version, "2.3");
-        assert_eq!(config.dependencies.get("dep-c").unwrap().version, "0.5");
+        assert_eq!(config.dependencies.get("dep-a").unwrap().version(), "1.0");
+        assert_eq!(config.dependencies.get("dep-b").unwrap().version(), "2.3");
+        assert_eq!(config.dependencies.get("dep-c").unwrap().version(), "0.5");
+        assert_eq!(
+            config.dependencies.get("dep-a").unwrap().kind(),
+            DependencyKind::Saturnite
+        );
+    }
+
+    #[test]
+    fn test_ecosystem_dependencies() {
+        let toml_content = r#"[package]
+name = "ecosys"
+
+[dependencies]
+serde = { kind = "rust", version = "1.0" }
+numpy = { kind = "python", version = "1.24" }
+sqlite = { kind = "native", version = "3.40" }
+std = "0.1"
+"#;
+        let config = SaturnConfig::from_toml_str(toml_content).unwrap();
+        assert_eq!(config.dependencies.len(), 4);
+
+        let serde_dep = config.dependencies.get("serde").unwrap();
+        assert_eq!(serde_dep.kind(), DependencyKind::Rust);
+        assert_eq!(serde_dep.version(), "1.0");
+
+        let numpy_dep = config.dependencies.get("numpy").unwrap();
+        assert_eq!(numpy_dep.kind(), DependencyKind::Python);
+        assert_eq!(numpy_dep.version(), "1.24");
+
+        let sqlite_dep = config.dependencies.get("sqlite").unwrap();
+        assert_eq!(sqlite_dep.kind(), DependencyKind::Native);
+        assert_eq!(sqlite_dep.version(), "3.40");
+
+        let std_dep = config.dependencies.get("std").unwrap();
+        assert_eq!(std_dep.kind(), DependencyKind::Saturnite);
+        assert_eq!(std_dep.version(), "0.1");
+    }
+
+    #[test]
+    fn test_dependency_target_optional() {
+        let toml_content = r#"[package]
+name = "tgt"
+
+[dependencies]
+foo = { kind = "rust", version = "1.0", target = "linux" }
+"#;
+        let config = SaturnConfig::from_toml_str(toml_content).unwrap();
+        let dep = config.dependencies.get("foo").unwrap();
+        assert_eq!(dep.target(), Some("linux"));
     }
 
     #[test]

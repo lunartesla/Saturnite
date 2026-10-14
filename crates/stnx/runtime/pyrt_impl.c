@@ -18,6 +18,15 @@
 /// `sat_py_init` and torn down by `sat_py_shutdown`.
 static int g_interpreter_initialized = 0;
 
+/// Persistent cache of imported module handles, keyed by module name.
+/// This allows `use python:module` to keep module handles alive across
+/// multiple calls. The array is grown with `realloc` as modules are
+/// imported. `g_module_count` tracks the number of entries; entries are
+/// never removed (modules live for the interpreter lifetime).
+static char **g_cached_names = NULL;
+static sat_py_object_handle **g_cached_handles = NULL;
+static size_t g_module_count = 0;
+
 /// Storage for the most recently fetched exception instance. Held between
 /// `PyErr_Fetch` and `record_exception` so the exception details can be
 /// rendered into the static buffers.
@@ -443,8 +452,200 @@ void sat_py_free_result_str(char *buf) {
     free(buf);
 }
 
+void sat_py_set_search_path(const char *search_path) {
+    if (search_path == NULL) {
+        return;
+    }
+    // Store the search path in a static buffer. This is a simple approach:
+    // the path is set once (or replaced) and used for subsequent imports.
+    // The buffer persists until the next call to this function or shutdown.
+    static char g_search_path[4096];
+    strncpy(g_search_path, search_path, sizeof(g_search_path) - 1);
+    g_search_path[sizeof(g_search_path) - 1] = '\0';
+
+    // Also add the directories to sys.path so subsequent imports can find
+    // modules from these locations.
+    PyObject *sys_path = PySys_GetObject("path");
+    if (sys_path == NULL || !PyList_Check(sys_path)) {
+        return;
+    }
+
+    char *copy = strdup(search_path);
+    if (copy == NULL) {
+        return;
+    }
+    char *saveptr = NULL;
+    char *dir = strtok_r(copy, ":", &saveptr);
+    while (dir != NULL) {
+        PyObject *py_dir = PyUnicode_FromString(dir);
+        if (py_dir != NULL) {
+            PyList_Append(sys_path, py_dir);
+            Py_DECREF(py_dir);
+        }
+        dir = strtok_r(NULL, ":", &saveptr);
+    }
+    free(copy);
+}
+
+sat_py_object_handle *sat_py_get_cached_module(const char *name) {
+    if (name == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < g_module_count; i++) {
+        if (strcmp(g_cached_names[i], name) == 0) {
+            // Return a new owned handle to the same underlying object.
+            // sat_py_handle_new increments the refcount.
+            return sat_py_handle_new(g_cached_handles[i]->object);
+        }
+    }
+    return NULL;
+}
+
+sat_py_object_handle *sat_py_import_and_cache(const char *name, const char *search_path) {
+    if (name == NULL) {
+        return NULL;
+    }
+
+    // Check if already cached.
+    sat_py_object_handle *cached = sat_py_get_cached_module(name);
+    if (cached != NULL) {
+        return cached;
+    }
+
+    // Import the module.
+    sat_py_object_handle *mod = sat_py_import_module(name, search_path);
+    if (mod == NULL) {
+        return NULL;
+    }
+
+    // Cache it: grow the arrays and store the name + handle.
+    char **new_names = (char **)realloc(g_cached_names, sizeof(char *) * (g_module_count + 1));
+    if (new_names == NULL) {
+        sat_py_release_handle(mod);
+        return NULL;
+    }
+    g_cached_names = new_names;
+
+    sat_py_object_handle **new_handles = (sat_py_object_handle **)realloc(
+        g_cached_handles, sizeof(sat_py_object_handle *) * (g_module_count + 1));
+    if (new_handles == NULL) {
+        sat_py_release_handle(mod);
+        return NULL;
+    }
+    g_cached_handles = new_handles;
+
+    // Store a duplicate of the name string (the caller's string may be transient).
+    char *name_copy = strdup(name);
+    if (name_copy == NULL) {
+        sat_py_release_handle(mod);
+        return NULL;
+    }
+
+    g_cached_names[g_module_count] = name_copy;
+    g_cached_handles[g_module_count] = mod;
+    g_module_count++;
+
+    return sat_py_handle_new(mod->object);
+}
+
+sat_py_object_handle *sat_py_get_attr(sat_py_object_handle *object, const char *name) {
+    if (object == NULL || name == NULL || object->object == NULL) {
+        return NULL;
+    }
+    PyObject *obj = (PyObject *)object->object;
+    PyObject *attr = PyObject_GetAttrString(obj, name);
+    if (attr == NULL) {
+        record_exception();
+        return NULL;
+    }
+    return sat_py_handle_new(attr);
+}
+
+bool sat_py_call_method(sat_py_object_handle *handle, const char *method_name,
+                        const char *search_path,
+                        const int32_t *kinds, const int64_t *values,
+                        size_t arg_count, sat_py_result *out) {
+    if (out == NULL) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    if (handle == NULL || handle->object == NULL || method_name == NULL) {
+        out->ok = false;
+        snprintf(g_error_class, sizeof(g_error_class), "RuntimeError");
+        snprintf(g_error_message, sizeof(g_error_message), "no callable provided for method call");
+        out->error_class = g_error_class;
+        out->error_message = g_error_message;
+        return true;
+    }
+
+    PyObject *obj = (PyObject *)handle->object;
+    PyObject *method = PyObject_GetAttrString(obj, method_name);
+    if (method == NULL) {
+        record_exception();
+        out->ok = false;
+        out->error_class = g_error_class;
+        out->error_message = g_error_message;
+        return true;
+    }
+
+    // Rebuild sat_py_value array from the flat kinds/values ABI.
+    sat_py_value *sv = (sat_py_value *)malloc(sizeof(sat_py_value) * (arg_count > 0 ? arg_count : 1));
+    if (sv == NULL) {
+        Py_DECREF(method);
+        return false;
+    }
+    for (size_t i = 0; i < arg_count; i++) {
+        sv[i].kind = (sat_py_value_kind)kinds[i];
+        switch (sv[i].kind) {
+        case SAT_PY_NONE:
+            sv[i].as.bool_val = false;
+            break;
+        case SAT_PY_BOOL:
+            sv[i].as.bool_val = values[i] != 0;
+            break;
+        case SAT_PY_I64:
+            sv[i].as.i64_val = (int64_t)values[i];
+            break;
+        case SAT_PY_F64:
+            memcpy(&sv[i].as.f64_val, &values[i], sizeof(double));
+            break;
+        case SAT_PY_STR:
+            sv[i].as.str_val = (const char *)(intptr_t)values[i];
+            break;
+        default:
+            sv[i].kind = SAT_PY_NONE;
+            sv[i].as.bool_val = false;
+            break;
+        }
+    }
+
+    // Use method as the callable for call_with_values.
+    sat_py_object_handle *method_handle = sat_py_handle_new(method);
+    Py_DECREF(method);
+    if (method_handle == NULL) {
+        free(sv);
+        return false;
+    }
+
+    bool ok = call_with_values(method_handle, sv, arg_count, out);
+    free(sv);
+    sat_py_release_handle(method_handle);
+    return ok;
+}
+
 void sat_py_shutdown(void) {
     if (g_interpreter_initialized) {
+        // Free cached module handles.
+        for (size_t i = 0; i < g_module_count; i++) {
+            sat_py_release_handle(g_cached_handles[i]);
+            free(g_cached_names[i]);
+        }
+        free(g_cached_names);
+        free(g_cached_handles);
+        g_cached_names = NULL;
+        g_cached_handles = NULL;
+        g_module_count = 0;
+
         Py_FinalizeEx();
         g_interpreter_initialized = 0;
     }

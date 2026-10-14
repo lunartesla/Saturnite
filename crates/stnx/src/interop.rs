@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 /// required by Phase 9: Rust and Python must not be collapsed into a
 /// vague "foreign library" mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DependencyKind {
     /// A Saturnite package / native dependency.
     Saturnite,
@@ -57,6 +58,7 @@ pub struct DependencyEntry {
 /// runtime. Rust and Python remain separate bridges (per the campaign rules),
 /// and `Native` is the path for plain C-ABI shared libraries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ExternalFunctionKind {
     /// A Rust crate function exposed through a `#[no_mangle] extern "C"`
     /// wrapper. Resolved at link time against a static/shared library.

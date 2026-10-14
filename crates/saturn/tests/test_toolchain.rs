@@ -18,7 +18,8 @@ fn write_file(dir: &std::path::Path, rel: &str, contents: &str) -> PathBuf {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("failed to create parent dir");
     }
-    fs::write(&path, contents).unwrap_or_else(|e| panic!("failed to write {}: {}", path.display(), e));
+    fs::write(&path, contents)
+        .unwrap_or_else(|e| panic!("failed to write {}: {}", path.display(), e));
     path
 }
 
@@ -80,8 +81,8 @@ fn test_discover_finds_project_from_root() {
     write_saturn_toml(root, "test_proj", "0.1.0", "2026");
     write_file(root, "src/main.stn", hello_program());
 
-    let project = saturn::discover::ProjectDiscovery::discover(root)
-        .expect("discovery should succeed");
+    let project =
+        saturn::discover::ProjectDiscovery::discover(root).expect("discovery should succeed");
     assert_eq!(project.root, root);
     assert_eq!(project.manifest.package.name, "test_proj");
     assert!(project.entry.ends_with("src/main.stn"));
@@ -248,7 +249,11 @@ fn test_check_invalid_project_fails() {
 
     write_saturn_toml(root, "check_invalid", "0.1.0", "2026");
     // Invalid Saturnite: unbalanced types.
-    write_file(root, "src/main.stn", "fn main() -> i64:\n    return \"not a number\"\n");
+    write_file(
+        root,
+        "src/main.stn",
+        "fn main() -> i64:\n    return \"not a number\"\n",
+    );
 
     let ctx = BuildContext::new(root.to_path_buf(), BuildProfile::Debug)
         .expect("build context should be created");
@@ -273,15 +278,27 @@ fn test_clean_removes_build_artifacts() {
 
     // Build first to create artifacts.
     ctx.build().expect("build should succeed");
-    assert!(ctx.target_dir.exists(), "target dir should exist after build");
+    assert!(
+        ctx.target_dir.exists(),
+        "target dir should exist after build"
+    );
 
     // Clean and verify.
     ctx.clean_profile().expect("clean should succeed");
-    assert!(!ctx.target_dir.exists(), "target dir should be removed after clean");
+    assert!(
+        !ctx.target_dir.exists(),
+        "target dir should be removed after clean"
+    );
 
     // Source files and saturn.toml must still exist.
-    assert!(root.join("saturn.toml").exists(), "saturn.toml must survive clean");
-    assert!(root.join("src/main.stn").exists(), "source must survive clean");
+    assert!(
+        root.join("saturn.toml").exists(),
+        "saturn.toml must survive clean"
+    );
+    assert!(
+        root.join("src/main.stn").exists(),
+        "source must survive clean"
+    );
 }
 
 #[test]
@@ -306,7 +323,10 @@ fn test_clean_all_removes_full_target() {
 
     // Clean all and verify.
     ctx.clean_all().expect("clean --all should succeed");
-    assert!(!root.join("target").exists(), "target/ must be removed by clean --all");
+    assert!(
+        !root.join("target").exists(),
+        "target/ must be removed by clean --all"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -324,8 +344,14 @@ fn test_init_creates_valid_project() {
     assert!(output.contains("Created project"));
 
     let proj_dir = root.join("myproject");
-    assert!(proj_dir.join("saturn.toml").exists(), "saturn.toml should exist");
-    assert!(proj_dir.join("src").join("main.stn").exists(), "src/main.stn should exist");
+    assert!(
+        proj_dir.join("saturn.toml").exists(),
+        "saturn.toml should exist"
+    );
+    assert!(
+        proj_dir.join("src").join("main.stn").exists(),
+        "src/main.stn should exist"
+    );
 
     // Verify the generated project can be built.
     let (code, output) = run_saturn(&proj_dir, &["build"]);
@@ -365,9 +391,17 @@ fn test_cli_build_from_project_root() {
     assert!(output.contains("Built"));
 
     // Verify the executable was created.
-    let exe_name = if cfg!(windows) { "cli_test.exe" } else { "cli_test" };
+    let exe_name = if cfg!(windows) {
+        "cli_test.exe"
+    } else {
+        "cli_test"
+    };
     let exe_path = root.join("target").join("debug").join(exe_name);
-    assert!(exe_path.exists(), "executable should exist at {:?}", exe_path);
+    assert!(
+        exe_path.exists(),
+        "executable should exist at {:?}",
+        exe_path
+    );
 }
 
 #[test]
@@ -381,7 +415,11 @@ fn test_cli_build_release() {
     let (code, output) = run_saturn(root, &["build", "--release"]);
     assert_eq!(code, 0, "saturn build --release should succeed: {}", output);
 
-    let exe_name = if cfg!(windows) { "cli_release.exe" } else { "cli_release" };
+    let exe_name = if cfg!(windows) {
+        "cli_release.exe"
+    } else {
+        "cli_release"
+    };
     let exe_path = root.join("target").join("release").join(exe_name);
     assert!(exe_path.exists(), "release executable should exist");
 }
@@ -396,7 +434,10 @@ fn test_cli_run() {
 
     let (code, output) = run_saturn(root, &["run"]);
     assert_eq!(code, 0, "saturn run should succeed: {}", output);
-    assert!(output.contains("Hello, Saturnite!"), "run output should contain the message");
+    assert!(
+        output.contains("Hello, Saturnite!"),
+        "run output should contain the message"
+    );
 }
 
 #[test]
@@ -462,9 +503,15 @@ fn test_platform_aware_executable_name() {
     let exe = saturn::profile::executable_name(name);
 
     if cfg!(windows) {
-        assert_eq!(exe, "testapp.exe", "Windows executable should have .exe suffix");
+        assert_eq!(
+            exe, "testapp.exe",
+            "Windows executable should have .exe suffix"
+        );
     } else {
-        assert_eq!(exe, "testapp", "Non-Windows executable should not have .exe suffix");
+        assert_eq!(
+            exe, "testapp",
+            "Non-Windows executable should not have .exe suffix"
+        );
     }
 }
 

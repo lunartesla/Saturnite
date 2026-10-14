@@ -148,8 +148,7 @@ impl SaturnCli {
                 // Explicit file mode: discover the project from the file's
                 // parent (which may be a subdirectory of the project root),
                 // then build using the explicit entry.
-                let project_root = crate::discover::ProjectDiscovery::discover(entry)?
-                    .root;
+                let project_root = crate::discover::ProjectDiscovery::discover(entry)?.root;
                 let mut ctx = BuildContext::with_entry(project_root, entry.clone(), profile)?;
                 ctx.no_link = no_link;
                 ctx.save_temps = save_temps;
