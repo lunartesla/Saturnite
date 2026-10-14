@@ -1,0 +1,188 @@
+module error
+
+// =============================================================================
+// Error types — structured errors for every compilation stage
+// =============================================================================
+//
+// One-to-one Saturnite port of crates/stnx/src/error.rs
+//
+// Saturnite does not have Rust's thiserror/miette derive macros.
+// Instead, we define struct-based error types with explicit message fields.
+// The `raise` statement is used to abort with an error message.
+
+// ─── Source span ───
+
+struct SourceSpan:
+    start: number
+    end: number
+
+// ─── LexError ───
+
+struct LexError:
+    src: text
+    span: SourceSpan
+    message: text
+
+fn lex_error(src: text, offset: number, len: number, message: text) -> LexError:
+    give LexError:
+        src: src
+        span: SourceSpan: start: offset, end: offset + len
+        message: message
+
+// ─── ParseError ───
+
+struct ParseError:
+    src: text
+    span: SourceSpan
+    message: text
+
+// ─── TargetError ───
+
+struct TargetError:
+    message: text
+    triple: text
+    triple_set: bool
+
+fn target_init_failed(message: text, triple: text) -> TargetError:
+    give TargetError:
+        message: message
+        triple: triple
+        triple_set: true
+
+fn target_lookup_failed(triple: text, message: text) -> TargetError:
+    give TargetError:
+        message: message
+        triple: triple
+        triple_set: true
+
+fn target_machine_failed(triple: text, message: text) -> TargetError:
+    give TargetError:
+        message: message
+        triple: triple
+        triple_set: true
+
+// ─── LinkError ───
+
+struct LinkError:
+    message: text
+    details: text
+    details_set: bool
+
+fn linker_not_found(linker: text) -> LinkError:
+    give LinkError:
+        message: "linker '" + linker + "' not found"
+        details: ""
+        details_set: false
+
+fn linking_failed(output: text, details: text) -> LinkError:
+    give LinkError:
+        message: "linking failed for output: " + output
+        details: details
+        details_set: true
+
+// ─── CompilerError ───
+// The top-level error enum. Saturnite enums are C-style (tag-only),
+// so we use a discriminant + payload struct pattern.
+
+enum CompilerErrorKind:
+    lexer
+    parse
+    semantic
+    type_error
+    codegen
+    target
+    link
+    io
+    process
+    config
+    ir_emission
+
+struct CompilerError:
+    kind: CompilerErrorKind
+    // Payload fields (only meaningful for certain kinds):
+    lex_error: LexError
+    lex_error_set: bool
+    parse_error: ParseError
+    parse_error_set: bool
+    semantic_msg: text
+    type_msg: text
+    codegen_msg: text
+    target_error: TargetError
+    target_error_set: bool
+    link_error: LinkError
+    link_error_set: bool
+    io_msg: text
+    process_msg: text
+    config_msg: text
+    ir_msg: text
+
+// ─── Constructors ───
+
+fn lexer_error(e: LexError) -> CompilerError:
+    give CompilerError:
+        kind: CompilerErrorKind::lexer
+        lex_error: e
+        lex_error_set: true
+
+fn parse_error(e: ParseError) -> CompilerError:
+    give CompilerError:
+        kind: CompilerErrorKind::parse
+        parse_error: e
+        parse_error_set: true
+
+fn semantic(message: text) -> CompilerError:
+    give CompilerError:
+        kind: CompilerErrorKind::semantic
+        semantic_msg: message
+
+fn type_error(message: text) -> CompilerError:
+    give CompilerError:
+        kind: CompilerErrorKind::type_error
+        type_msg: message
+
+fn codegen(message: text) -> CompilerError:
+    give CompilerError:
+        kind: CompilerErrorKind::codegen
+        codegen_msg: message
+
+fn target_error(e: TargetError) -> CompilerError:
+    give CompilerError:
+        kind: CompilerErrorKind::target
+        target_error: e
+        target_error_set: true
+
+fn link_error(e: LinkError) -> CompilerError:
+    give CompilerError:
+        kind: CompilerErrorKind::link
+        link_error: e
+        link_error_set: true
+
+fn io_error(message: text) -> CompilerError:
+    give CompilerError:
+        kind: CompilerErrorKind::io
+        io_msg: message
+
+fn process_error(message: text) -> CompilerError:
+    give CompilerError:
+        kind: CompilerErrorKind::process
+        process_msg: message
+
+fn config_error(message: text) -> CompilerError:
+    give CompilerError:
+        kind: CompilerErrorKind::config
+        config_msg: message
+
+fn ir_emission_error(message: text) -> CompilerError:
+    give CompilerError:
+        kind: CompilerErrorKind::ir_emission
+        ir_msg: message
+
+// ─── Result type ───
+// Saturnite doesn't have a built-in Result<T, E> type.
+// We use a pattern where functions return a struct with `ok: bool`
+// and a value field. On error, callers check the ok flag and raise.
+
+struct CompilerResult:
+    ok: bool
+    error: CompilerError
+    error_set: bool

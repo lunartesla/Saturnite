@@ -1,0 +1,1012 @@
+module mir_lower
+
+// =============================================================================
+// MIR Lowering — HIR → MIR (control-flow-aware IR)
+// =============================================================================
+//
+// One-to-one Saturnite port of crates/stnx/src/mir/lower.rs
+//
+// Transforms a HirProgram into a MirProgram with an explicit control-flow
+// graph. Every if, for, and while expression is lowered into SwitchInt /
+// Goto terminators and dedicated basic blocks, so that LLVM codegen never
+// needs to "rediscover" the CFG.
+//
+// Builder model:
+// - Blocks are stored in a List whose indices correspond to BlockIds.
+// - `current` tracks the index of the block being built.
+// - `create_block` allocates a new (empty, unterminated) block.
+// - `switch_to` changes which block is being built.
+// - `finish` sets a terminator, closing the block.
+
+use error::{CompilerError, CompilerResult}
+use hir_expr::{HirExpr, ExprKind}
+use hir_function::{HirFunction, HirProgram, StructDef}
+use hir_stmt::{HirStmt, StmtKind, StructFieldDef}
+use hir_symbol::{DefId, SymbolId, SymbolInterner, DefTable, DefEntry, DefKind, Visibility, ModuleId, NO_SYMBOL}
+use hir_types::{HirType, TypeKind}
+use mir::{
+    BlockId, LocalId, MirBasicBlock, MirBinOp, MirConst, MirExternalKind,
+    MirFunction, MirLocal, MirOperand, MirProgram, MirRvalue, MirStmt,
+    MirStmtKind, MirTerminator, MirType, MirUnOp, ExternalLibrary,
+    PRINTLN_DEF_ID, PRINTLN_STR_DEF_ID, CONCAT_STR_DEF_ID, STR_I64_DEF_ID,
+    OperandKind, RvalueKind, TermKind, StmtKind as MirStmtKindEnum,
+}
+
+// ─── DefId sentinels for builtins ───
+// Must match hir::lower::PRINTLN_DEF_ID and mir::codegen sentinels.
+
+// ─── Entry point ───
+// Lower a HirProgram into a MirProgram.
+// Builds a function signature table for call return-type resolution,
+// then lowers each function body into a CFG.
+
+fn lower_program(hir: HirProgram) -> CompilerResult<MirProgram>:
+    // Build function signature table for call return-type resolution.
+    let mut sigs: HashMap<SymbolId, FunctionSig> = new_hashmap()
+    for func in hir.functions:
+        let param_types: List<HirType> = func.params.map(|(_, t)| t)
+        sigs.insert(func.name, FunctionSig:
+            def_id: func.def_id
+            param_types: param_types
+            param_names: func.params.map(|(n, _)| n)
+            return_type: func.return_type
+            generic_params: func.generic_params
+        )
+
+    // Register external declarations in the signature table.
+    for ext in hir.external_functions:
+        sigs.insert(ext.name, FunctionSig:
+            def_id: ext.def_id
+            param_types: ext.param_types
+            param_names: ext.param_names
+            return_type: ext.return_type
+            generic_params: []
+        )
+
+    // Lower each function.
+    let mut funcs: List<MirFunction> = []
+    for func in hir.functions:
+        let mut lower = mir_lower_new(hir, func, sigs)
+        funcs = funcs + [lower.lower_function()]
+
+    // Collect distinct declared external libraries for the linker.
+    let mut external_libraries: List<ExternalLibrary> = []
+    for ext in hir.external_functions:
+        let kind = match ext.kind:
+            case ExternalKind::rust:   MirExternalKind::rust
+            case ExternalKind::python: MirExternalKind::python
+            case ExternalKind::native: MirExternalKind::native
+        // All external kinds are tracked. Python needs the Python library
+        // linked (-lpython, -lpthread, etc.) even though it has no
+        // link-time staticlib artifact of its own.
+        if not external_libraries.any(|l| l.name == ext.ecosystem):
+            external_libraries = external_libraries + [ExternalLibrary:
+                name: ext.ecosystem
+                kind: kind
+            ]
+
+    give MirProgram:
+        functions: funcs
+        symbols: hir.symbols
+        structs: hir.structs
+        enums: hir.enums
+        external_libraries: external_libraries
+
+// ─── FunctionSig (internal helper) ───
+
+struct FunctionSig:
+    def_id: DefId
+    param_types: List<HirType>
+    param_names: List<SymbolId>
+    return_type: HirType
+    generic_params: List<SymbolId>
+
+// ─── MirLower (per-function lowering state) ───
+// Saturnite has no struct methods or lifetimes, so this is a set of free
+// functions that thread the lowering state explicitly.
+
+struct MirLower:
+    hir: HirProgram
+    func: HirFunction
+    sigs: HashMap<SymbolId, FunctionSig>
+    blocks: List<MirBasicBlock>
+    current: number
+    locals: List<MirLocal>
+    var_map: HashMap<SymbolId, LocalId>
+    temp_symbol: SymbolId
+
+fn mir_lower_new(hir: HirProgram, func: HirFunction, sigs: HashMap<SymbolId, FunctionSig>) -> MirLower:
+    let mut symbols = hir.symbols.clone()
+    let temp = sym_interner_intern(symbols, "")
+    give MirLower:
+        hir: hir
+        func: func
+        sigs: sigs
+        blocks: []
+        current: 0
+        locals: []
+        var_map: new_hashmap()
+        temp_symbol: temp
+
+fn new_local(self: MirLower, ty: MirType, name: SymbolId, mutable: bool) -> LocalId:
+    let id = LocalId: id: self.locals.length
+    self.locals = self.locals + [MirLocal:
+        id: id
+        ty: ty
+        name: name
+        mutable: mutable
+    ]
+    give id
+
+fn create_block(self: MirLower, name: text) -> BlockId:
+    let id = BlockId: id: self.blocks.length
+    self.blocks = self.blocks + [MirBasicBlock:
+        id: id
+        name: name
+        stmts: []
+        terminator: MirTerminator: kind: TermKind::unreachable  // placeholder
+    ]
+    yield id
+
+fn start_block(self: MirLower, name: text) -> BlockId:
+    let id = create_block(self, name)
+    self.current = self.blocks.length - 1
+    yield id
+
+fn switch_to(self: MirLower, block_id: BlockId):
+    self.current = block_id.id
+    // assert: current block is unterminated (Unreachable placeholder)
+    if not (self.blocks[self.current].terminator.kind == TermKind::unreachable):
+        panic("switch_to: block already terminated")
+
+fn emit(self: MirLower, kind: MirStmtKind):
+    self.blocks[self.current].stmts = self.blocks[self.current].stmts + [MirStmt: kind: kind]
+
+// ─── Terminator helpers ───
+
+fn finish_return_none(self: MirLower):
+    self.blocks[self.current].terminator = MirTerminator: kind: TermKind::return_val
+    // has_return_value = false
+
+fn finish_return_some(self: MirLower, operand: MirOperand):
+    self.blocks[self.current].terminator = MirTerminator:
+        kind: TermKind::return_val
+        return_value: operand
+        has_return_value: true
+
+fn finish_goto(self: MirLower, target: BlockId):
+    self.blocks[self.current].terminator = MirTerminator:
+        kind: TermKind::goto
+        goto_target: target
+
+fn finish_switch_int(self: MirLower, scrutinee: MirOperand, branches: List<SwitchBranch>, else_target: BlockId):
+    self.blocks[self.current].terminator = MirTerminator:
+        kind: TermKind::switch_int
+        switch_scrutinee: scrutinee
+        switch_ty: MirType: kind: TypeKind::bool   // bool conditions use i1
+        switch_branches: branches
+        switch_else: else_target
+
+fn finish_call(self: MirLower, func: DefId, args: List<MirOperand>, destination: LocalId, next: BlockId):
+    self.blocks[self.current].terminator = MirTerminator:
+        kind: TermKind::call
+        call_func: func
+        call_args: args
+        call_destination: destination
+        call_next: next
+
+fn finish_unreachable(self: MirLower):
+    self.blocks[self.current].terminator = MirTerminator: kind: TermKind::unreachable
+
+fn current_closed(self: MirLower) -> boolean:
+    give self.blocks[self.current].terminator.kind != TermKind::unreachable
+
+// If current block is not yet terminated, emit a Goto to target.
+fn ensure_terminated(self: MirLower, target: BlockId):
+    if not current_closed(self):
+        finish_goto(self, target)
+
+fn lookup_var(self: MirLower, sym: SymbolId) -> LocalId:
+    if self.var_map.has(sym):
+        give self.var_map.get(sym)
+    yield LocalIdNotFound  // error handled by caller
+
+const LocalIdNotFound: LocalId = LocalId: id: 4294967295
+
+// ─── Function lowering ───
+
+fn lower_function(self: MirLower) -> MirFunction:
+    start_block(self, "entry")
+
+    let mut param_locals: List<LocalId> = []
+    let mut param_types: List<(SymbolId, HirType)> = []
+    for (sym, ty) in self.func.params:
+        let lid = new_local(self, ty, sym, false)
+        self.var_map.insert(sym, lid)
+        param_locals = param_locals + [lid]
+        param_types = param_types + [(sym, ty)]
+
+    let body = self.func.body
+    if body.length == 0:
+        finish_return_none(self)
+    else:
+        let last = body[body.length - 1]
+        let rest = body[0 .. body.length - 1]
+        for stmt in rest:
+            lower_stmt(self, stmt)
+
+        match last.kind:
+            case StmtKind::expr_stmt:
+                let ret_val = lower_expr(self, last.expr_value)
+                if not current_closed(self):
+                    finish_return_some(self, ret_val)
+            case StmtKind::return_stmt:
+                lower_stmt(self, last)
+            case else:
+                lower_stmt(self, last)
+                if not current_closed(self):
+                    finish_return_none(self)
+
+    // Verify all blocks have terminators
+    for block in self.blocks:
+        if block.terminator.kind == TermKind::unreachable:
+            panic("block `" + block.name + "` has no terminator")
+
+    yield MirFunction:
+        def_id: self.func.def_id
+        name: self.func.name
+        params: param_types
+        return_type: self.func.return_type
+        locals: self.locals
+        param_locals: param_locals
+        blocks: self.blocks
+        start_block: BlockId: id: 0
+
+// ─── Statement lowering ───
+
+fn lower_stmt(self: MirLower, stmt: HirStmt):
+    match stmt.kind:
+        case StmtKind::let_stmt:
+            let local_ty = stmt.let_ty
+            let local = new_local(self, local_ty, stmt.let_name, stmt.let_mutable)
+            // Evaluate the initializer BEFORE updating var_map so that a
+            // shadowing `let x = x + 1` correctly reads the *previous* local.
+            let val = lower_expr(self, stmt.let_value)
+            self.var_map.insert(stmt.let_name, local)
+            let ty = stmt.let_has_type
+                ? stmt.let_ty
+                : val.determine_type()   // fallback to inferred
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: local
+                local_ty: ty
+                local_mutable: stmt.let_mutable
+            )
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::assign
+                assign_local: local
+                assign_rvalue: MirRvalue:
+                    kind: RvalueKind::use_operand
+                    operand: val
+            )
+
+        case StmtKind::expr_stmt:
+            lower_expr(self, stmt.expr_value)
+            // Discard result
+
+        case StmtKind::return_stmt:
+            if stmt.has_value:
+                let operand = lower_expr(self, stmt.return_value)
+                if not current_closed(self):
+                    finish_return_some(self, operand)
+            else:
+                if not current_closed(self):
+                    finish_return_none(self)
+
+        case StmtKind::println_stmt:
+            let val = lower_expr(self, stmt.print_expr)
+            let dest = new_local(self, MirType: kind: TypeKind::i64, self.temp_symbol, false)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: dest
+                local_ty: MirType: kind: TypeKind::i64
+                local_mutable: false
+            )
+            let next = create_block(self, "println_cont_" + self.blocks.length.to_string())
+            finish_call(self, PRINTLN_DEF_ID, [val], dest, next)
+            switch_to(self, next)
+
+        case StmtKind::println_str:
+            let val = lower_expr(self, stmt.print_expr)
+            let dest = new_local(self, MirType: kind: TypeKind::i64, self.temp_symbol, false)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: dest
+                local_ty: MirType: kind: TypeKind::i64
+                local_mutable: false
+            )
+            let next = create_block(self, "println_str_cont_" + self.blocks.length.to_string())
+            finish_call(self, PRINTLN_STR_DEF_ID, [val], dest, next)
+            switch_to(self, next)
+
+        case StmtKind::struct_def, StmtKind::enum_def:
+            // Definitions are collected during the pre-pass; emit nothing.
+            pass
+
+        case StmtKind::give:
+            // 0.5: `give expr` is a synonym for `return expr`.
+            if stmt.has_value:
+                let hir_opt = lower_expr(self, stmt.return_value)
+                if not current_closed(self):
+                    finish_return_some(self, hir_opt)
+            else:
+                if not current_closed(self):
+                    finish_return_none(self)
+
+        case StmtKind::say:
+            // 0.5: `say expr` is a synonym for `println(expr)`.
+            let hir_expr = lower_expr(self, stmt.print_expr)
+            let dest = new_local(self, MirType: kind: TypeKind::i64, self.temp_symbol, false)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: dest
+                local_ty: MirType: kind: TypeKind::i64
+                local_mutable: false
+            )
+            let next = create_block(self, "say_cont_" + self.blocks.length.to_string())
+            // Use PrintlnStr for string expressions, Println for numbers
+            if stmt.print_expr.ty.kind == TypeKind::str:
+                finish_call(self, PRINTLN_STR_DEF_ID, [hir_expr], dest, next)
+            else:
+                finish_call(self, PRINTLN_DEF_ID, [hir_expr], dest, next)
+            switch_to(self, next)
+
+        case StmtKind::raise:
+            // 0.5: `raise expr` lowers to a stub — print the expression
+            // (which is expected to be a StrLit in 0.5) and then emit an
+            // Unreachable terminator.
+            let val = lower_expr(self, stmt.print_expr)
+            let dest = new_local(self, MirType: kind: TypeKind::i64, self.temp_symbol, false)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: dest
+                local_ty: MirType: kind: TypeKind::i64
+                local_mutable: false
+            )
+            let next = create_block(self, "raise_cont_" + self.blocks.length.to_string())
+            // String messages go to the string printer; numeric tags to i64 printer.
+            let func = if stmt.print_expr.ty.kind == TypeKind::str:
+                PRINTLN_STR_DEF_ID
+            else:
+                PRINTLN_DEF_ID
+            finish_call(self, func, [val], dest, next)
+            switch_to(self, next)
+            // After printing, mark the block as unreachable.
+            finish_unreachable(self)
+
+// ─── Expression lowering ───
+
+fn lower_expr(self: MirLower, expr: HirExpr) -> MirOperand:
+    match expr.kind:
+        case ExprKind::integer:
+            give MirOperand:
+                kind: OperandKind::const_val
+                const_val: MirConst: kind: MirConstKind::i64_val, int_val: expr.int_val
+
+        case ExprKind::float:
+            give MirOperand:
+                kind: OperandKind::const_val
+                const_val: MirConst: kind: MirConstKind::f64_val, float_val: expr.float_val
+
+        case ExprKind::bool_lit:
+            give MirOperand:
+                kind: OperandKind::const_val
+                const_val: MirConst: kind: MirConstKind::bool_val, bool_val: expr.bool_val
+
+        case ExprKind::str_lit:
+            let local = new_local(self, MirType: kind: TypeKind::str, self.temp_symbol, false)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: local
+                local_ty: MirType: kind: TypeKind::str
+                local_mutable: false
+            )
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::assign
+                assign_local: local
+                assign_rvalue: MirRvalue:
+                    kind: RvalueKind::str_lit
+                    str_symbol: expr.str_symbol
+            )
+            give MirOperand: kind: OperandKind::local, local_id: local
+
+        case ExprKind::unit_val:
+            give MirOperand: kind: OperandKind::const_val, const_val: MirConst: kind: MirConstKind::i64_val, int_val: 0
+
+        case ExprKind::variable:
+            let lid = var_lookup(self, expr.symbol)
+            give MirOperand: kind: OperandKind::local, local_id: lid
+
+        case ExprKind::assign:
+            let target_local = var_lookup(self, expr.symbol)
+            let val = lower_expr(self, expr.assign_value)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::assign
+                assign_local: target_local
+                assign_rvalue: MirRvalue:
+                    kind: RvalueKind::use_operand
+                    operand: val
+            )
+            give MirOperand: kind: OperandKind::local, local_id: target_local
+
+        case ExprKind::aug_assign:
+            let target_local = var_lookup(self, expr.symbol)
+            let val = lower_expr(self, expr.assign_value)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::assign
+                assign_local: target_local
+                assign_rvalue: MirRvalue:
+                    kind: RvalueKind::binary
+                    bin_op: augop_to_binop(expr.aug_op)
+                    bin_lhs: MirOperand: kind: OperandKind::local, local_id: target_local
+                    bin_rhs: val
+            )
+            give MirOperand: kind: OperandKind::local, local_id: target_local
+
+        case ExprKind::binary:
+            let l = lower_expr(self, expr.lhs)
+            let r = lower_expr(self, expr.rhs)
+            let result_local = new_local(self, expr.ty, self.temp_symbol, false)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: result_local
+                local_ty: expr.ty
+                local_mutable: false
+            )
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::assign
+                assign_local: result_local
+                assign_rvalue: MirRvalue:
+                    kind: RvalueKind::binary
+                    bin_op: expr.bin_op
+                    bin_lhs: l
+                    bin_rhs: r
+            )
+            give MirOperand: kind: OperandKind::local, local_id: result_local
+
+        case ExprKind::unary:
+            let val = lower_expr(self, expr.un_expr)
+            let result_local = new_local(self, expr.ty, self.temp_symbol, false)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: result_local
+                local_ty: expr.ty
+                local_mutable: false
+            )
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::assign
+                assign_local: result_local
+                assign_rvalue: MirRvalue:
+                    kind: RvalueKind::unary
+                    un_op: expr.un_op
+                    un_operand: val
+            )
+            give MirOperand: kind: OperandKind::local, local_id: result_local
+
+        case ExprKind::call:
+            // By this point monomorphization has already retargeted generic
+            // call sites to their concrete instantiations.
+            // If the callee is an external declaration, lower it as an
+            // ExternalCall rvalue rather than a normal call terminator.
+            if expr.func_is_external:
+                yield lower_external_call(self, expr)
+
+            yield lower_call(self, expr)
+
+        case ExprKind::if_expr:
+            lower_if(self, expr)
+            give MirOperand: kind: OperandKind::const_val, const_val: MirConst: kind: MirConstKind::i64_val, int_val: 0
+
+        case ExprKind::for_expr:
+            lower_for(self, expr)
+            give MirOperand: kind: OperandKind::const_val, const_val: MirConst: kind: MirConstKind::i64_val, int_val: 0
+
+        case ExprKind::while_expr:
+            lower_while(self, expr)
+            give MirOperand: kind: OperandKind::const_val, const_val: MirConst: kind: MirConstKind::i64_val, int_val: 0
+
+        case ExprKind::range_expr:
+            // Range evaluates to its start value.
+            yield lower_expr(self, expr.range_start)
+
+        case ExprKind::struct_literal:
+            let mut field_ops: List<(SymbolId, MirOperand)> = []
+            for (fid, fexpr) in expr.struct_fields:
+                field_ops = field_ops + [(fid, lower_expr(self, fexpr))]
+            let local = new_local(self, expr.ty, self.temp_symbol, false)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: local
+                local_ty: expr.ty
+                local_mutable: false
+            )
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::assign
+                assign_local: local
+                assign_rvalue: MirRvalue:
+                    kind: RvalueKind::struct_lit
+                    struct_def: expr.struct_symbol
+                    struct_fields: field_ops
+            )
+            give MirOperand: kind: OperandKind::local, local_id: local
+
+        case ExprKind::field_access:
+            let inner_val = lower_expr(self, expr.field_access_expr)
+            let inner_local = new_local(self, expr.field_access_expr.ty, self.temp_symbol, false)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: inner_local
+                local_ty: expr.field_access_expr.ty
+                local_mutable: false
+            )
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::assign
+                assign_local: inner_local
+                assign_rvalue: MirRvalue: kind: RvalueKind::use_operand, operand: inner_val
+            )
+            let result_local = new_local(self, expr.ty, self.temp_symbol, false)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: result_local
+                local_ty: expr.ty
+                local_mutable: false
+            )
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::assign
+                assign_local: result_local
+                assign_rvalue: MirRvalue:
+                    kind: RvalueKind::field_access
+                    field_access_local: inner_local
+                    field_access_field: expr.field_symbol
+            )
+            give MirOperand: kind: OperandKind::local, local_id: result_local
+
+        case ExprKind::enum_constructor:
+            let variant_idx = enum_variant_index(self.hir, expr.enum_symbol, expr.enum_variant)
+            give MirOperand: kind: OperandKind::const_val, const_val: MirConst: kind: MirConstKind::i64_val, int_val: variant_idx
+
+        case ExprKind::index:
+            let list_val = lower_expr(self, expr.index_list)
+            let list_local = new_local(self, expr.index_list.ty, self.temp_symbol, false)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: list_local
+                local_ty: expr.index_list.ty
+                local_mutable: false
+            )
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::assign
+                assign_local: list_local
+                assign_rvalue: MirRvalue: kind: RvalueKind::use_operand, operand: list_val
+            )
+            let idx = lower_expr(self, expr.index_expr)
+            let result_local = new_local(self, expr.ty, self.temp_symbol, false)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: result_local
+                local_ty: expr.ty
+                local_mutable: false
+            )
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::assign
+                assign_local: result_local
+                assign_rvalue: MirRvalue:
+                    kind: RvalueKind::index
+                    index_list_local: list_local
+                    index_value: idx
+            )
+            give MirOperand: kind: OperandKind::local, local_id: result_local
+
+        case ExprKind::length:
+            let inner_val = lower_expr(self, expr.length_expr)
+            let inner_local = new_local(self, expr.length_expr.ty, self.temp_symbol, false)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: inner_local
+                local_ty: expr.length_expr.ty
+                local_mutable: false
+            )
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::assign
+                assign_local: inner_local
+                assign_rvalue: MirRvalue: kind: RvalueKind::use_operand, operand: inner_val
+            )
+            let result_local = new_local(self, MirType: kind: TypeKind::i64, self.temp_symbol, false)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: result_local
+                local_ty: MirType: kind: TypeKind::i64
+                local_mutable: false
+            )
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::assign
+                assign_local: result_local
+                assign_rvalue: MirRvalue:
+                    kind: RvalueKind::length
+                    length_list_local: inner_local
+            )
+            give MirOperand: kind: OperandKind::local, local_id: result_local
+
+        case ExprKind::list_literal:
+            // Lower each element left-to-right, collecting operands.
+            let mut element_ops: List<MirOperand> = []
+            for elem in expr.list_items:
+                element_ops = element_ops + [lower_expr(self, elem)]
+            let list_ty = MirType: kind: TypeKind::list, list_element: MirType: kind: TypeKind::i64
+            let list_local = new_local(self, list_ty, self.temp_symbol, false)
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::local_decl
+                local: list_local
+                local_ty: list_ty
+                local_mutable: false
+            )
+            emit(self, MirStmtKind:
+                kind: MirStmtKindEnum::assign
+                assign_local: list_local
+                assign_rvalue: MirRvalue:
+                    kind: RvalueKind::list_literal
+                    list_elements: element_ops
+            )
+            give MirOperand: kind: OperandKind::local, local_id: list_local
+
+// ─── Call lowering ───
+
+fn lower_call(self: MirLower, expr: HirExpr) -> MirOperand:
+    // The Call is a terminator: it ends the current block and starts a
+    // new continuation block. Returns the destination local as a Local
+    // operand (valid in the continuation block).
+    let func_sym = expr.func_name
+    let sig = self.sigs.get(func_sym)
+
+    let mut arg_ops: List<MirOperand> = []
+    for arg in expr.call_args:
+        arg_ops = arg_ops + [lower_expr(self, arg)]
+
+    let ret_ty = if sig.found:
+        sig.return_type
+    else:
+        expr.ty
+
+    let dest = new_local(self, ret_ty, self.temp_symbol, false)
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::local_decl
+        local: dest
+        local_ty: ret_ty
+        local_mutable: false
+    )
+
+    let next = create_block(self, "call_cont_" + self.blocks.length.to_string())
+    finish_call(self, expr.func_def_id, arg_ops, dest, next)
+    switch_to(self, next)
+
+    give MirOperand: kind: OperandKind::local, local_id: dest
+
+fn lower_external_call(self: MirLower, expr: HirExpr) -> MirOperand:
+    // External calls are value-producing (not terminators).
+    // Arguments are lowered left-to-right.
+    let mut arg_ops: List<MirOperand> = []
+    for arg in expr.call_args:
+        arg_ops = arg_ops + [lower_expr(self, arg)]
+
+    let ret_ty = expr.ty
+
+    let dest = new_local(self, ret_ty, self.temp_symbol, false)
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::local_decl
+        local: dest
+        local_ty: ret_ty
+        local_mutable: false
+    )
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::assign
+        assign_local: dest
+        assign_rvalue: MirRvalue:
+            kind: RvalueKind::external_call
+            ext_kind: expr.ext_kind
+            ext_symbol: expr.ext_symbol
+            ext_args: arg_ops
+            ext_ret_ty: ret_ty
+    )
+    give MirOperand: kind: OperandKind::local, local_id: dest
+
+// ─── Control-flow lowering ───
+
+fn lower_if(self: MirLower, expr: HirExpr):
+    // if/elif/else expression into a CFG.
+    let then_bb = create_block(self, "if_then")
+    let end_bb = create_block(self, "if_end")
+
+    let mut elif_conds: List<BlockId> = []
+    let mut elif_bodies: List<BlockId> = []
+    for i in 0..expr.elif_branches.length:
+        elif_conds = elif_conds + [create_block(self, "elif" + i.to_string() + "_cond")]
+        elif_bodies = elif_bodies + [create_block(self, "elif" + i.to_string() + "_body")]
+    let else_bb = create_block(self, "if_else")
+
+    let cond_val = lower_expr(self, expr.if_cond)
+    let next_cond = elif_conds.length > 0
+        ? elif_conds[0]
+        : else_bb
+    finish_switch_int(self, cond_val, [(1, then_bb)], else_bb)
+
+    // then body
+    switch_to(self, then_bb)
+    for s in expr.if_then:
+        lower_stmt(self, s)
+    ensure_terminated(self, end_bb)
+
+    // elif chain
+    for i in 0..expr.elif_branches.length:
+        let cond_expr = expr.elif_branches[i].condition
+        let body = expr.elif_branches[i].body
+        switch_to(self, elif_conds[i])
+
+        let elif_cond_val = lower_expr(self, cond_expr)
+        let elif_else = i + 1 < elif_conds.length
+            ? elif_conds[i + 1]
+            : else_bb
+        finish_switch_int(self, elif_cond_val, [(1, elif_bodies[i])], elif_else)
+
+        switch_to(self, elif_bodies[i])
+        for s in body:
+            lower_stmt(self, s)
+        ensure_terminated(self, end_bb)
+
+    // else body
+    switch_to(self, else_bb)
+    if expr.has_else:
+        for s in expr.if_else:
+            lower_stmt(self, s)
+    ensure_terminated(self, end_bb)
+
+    switch_to(self, end_bb)
+
+fn lower_for(self: MirLower, expr: HirExpr):
+    // for var in start..end  or  for var in list
+    let iter_kind = expr.for_iter.kind
+    if iter_kind == ExprKind::range_expr:
+        lower_for_range(self, expr)
+    else:
+        lower_for_list(self, expr)
+
+fn lower_for_range(self: MirLower, expr: HirExpr):
+    let (start_expr, end_expr, is_inclusive) = expr.for_iter.range_components()
+
+    // Lower range bounds into locals.
+    let start_val = lower_expr(self, start_expr)
+    let start_local = new_local(self, MirType: kind: TypeKind::i64, self.temp_symbol, false)
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::local_decl
+        local: start_local
+        local_ty: MirType: kind: TypeKind::i64
+        local_mutable: false
+    )
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::assign
+        assign_local: start_local
+        assign_rvalue: MirRvalue: kind: RvalueKind::use_operand, operand: start_val
+    )
+
+    let end_val = lower_expr(self, end_expr)
+    let end_local = new_local(self, MirType: kind: TypeKind::i64, self.temp_symbol, false)
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::local_decl
+        local: end_local
+        local_ty: MirType: kind: TypeKind::i64
+        local_mutable: false
+    )
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::assign
+        assign_local: end_local
+        assign_rvalue: MirRvalue: kind: RvalueKind::use_operand, operand: end_val
+    )
+
+    // Loop variable (mutable), initialized at start_local.
+    let loop_var = new_local(self, MirType: kind: TypeKind::i64, expr.for_var, true)
+
+    let cond_bb = create_block(self, "for_cond")
+    let body_bb = create_block(self, "for_body")
+    let exit_bb = create_block(self, "for_exit")
+
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::local_decl
+        local: loop_var
+        local_ty: MirType: kind: TypeKind::i64
+        local_mutable: true
+    )
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::assign
+        assign_local: loop_var
+        assign_rvalue: MirRvalue: kind: RvalueKind::use_operand, operand: MirOperand: kind: OperandKind::local, local_id: start_local
+    )
+    finish_goto(self, cond_bb)
+
+    // cond_bb: check loop_var < end_local (or <= if inclusive)
+    switch_to(self, cond_bb)
+    let cmp_op = if is_inclusive: MirBinOp::le else: MirBinOp::lt
+    let cond_local = new_local(self, MirType: kind: TypeKind::bool, self.temp_symbol, false)
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::local_decl
+        local: cond_local
+        local_ty: MirType: kind: TypeKind::bool
+        local_mutable: false
+    )
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::assign
+        assign_local: cond_local
+        assign_rvalue: MirRvalue:
+            kind: RvalueKind::binary
+            bin_op: cmp_op
+            bin_lhs: MirOperand: kind: OperandKind::local, local_id: loop_var
+            bin_rhs: MirOperand: kind: OperandKind::local, local_id: end_local
+    )
+    finish_switch_int(self, MirOperand: kind: OperandKind::local, local_id: cond_local, [], else_bb)
+
+    // body_bb: bind var, lower body, increment, goto cond
+    switch_to(self, body_bb)
+    self.var_map.insert(expr.for_var, loop_var)
+    for s in expr.for_body:
+        lower_stmt(self, s)
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::assign
+        assign_local: loop_var
+        assign_rvalue: MirRvalue:
+            kind: RvalueKind::binary
+            bin_op: MirBinOp::add
+            bin_lhs: MirOperand: kind: OperandKind::local, local_id: loop_var
+            bin_rhs: MirOperand: kind: OperandKind::const_val, const_val: MirConst: kind: MirConstKind::i64_val, int_val: 1
+    )
+    ensure_terminated(self, cond_bb)
+
+    switch_to(self, exit_bb)
+
+fn lower_for_list(self: MirLower, expr: HirExpr):
+    // Evaluate the iterable list expression exactly once, into a local.
+    let list_val = lower_expr(self, expr.for_iter)
+    let list_local = new_local(self, expr.for_iter.ty, self.temp_symbol, false)
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::local_decl
+        local: list_local
+        local_ty: expr.for_iter.ty
+        local_mutable: false
+    )
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::assign
+        assign_local: list_local
+        assign_rvalue: MirRvalue: kind: RvalueKind::use_operand, operand: list_val
+    )
+
+    // Mutable index, initialized to zero.
+    let index_local = new_local(self, MirType: kind: TypeKind::i64, self.temp_symbol, true)
+
+    let cond_bb = create_block(self, "for_cond")
+    let body_bb = create_block(self, "for_body")
+    let exit_bb = create_block(self, "for_exit")
+
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::local_decl
+        local: index_local
+        local_ty: MirType: kind: TypeKind::i64
+        local_mutable: true
+    )
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::assign
+        assign_local: index_local
+        assign_rvalue: MirRvalue: kind: RvalueKind::use_operand, operand: MirOperand: kind: OperandKind::const_val, const_val: MirConst: kind: MirConstKind::i64_val, int_val: 0
+    )
+    finish_goto(self, cond_bb)
+
+    // cond_bb: check index < list_len(list_local)
+    switch_to(self, cond_bb)
+    let len_local = new_local(self, MirType: kind: TypeKind::i64, self.temp_symbol, false)
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::local_decl
+        local: len_local
+        local_ty: MirType: kind: TypeKind::i64
+        local_mutable: false
+    )
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::assign
+        assign_local: len_local
+        assign_rvalue: MirRvalue:
+            kind: RvalueKind::length
+            length_list_local: list_local
+    )
+    let cond_local = new_local(self, MirType: kind: TypeKind::bool, self.temp_symbol, false)
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::local_decl
+        local: cond_local
+        local_ty: MirType: kind: TypeKind::bool
+        local_mutable: false
+    )
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::assign
+        assign_local: cond_local
+        assign_rvalue: MirRvalue:
+            kind: RvalueKind::binary
+            bin_op: MirBinOp::lt
+            bin_lhs: MirOperand: kind: OperandKind::local, local_id: index_local
+            bin_rhs: MirOperand: kind: OperandKind::local, local_id: len_local
+    )
+    finish_switch_int(self, MirOperand: kind: OperandKind::local, local_id: cond_local, [], else_bb)
+
+    // body_bb: bind var = list_get(list_local, index), lower body, increment
+    switch_to(self, body_bb)
+    let loop_var = new_local(self, MirType: kind: TypeKind::i64, expr.for_var, true)
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::local_decl
+        local: loop_var
+        local_ty: MirType: kind: TypeKind::i64
+        local_mutable: true
+    )
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::assign
+        assign_local: loop_var
+        assign_rvalue: MirRvalue:
+            kind: RvalueKind::index
+            index_list_local: list_local
+            index_value: MirOperand: kind: OperandKind::local, local_id: index_local
+    )
+    self.var_map.insert(expr.for_var, loop_var)
+    for s in expr.for_body:
+        lower_stmt(self, s)
+    emit(self, MirStmtKind:
+        kind: MirStmtKindEnum::assign
+        assign_local: index_local
+        assign_rvalue: MirRvalue:
+            kind: RvalueKind::binary
+            bin_op: MirBinOp::add
+            bin_lhs: MirOperand: kind: OperandKind::local, local_id: index_local
+            bin_rhs: MirOperand: kind: OperandKind::const_val, const_val: MirConst: kind: MirConstKind::i64_val, int_val: 1
+    )
+    ensure_terminated(self, cond_bb)
+
+    switch_to(self, exit_bb)
+
+fn lower_while(self: MirLower, expr: HirExpr):
+    let cond_bb = create_block(self, "while_cond")
+    let body_bb = create_block(self, "while_body")
+    let exit_bb = create_block(self, "while_exit")
+
+    finish_goto(self, cond_bb)
+
+    switch_to(self, cond_bb)
+    let cond_val = lower_expr(self, expr.while_cond)
+    finish_switch_int(self, cond_val, [(1, body_bb)], exit_bb)
+
+    switch_to(self, body_bb)
+    for s in expr.while_body:
+        lower_stmt(self, s)
+    ensure_terminated(self, cond_bb)
+
+    switch_to(self, exit_bb)
+
+// ─── Helper: variable lookup ───
+
+fn var_lookup(self: MirLower, sym: SymbolId) -> LocalId:
+    if self.var_map.has(sym):
+        give self.var_map.get(sym)
+    let name = interner_lookup(self.hir.symbols, sym)
+    raise(CompilerError::codegen("undefined variable: " + name))
+
+// ─── Helper: enum variant index ───
+// Look up the enum definition by SymbolId and find the variant index.
+
+fn enum_variant_index(hir: HirProgram, enum_sym: SymbolId, variant_sym: SymbolId) -> number:
+    for edef in hir.enums:
+        if edef.name == enum_sym:
+            for (i, v) in edef.variants.enumerate():
+                if v == variant_sym:
+                    give i
+    // Not found — this should have been caught during HIR lowering.
+    give 0

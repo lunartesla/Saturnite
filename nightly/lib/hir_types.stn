@@ -1,0 +1,99 @@
+module hir_types
+
+// =============================================================================
+// HIR Types — compiler-internal type representation
+// =============================================================================
+//
+// One-to-one Saturnite port of crates/stnx/src/hir/types.rs
+//
+// Native type aliases (number -> i64, text -> str) are resolved at the
+// AST->HIR boundary, so the HIR never sees them. User-defined types
+// are referenced by SymbolId.
+
+// ─── SymbolId (inline for self-containment) ───
+struct SymbolId:
+    id: number
+
+// ─── TypeKind ───
+enum TypeKind:
+    i64            // 64-bit signed integer
+    f64            // 64-bit float
+    bool           // Boolean
+    str            // UTF-8 string
+    unit           // No-value type
+    struct_type    // Named struct (SymbolId references the def)
+    enum_type      // Named enum (SymbolId references the def)
+    list           // Homogeneous list (element type below)
+    generic        // Free type variable (SymbolId = param name)
+    apply          // Applied generic (Pair<i64, bool>)
+
+// ─── HirType ───
+struct HirType:
+    kind: TypeKind
+    // struct_type / enum_type: references the SymbolId of the definition
+    type_symbol: SymbolId
+    type_symbol_set: bool
+    // list: element type (stored as a HirType index into an arena)
+    list_element_idx: number
+    list_element_set: bool
+    // generic: the SymbolId name of the type parameter (e.g. "T")
+    generic_param: SymbolId
+    generic_param_set: bool
+    // apply: base SymbolId + list of argument type indices
+    apply_base: SymbolId
+    apply_base_set: bool
+    apply_args: List<HirType>
+
+// ─── Type helpers ───
+
+fn unit() -> HirType:
+    give HirType: kind: TypeKind::unit
+
+fn is_unit(ty: HirType) -> bool:
+    give ty.kind == TypeKind::unit
+
+// Whether this type contains a free generic parameter.
+fn contains_generic(ty: HirType) -> bool:
+    if ty.kind == TypeKind::generic:
+        give true
+    elif ty.kind == TypeKind::apply:
+        for arg in ty.apply_args:
+            if contains_generic(arg):
+                give true
+        give false
+    give false
+
+// Substitute each Generic(s) according to subst. Used to compute the
+// concrete return type of a generic call given its turbofish type arguments.
+// In the Rust version, this takes a HashMap<SymbolId, HirType>; in Saturnite
+// we use a List<SubstitutionEntry> since there's no HashMap type.
+fn substitute(ty: HirType, subst: List<SubstitutionEntry>) -> HirType:
+    if ty.kind == TypeKind::generic:
+        for entry in subst:
+            if entry.from == ty.generic_param:
+                give entry.to
+        give ty   // fallback: keep as-is
+    elif ty.kind == TypeKind::apply:
+        let result = ty
+        result.apply_args = []
+        for arg in ty.apply_args:
+            let sub = substitute(arg, subst)
+            result.apply_args = result.apply_args + [sub]
+        give result
+    give ty
+
+struct SubstitutionEntry:
+    from: SymbolId   // the generic param name
+    to: HirType      // the concrete type to substitute
+
+// ─── ABI-safe type check ───
+// Only I64, F64, Bool, and Unit are ABI-safe for external calls.
+fn is_abi_safe(ty: HirType) -> bool:
+    if ty.kind == TypeKind::i64:
+        give true
+    elif ty.kind == TypeKind::f64:
+        give true
+    elif ty.kind == TypeKind::bool:
+        give true
+    else:
+        give false

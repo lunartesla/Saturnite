@@ -1,0 +1,196 @@
+module mir_verify
+
+// =============================================================================
+// MIR CFG Verifier — validates structural invariants before LLVM codegen
+// =============================================================================
+//
+// One-to-one Saturnite port of crates/stnx/src/mir/verify.rs
+//
+// The verifier returns structured errors rather than panicking so that
+// diagnostic infrastructure can present them to the user.
+
+use mir::{
+    BlockId, LocalId, MirBasicBlock, MirFunction, MirOperand, MirProgram,
+    MirStmt, MirStmtKind, MirTerminator, RvalueKind, OperandKind,
+}
+use error::{CompilerError}
+
+// ─── MirVerifyError ───
+// A single verification failure.
+
+struct MirVerifyError:
+    message: text
+    location_func: text
+    location_block: text
+    location_set: bool    // whether location info was set
+
+fn verify_error_location_none(message: text) -> MirVerifyError:
+    give MirVerifyError:
+        message: message
+        location_func: ""
+        location_block: ""
+        location_set: false
+
+fn verify_error_location(message: text, func: text, block: text) -> MirVerifyError:
+    give MirVerifyError:
+        message: message
+        location_func: func
+        location_block: block
+        location_set: true
+
+fn verify_error_to_compiler_error(e: MirVerifyError) -> CompilerError:
+    give CompilerError:
+        kind: CompilerErrorKind::codegen
+        codegen_msg: to_string(e)
+
+fn to_string(e: MirVerifyError) -> text:
+    if e.location_set:
+        give e.message + " (in fn `" + e.location_func + "`, block `" + e.location_block + "`)"
+    give e.message
+
+// ─── VerifyResult ───
+// Ok(()) or a list of errors.
+struct VerifyResult:
+    ok: bool
+    errors: List<MirVerifyError>
+
+fn verify_ok() -> VerifyResult:
+    give VerifyResult: ok: true, errors: []
+
+fn verify_err(errors: List<MirVerifyError>) -> VerifyResult:
+    give VerifyResult: ok: false, errors: errors
+
+// ─── Entry point: verify entire program ───
+
+fn verify(program: MirProgram) -> VerifyResult:
+    let mut errors: List<MirVerifyError> = []
+    for func in program.functions:
+        verify_function(func, program, errors)
+    if errors.length == 0:
+        give verify_ok()
+    give verify_err(errors)
+
+// ─── verify_function ───
+// Check 1: every block has a real terminator (not Unreachable placeholder)
+// Check 2: all terminator target blocks exist
+// Check 3: LocalId references in operands are valid
+// Check 4: parameters exist as locals
+// Check 5: start_block is valid
+
+fn verify_function(func: MirFunction, prog: MirProgram, errors: List<MirVerifyError>):
+    let name = prog.symbols.lookup(func.name)
+    let valid_blocks: List<BlockId> = func.blocks.map(|b| b.id)
+    let valid_locals: List<LocalId> = func.locals.map(|l| l.id)
+
+    // Check 1: every block has a real terminator
+    for block in func.blocks:
+        if block.terminator.kind == TermKind::unreachable:
+            errors = errors + [verify_error_location(
+                "block `" + block.name + "` has no terminator (Unreachable placeholder remains)",
+                name, block.name
+            )]
+
+    // Check 2: all terminator target blocks exist
+    for block in func.blocks:
+        check_terminator_blocks(block, valid_blocks, name, errors)
+
+    // Check 3: LocalId references in operands are valid
+    for block in func.blocks:
+        check_local_refs(block, valid_locals, name, block.name, errors)
+
+    // Check 4: parameters exist as locals
+    for (i, param_lid) in func.param_locals.enumerate():
+        if not valid_locals.contains(param_lid):
+            errors = errors + [verify_error_location(
+                "parameter " + to_string_i32(i) + " local " + to_string_lid(param_lid) + " not found in locals",
+                name, "entry"
+            )]
+
+    // Check 5: start_block is valid
+    if not valid_blocks.contains(func.start_block):
+        errors = errors + [verify_error_location(
+            "start_block " + to_string_bid(func.start_block) + " does not exist in function body",
+            name, "entry"
+        )]
+
+// ─── check_terminator_blocks ───
+// Check that all block references in a terminator point to valid blocks.
+
+fn check_terminator_blocks(
+    block: MirBasicBlock,
+    valid: List<BlockId>,
+    func_name: text,
+    errors: List<MirVerifyError>
+):
+    let loc = |msg: text| verify_error_location(msg, func_name, block.name)
+
+    match block.terminator.kind:
+        case TermKind::goto:
+            if not valid.contains(block.terminator.goto_target):
+                errors = errors + [loc("Goto references non-existent block " + to_string_bid(block.terminator.goto_target))]
+        case TermKind::switch_int:
+            if not valid.contains(block.terminator.switch_else):
+                errors = errors + [loc("SwitchInt else_target references non-existent block " + to_string_bid(block.terminator.switch_else))]
+            for (val, target_id) in block.terminator.switch_branches:
+                if not valid.contains(target_id):
+                    errors = errors + [loc("SwitchInt branch references non-existent block " + to_string_bid(target_id))]
+        case TermKind::call:
+            if not valid.contains(block.terminator.call_next):
+                errors = errors + [loc("Call next references non-existent block " + to_string_bid(block.terminator.call_next))]
+        case TermKind::return_val, TermKind::unreachable:
+            // no block references to check
+            pass
+
+// ─── Helper: collect operands from a statement ───
+
+fn stmt_operands(stmt: MirStmt) -> List<MirOperand>:
+    match stmt.kind:
+        case StmtKind::local_decl: give []
+        case StmtKind::assign: give rvalue_operands(stmt.assign_rvalue)
+
+// ─── Helper: collect operands from an rvalue ───
+
+fn rvalue_operands(rvalue: MirRvalue) -> List<MirOperand>:
+    match rvalue.kind:
+        case RvalueKind::use_operand:       give [rvalue.operand]
+        case RvalueKind::binary:            give [rvalue.bin_lhs, rvalue.bin_rhs]
+        case RvalueKind::unary:            give [rvalue.un_operand]
+        case RvalueKind::field_access:     give [MirOperand: kind: OperandKind::local, local_id: rvalue.field_access_local]
+        case RvalueKind::struct_lit:       give rvalue.struct_fields.map(|(f, v)| v)
+        case RvalueKind::enum_ctor:        give []
+        case RvalueKind::list_literal:     give rvalue.list_elements
+        case RvalueKind::index:            give [MirOperand: kind: OperandKind::local, local_id: rvalue.index_list_local, rvalue.index_value]
+        case RvalueKind::length:            give [MirOperand: kind: OperandKind::local, local_id: rvalue.length_list_local]
+        case RvalueKind::str_lit:          give []
+        case RvalueKind::external_call:    give rvalue.ext_args
+
+// ─── check_local_refs ───
+// Verify that all LocalId references in operands are valid.
+
+fn check_local_refs(
+    block: MirBasicBlock,
+    valid: List<LocalId>,
+    func_name: text,
+    block_name: text,
+    errors: List<MirVerifyError>
+):
+    for stmt in block.stmts:
+        for op in stmt_operands(stmt):
+            if op.kind == OperandKind::local:
+                if not valid.contains(op.local_id):
+                    errors = errors + [verify_error_location(
+                        "operand references undefined local " + to_string_lid(op.local_id),
+                        func_name, block_name
+                    )]
+
+// ─── Helper: stringify IDs for error messages ───
+
+fn to_string_i32(n: number) -> text:
+    // Saturnite uses 'number' as i64; this converts for display
+    give n.to_string()
+
+fn to_string_lid(id: LocalId) -> text:
+    give "LocalId(" + id.id.to_string() + ")"
+
+fn to_string_bid(id: BlockId) -> text:
+    give "BlockId(" + id.id.to_string() + ")"

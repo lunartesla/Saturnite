@@ -1,0 +1,970 @@
+module codegen
+
+// =============================================================================
+// Saturnite Compiler — Codegen Module
+// =============================================================================
+//
+// Backend seams for the Saturnite compiler pipeline:
+//
+//   Source -> Lexer -> Parser -> AST -> HIR -> MIR -> [mir::codegen] -> LLVM IR
+//        -> [codegen::emitter] -> Object File -> [codegen::linker] -> Executable
+//
+// One-to-one Saturnite port of crates/stnx/src/codegen/ (mod.rs, emitter.rs,
+// linker.rs).
+//
+// Saturnite has no sub-modules within a single file, so this module
+// consolidates the three Rust files into one with clear section separators:
+//
+//   Section 1 — Module root (mod.rs equivalent): re-exports + free functions
+//   Section 2 — ObjectEmitter   (emitter.rs equivalent)
+//   Section 3 — Linker          (linker.rs equivalent)
+//
+// Saturnite-specific design notes:
+//   * No lifetimes: structs store values directly (no &'ctx, no &'cfg).
+//   * No generics: Result<T, E> is replaced by result structs with `ok`
+//     + `error` fields (see error.stn for CompilerResult, and LinkResult
+//     defined below).
+//   * No Path/PathBuf: paths are `text` strings.
+//   * No Vec<T>: use `List<T>`.
+//   * LLVM objects (inkwell::module::Module, TargetMachine) are opaque
+//     handles bridged through external native functions.
+//   * std::process::Command / which::which are bridged to native functions.
+//   * env!("OUT_DIR") is replaced by a native bridge that returns the
+//     runtime archive path at runtime.
+
+use target::{
+    TargetConfig, TargetTriple, Os, Env, Arch, Profile, OptLevel,
+    TargetMachine, TargetError, OutputKind
+}
+use mir::{ExternalLibrary, MirExternalKind}
+use error::{
+    CompilerError, CompilerErrorKind, LinkError, CompilerResult,
+    codegen as make_codegen_err,
+    link_error as wrap_link_err,
+    target_error as make_target_err,
+    compiler_error_codegen,
+    link_error_linker_not_found,
+    link_error_linking_failed
+}
+
+// ─── Type aliases re-exported for callers ───
+// In the Rust version, `pub use crate::target::TargetConfig;` re-exports
+// TargetConfig so callers can refer to it as codegen::TargetConfig.
+// Saturnite doesn't have a re-export mechanism, but TargetConfig is already
+// imported above and available to importing modules.
+
+// =============================================================================
+// ─── Native bridge declarations ───
+// =============================================================================
+// These external native functions form the FFI boundary between the Saturnite
+// compiler logic and the LLVM / system libraries that do the actual work.
+// Each would be implemented in a companion Rust/C shared library (e.g.
+// libsaturnite_codegen.so / .dylib / .dll).
+
+// ─── LLVM module operations ───
+
+// Opaque handle to an inkwell::module::Module<'ctx>.
+struct ModuleHandle:
+    handle: text   // stringified pointer address
+
+// Set the target triple on an LLVM module (module.set_triple in Rust).
+external native "libsaturnite_codegen" "sat_module_set_triple"(
+    module: ModuleHandle,
+    triple: text
+) -> bool
+
+// Write the module to an object file via the target machine
+// (target_machine.write_to_file in Rust with FileType::Object).
+external native "libsaturnite_codegen" "sat_module_emit_object"(
+    module: ModuleHandle,
+    machine: TargetMachine,
+    path: text
+) -> bool
+
+// Print the module's LLVM IR to a string (module.print_to_string in Rust).
+external native "libsaturnite_codegen" "sat_module_print_to_string"(
+    module: ModuleHandle
+) -> text
+
+// Write the module's LLVM IR to a file (module.print_to_file in Rust).
+external native "libsaturnite_codegen" "sat_module_print_to_file"(
+    module: ModuleHandle,
+    path: text
+) -> bool
+
+// ─── System operations ───
+
+// Result of running a subprocess: captures success status + output streams.
+struct ProcessResult:
+    success: bool
+    stdout: text
+    stderr: text
+
+// Run a command with arguments and capture its output.
+// Mirrors Rust's std::process::Command::status + output capture.
+external native "libsaturnite_runtime" "sat_process_run"(
+    command: text,
+    args: List<text>
+) -> ProcessResult
+
+// Check whether a path exists as a file.
+// Mirrors Rust's std::path::Path::is_file().
+external native "libsaturnite_runtime" "sat_file_exists"(path: text) -> bool
+
+// Read directory entries (non-recursive).
+// Mirrors Rust's std::fs::read_dir returning filenames.
+external native "libsaturnite_runtime" "sat_read_dir"(path: text) -> List<text>
+
+// Read an environment variable. Returns empty string if unset.
+external native "libsaturnite_runtime" "sat_env_var"(name: text) -> text
+
+// Resolve a program on PATH (mirrors the `which` crate).
+// Returns the resolved path, or empty string if not found.
+external native "libsaturnite_runtime" "sat_which"(name: text) -> text
+
+// =============================================================================
+// ─── Runtime archive path ───
+// =============================================================================
+// In the Rust version, runtime_object_path() uses env!("OUT_DIR") to locate
+// libsaturnite_runtime.a at compile time. In Saturnite, we bridge to a native
+// function that returns the path at runtime.
+
+fn runtime_object_path() -> text:
+    external native "libsaturnite_runtime" "sat_runtime_object_path"() -> text
+    give sat_runtime_object_path()
+
+// =============================================================================
+// ─── Result types for linking operations ───
+// =============================================================================
+
+// LinkResult mirrors Rust's LinkResult<T> = Result<T, LinkError>.
+// For void operations, `value` is unused (empty text on success).
+struct LinkResult:
+    ok: bool
+    value: text          // unused for void results
+    error: LinkError
+    error_set: bool
+
+fn link_ok() -> LinkResult:
+    give LinkResult:
+        ok: true
+        value: ""
+        error: LinkError: message: "", details: "", details_set: false
+        error_set: false
+
+fn link_err(e: LinkError) -> LinkResult:
+    give LinkResult:
+        ok: false
+        value: ""
+        error: e
+        error_set: true
+
+// PathResolveResult mirrors Rust's Result<PathBuf, String>.
+// ok=true means `path` is the resolved artifact; ok=false means `searched`
+// lists all candidate paths that were checked.
+struct PathResolveResult:
+    ok: bool
+    path: text
+    searched: text
+
+// =============================================================================
+// SECTION 1: MODULE ROOT (mod.rs equivalent)
+// =============================================================================
+
+// ─── check_linker ──────────────────────────────────────────────────────────
+// Delegates to Linker::check_linker_available logic.
+// Returns Ok(()) if the platform-appropriate linker binary is found and
+// responds to --version (or /? on MSVC).
+// Returns Err(CompilerError::Link(...)) if the linker is not found or
+// exits with a non-success status.
+// Called from main.rs `info` command to report linker availability.
+
+fn check_linker(target_config: TargetConfig) -> CompilerResult:
+    let result = check_linker_available(target_config)
+    if result.ok:
+        give CompilerResult: ok: true, error: CompilerError: kind: CompilerErrorKind::link, link_error: LinkError: message: "", details: "", details_set: false, error_set: false
+    else:
+        // Both linker_not_found and linking_failed produce a CompilerError::Link.
+        // The distinction is in the LinkError payload (details_set flag).
+        give CompilerResult:
+            ok: false
+            error: CompilerError:
+                kind: CompilerErrorKind::link
+                link_error: result.error
+                link_error_set: true
+            error_set: true
+
+// ─── host_triple ───────────────────────────────────────────────────────────
+// Calls TargetConfig::host() to build a config for the host platform.
+// Returns the triple string via config.triple_str().
+// Propagates TargetError as CompilerError::Target.
+// Called from main.rs for --print-target, cross-compilation guards,
+// and diagnostics.
+
+fn host_triple() -> text:
+    // In the Rust version, TargetConfig::host() detects the host platform
+    // via TargetMachine::get_default_triple() and initializes the native
+    // LLVM target. In Saturnite, the target module provides host detection
+    // via a native bridge.
+    //
+    // Here we delegate to target::host_triple() + target::new() to construct
+    // a host TargetConfig, then return its triple string.
+    let triple = target::host_triple()
+    let config = target::new(triple)
+    give config.triple_str()
+
+// =============================================================================
+// SECTION 2: OBJECT EMITTER (emitter.rs equivalent)
+// =============================================================================
+//
+// Translates an in-memory LLVM Module into an on-disk .o object file
+// (or emits IR text). This is a thin wrapper: it stores an LLVM Module
+// handle and a TargetMachine, and exposes write_to_file with
+// FileType::Object.
+
+// ─── Struct Definition ─────────────────────────────────────────────────────
+
+// ObjectEmitter owns the LLVM IR module and the target machine that performs
+// code generation. In the Rust version, the lifetime 'ctx is tied to the
+// LLVMContext; in Saturnite, the module is an opaque handle and the caller
+// must keep the owning context alive externally.
+struct ObjectEmitter:
+    module: ModuleHandle          // the LLVM IR module to emit from
+    target_machine: TargetMachine  // LLVM target machine (owns the codegen)
+
+// ─── Methods ───────────────────────────────────────────────────────────────
+
+// ObjectEmitter::new — create an emitter from a module and target config.
+//
+// - Calls target_config.create_target_machine() to obtain a TargetMachine.
+//   This initializes the native LLVM target and creates a machine with the
+//   config's triple, CPU, features, opt level, RelocMode::PIC, and
+//   CodeModel::Default.
+// - Sets the module's triple to match the target config's triple string.
+//   This is critical: inkwell modules are created without a triple by
+//   default; setting it tells LLVM which target to generate code for.
+// - Wraps any TargetError as CompilerError::Target.
+// - Returns Ok(Self { module, target_machine }) on success.
+fn object_emitter_new(
+    module: ModuleHandle,
+    target_config: TargetConfig,
+    profile: Profile
+) -> ObjectEmitter:
+    // Create the target machine from the config.
+    // In the Rust version, this calls target_config.create_target_machine()
+    // which initializes the native LLVM target. In Saturnite, this is bridged.
+    let machine = target::create_target_machine(target_config, profile)
+
+    // Set the module's triple to match the target config.
+    // Critical: tells LLVM which target to generate code for.
+    let triple_str = target_config.triple_str()
+    sat_module_set_triple(module, triple_str)
+
+    give ObjectEmitter:
+        module: module
+        target_machine: machine
+
+// ObjectEmitter::emit_object — the core "LLVM IR -> object file" step.
+//
+// - Calls target_machine.write_to_file(module, FileType::Object, path).
+// - The TargetMachine performs instruction selection, register allocation,
+//   and emits machine code packaged as a relocatable object file.
+// - FileType::Object means a platform-native object file (.o / .obj).
+// - On failure, raises with "failed to write object file: {e}".
+// - The output path must be writable; parent directories should be created
+//   by the caller (see compile_from_mir_ext in mir/codegen.rs).
+fn object_emitter_emit_object(self: ObjectEmitter, path: text) -> bool:
+    let ok = sat_module_emit_object(self.module, self.target_machine, path)
+    if not ok:
+        raise "failed to write object file: LLVM write_to_file returned an error"
+    give ok
+
+// ObjectEmitter::emit_ir — print the module's LLVM IR to a string.
+//
+// - Calls module.print_to_string().to_string().
+// - Returns the full LLVM IR text (human-readable bitcode assembly).
+// - Used for debugging and the OutputKind::Ir path (though
+//   compile_from_mir_ext uses module.print_to_file directly for that case).
+fn object_emitter_emit_ir(self: ObjectEmitter) -> text:
+    give sat_module_print_to_string(self.module)
+
+// ObjectEmitter::emit_ir_to_file — write LLVM IR text to a file.
+//
+// - Calls module.print_to_file(path).
+// - Writes the human-readable LLVM IR to the given path.
+// - On failure, raises with "failed to write IR file: {e}".
+fn object_emitter_emit_ir_to_file(self: ObjectEmitter, path: text) -> bool:
+    let ok = sat_module_print_to_file(self.module, path)
+    if not ok:
+        raise "failed to write IR file: LLVM print_to_file returned an error"
+    give ok
+
+// =============================================================================
+// SECTION 3: LINKER (linker.rs equivalent)
+// =============================================================================
+//
+// Invokes a platform-appropriate system linker to combine an object file
+// with the Saturnite runtime and any declared external interop libraries
+// into a final executable.
+
+// ─── Struct Definition ─────────────────────────────────────────────────────
+
+// Linker borrows a TargetConfig for its lifetime. In Saturnite, there are no
+// lifetimes; the TargetConfig is stored by value and the caller ensures it
+// outlives the Linker (which is always trivial since Saturnite values are
+// cheap to copy or the struct is passed by value).
+struct Linker:
+    target_config: TargetConfig
+
+// ─── Methods ───────────────────────────────────────────────────────────────
+
+// Linker::new — construct a Linker from a target config.
+// Stores the reference; no work is done until link() is called.
+fn linker_new(target_config: TargetConfig) -> Linker:
+    give Linker: target_config: target_config
+
+// Linker::link — simplest entry point: only the Saturnite runtime + object.
+// Delegates to link_with_externals with an empty externals list.
+fn linker_link(self: Linker, obj_path: text, output_path: text) -> LinkResult:
+    give linker_link_with_externals(self, obj_path, output_path, [])
+
+// Linker::link_with_externals — the full linking pipeline.
+//
+// Semantics (high level):
+//   1. Extract os and env from the TargetConfig.
+//   2. Select the linker binary via self.select_linker(os, env).
+//   3. Build base linker arguments via self.build_linker_args(...).
+//   4. Determine if any Python externals are declared (has_python check).
+//   5. For each external library:
+//      a. Call resolve_external_library to find the concrete artifact.
+//      b. Rust or Native: append the resolved path to args.
+//      c. Python: skip (artifact path is empty; handled by -l flags).
+//      d. If resolution fails: return linking_failed error.
+//   6. If has_python: resolve Python lib + append -lpython, -lpthread, -ldl,
+//      -lutil, -lm.
+//   7. Resolve the linker binary path (Windows MSVC vswhere special handling).
+//   8. Spawn the linker process with the assembled arguments.
+//   9. If non-success exit: capture stderr/stdout, return linking_failed.
+//   10. Return Ok(()) on success.
+//
+// Note: has_python is computed twice (once at step 4, again at step 6).
+// The second computation is redundant/dead but does not affect correctness.
+fn linker_link_with_externals(
+    self: Linker,
+    obj_path: text,
+    output_path: text,
+    externals: List<ExternalLibrary>
+) -> LinkResult:
+    let os = self.target_config.os
+    let env = self.target_config.env
+
+    // Step 1: Select the linker binary.
+    let linker_names = select_linker(os, env)
+    let linker_name = linker_names[0]   // only [0] is used; [1..] would be pre-args
+
+    // Step 2: Build base linker arguments.
+    let mut args = build_linker_args(os, env, obj_path, output_path)
+
+    // Step 3: Determine if any Python externals are declared.
+    let has_python = false
+    let mut has_python = false
+    for ext in externals:
+        if ext.kind == MirExternalKind::python:
+            has_python = true
+
+    // Step 4: Resolve and append each external library.
+    for ext in externals:
+        let resolved = resolve_external_library(ext, output_path)
+
+        if not resolved.ok:
+            // Resolution failed — report all searched paths.
+            give link_err(link_error_linking_failed(output_path, resolved.searched))
+
+        if ext.kind == MirExternalKind::python:
+            // Python externals have no link-time artifact (empty path).
+            // Linking is handled by -l flags below.
+            give  // continue to next external
+        end
+
+        // Rust or Native: append the resolved artifact path.
+        args = args + [resolved.path]
+    end
+
+    // Step 5: If Python externals are present, add Python linking flags.
+    // (This is the redundant second has_python computation; harmless.)
+    let has_python_again = false
+    for ext in externals:
+        if ext.kind == MirExternalKind::python:
+            has_python_again = true
+    end
+
+    if has_python:
+        // Resolve the Python library name from SAT_PYTHON_LIB env var,
+        // or fall back to running `python3-config --ldflags --embed`,
+        // or default to "python3.13".
+        let py_lib = sat_env_var("SAT_PYTHON_LIB")
+        if py_lib == "":
+            // Fall back to python3-config --ldflags --embed
+            let py_result = sat_process_run("python3-config", ["--ldflags", "--embed"])
+            if py_result.success:
+                // Parse -l flags from the output; use the first one found.
+                let py_lib = parse_python_ldflags(py_result.stdout)
+            else:
+                py_lib = "python3.13"
+            end
+        end
+
+        // Resolve the Python library search path from SAT_PYTHON_LIBDIR,
+        // or from python3-config --ldflags --embed output, or skip.
+        let py_libdir = sat_env_var("SAT_PYTHON_LIBDIR")
+        if py_libdir == "":
+            let py_result2 = sat_process_run("python3-config", ["--ldflags", "--embed"])
+            if py_result2.success:
+                py_libdir = parse_python_libdir(py_result2.stdout)
+            end
+        end
+
+        if py_libdir != "":
+            args = args + ["-L" + py_libdir]
+        end
+
+        // Append Python and system libraries.
+        args = args + ["-l" + py_lib, "-lpthread", "-ldl", "-lutil", "-lm"]
+    end
+
+    // Step 6: Resolve the linker binary path.
+    let linker_path = resolve_linker_path(linker_name, os, env)
+    if linker_path == "":
+        // Linker binary not found.
+        give link_err(link_error_linker_not_found(linker_name))
+    end
+
+    // Step 7: Spawn the linker process.
+    let proc_result = sat_process_run(linker_path, args)
+    if not proc_result.success:
+        // Capture stderr, fall back to stdout, or None if both empty.
+        let mut details = proc_result.stderr
+        if details == "":
+            details = proc_result.stdout
+        end
+        give link_err(link_error_linking_failed(output_path, details))
+    end
+
+    // Success.
+    give link_ok()
+
+// Linker::resolve_external_library — find a concrete artifact file for an
+// external library declaration.
+//
+// Determines candidate filenames based on the external kind:
+//   Rust:   lib<name>.a
+//   Native: lib<name>.dylib on macOS, lib<name>.so on other Unix
+//   Python: returns empty path immediately (no link-time artifact)
+//
+// Builds a search directory list:
+//   1. Parent of output_path (the project target/ directory)
+//   2. Current working directory (cwd)
+//   3. <cwd>/libs/<name>  (conventional per-project interop dir)
+//   4. <cwd>/libs         (general libs dir)
+//   5. /usr/local/lib     (system fallback)
+//
+// For each (dir, filename) pair, checks if the file exists.
+// For Rust kind, additionally checks <dir>/<name>/target/release/lib<name>.a.
+// Returns the first match, or Err(searched) listing all candidates.
+fn resolve_external_library(
+    ext: ExternalLibrary,
+    output_path: text
+) -> PathResolveResult:
+    let name = ext.name
+
+    // Determine candidate filenames based on external kind.
+    let candidates: List<text>
+    if ext.kind == MirExternalKind::python:
+        // Python externals have no link-time artifact.
+        // The empty path is skipped in link_with_externals.
+        give PathResolveResult: ok: true, path: "", searched: ""
+    elif ext.kind == MirExternalKind::rust:
+        candidates = ["lib" + name + ".a"]
+    elif ext.kind == MirExternalKind::native:
+        // On macOS, use .dylib; on other Unix, use .so.
+        // In Saturnite, we check both and use whichever exists.
+        candidates = ["lib" + name + ".dylib", "lib" + name + ".so"]
+    end
+
+    // Build search directories.
+    let cwd = sat_env_var("SATURN_CWD")
+    if cwd == "":
+        cwd = "."  // fallback
+
+    let output_parent = path_parent(output_path)
+
+    let mut search_dirs: List<text> = [
+        output_parent,
+        cwd,
+        cwd + "/libs/" + name,
+        cwd + "/libs",
+        "/usr/local/lib"
+    ]
+
+    // Build the list of all candidate paths for error reporting.
+    let mut searched = ""
+
+    // Check each (dir, filename) pair.
+    for dir in search_dirs:
+        for filename in candidates:
+            let full_path = dir + "/" + filename
+            searched = searched + full_path + "\n"
+            if sat_file_exists(full_path):
+                give PathResolveResult: ok: true, path: full_path, searched: searched
+        end
+
+        // For Rust kind, also check the rustc build output directory.
+        if ext.kind == MirExternalKind::rust:
+            let rustc_path = dir + "/" + name + "/target/release/lib" + name + ".a"
+            searched = searched + rustc_path + "\n"
+            if sat_file_exists(rustc_path):
+                give PathResolveResult: ok: true, path: rustc_path, searched: searched
+            end
+        end
+    end
+
+    // No match found — return all searched paths.
+    give PathResolveResult: ok: false, path: "", searched: searched
+
+// Linker::select_linker — choose the linker binary for a (OS, Environment).
+//
+// Returns a List<text> where index [0] is the binary name.
+// [1..] would be pre-args but no current case produces them.
+fn select_linker(os: Os, env: Env) -> List<text>:
+    if os == Os::linux:
+        give ["cc"]
+    elif os == Os::macos:
+        give ["clang"]
+    elif os == Os::windows:
+        if env == Env::msvc:
+            give ["link.exe"]
+        elif env == Env::gnu:
+            give ["gcc"]
+        else:
+            give ["cc"]   // fallback for unknown env on Windows
+        end
+    elif os == Os::freebsd:
+        give ["cc"]
+    else:
+        give ["cc"]       // catch-all for Unknown OS
+    end
+
+// Linker::build_linker_args — construct platform-specific linker arguments.
+//
+// Linux / Darwin (Unix):
+//   [<obj_path>, "-o", <output_path>, <runtime_path>, "-no-pie"]
+//   "-no-pie" is required because the runtime object is compiled without
+//   PIE support; default-PIE linking would cause:
+//   "R_X86_64_32 against `.rodata' can not be used when making a PIE object"
+//   The runtime is statically linked via the .a archive.
+//
+// Windows MSVC:
+//   [<obj_path>, "/OUT:<output_path>", <runtime_path>,
+//    "/SUBSYSTEM:CONSOLE",
+//    "/DEFAULTLIB:msvcrt", "/DEFAULTLIB:ucrt", "/DEFAULTLIB:vcruntime",
+//    "/LIBPATH:<dir>" for each dir from find_msvc_lib_dirs()]
+//   MSVC CRT and Windows SDK lib paths are discovered via vswhere so the
+//   linker can find system libs without the LIB environment variable.
+//
+// Windows GNU:
+//   [<obj_path>, "-o", <output_path>, <runtime_path>, "-no-pie"]
+//
+// Windows (other/unknown env):
+//   [<obj_path>, "/OUT:<output_path>", <runtime_path>]
+//   Minimal fallback; real Windows targets are Msvc or Gnu.
+fn build_linker_args(
+    os: Os,
+    env: Env,
+    obj_path: text,
+    output_path: text
+) -> List<text>:
+    let runtime = runtime_object_path()
+
+    if os == Os::linux or os == Os::macos or os == Os::freebsd:
+        give [obj_path, "-o", output_path, runtime, "-no-pie"]
+    elif os == Os::windows:
+        if env == Env::msvc:
+            let mut args = [
+                obj_path,
+                "/OUT:" + output_path,
+                runtime,
+                "/SUBSYSTEM:CONSOLE",
+                "/DEFAULTLIB:msvcrt",
+                "/DEFAULTLIB:ucrt",
+                "/DEFAULTLIB:vcruntime"
+            ]
+            // Add MSVC and Windows SDK lib paths discovered via vswhere.
+            for lib_dir in find_msvc_lib_dirs():
+                args = args + ["/LIBPATH:" + lib_dir]
+            end
+            give args
+        elif env == Env::gnu:
+            give [obj_path, "-o", output_path, runtime, "-no-pie"]
+        else:
+            // Minimal fallback for unknown Windows env.
+            give [obj_path, "/OUT:" + output_path, runtime]
+        end
+    else:
+        // Catch-all (same as Linux/Darwin Unix-style).
+        give [obj_path, "-o", output_path, runtime, "-no-pie"]
+    end
+
+// =============================================================================
+// ─── Free functions: linker availability checking ──────────────────────────
+// =============================================================================
+
+// check_linker_available — verify that the platform-appropriate linker binary
+// is installed and responds to --version (or /? on MSVC).
+//
+// - Creates a Linker from the config.
+// - Gets the linker binary name via Linker.select_linker(os, env)[0].
+// - Resolves the actual binary path via resolve_linker_path().
+// - Determines the help flag: "/?" for MSVC link.exe, "--version" for others.
+// - Runs the linker with the help flag and checks for success.
+// - Returns LinkResult: Ok(()) on success, Err(linking_failed) if the linker
+//   was found but exited with an error, Err(linker_not_found) if not found.
+// - Called from main.rs `info` command and from check_linker().
+fn check_linker_available(target_config: TargetConfig) -> LinkResult:
+    let os = target_config.os
+    let env = target_config.env
+
+    let linker_names = select_linker(os, env)
+    let linker_name = linker_names[0]
+
+    let linker_path = resolve_linker_path(linker_name, os, env)
+    if linker_path == "":
+        give link_err(link_error_linker_not_found(linker_name))
+    end
+
+    // Determine the help flag: "/?" for MSVC link.exe, "--version" for others.
+    let help_flag = "/?"
+    if not (os == Os::windows and env == Env::msvc):
+        help_flag = "--version"
+    end
+
+    let proc_result = sat_process_run(linker_path, [help_flag])
+    if not proc_result.success:
+        let details = proc_result.stderr
+        if details == "":
+            details = proc_result.stdout
+        end
+        give link_err(link_error_linking_failed(linker_name, details))
+    end
+
+    give link_ok()
+
+// =============================================================================
+// ─── Private free functions: linker path resolution ─────────────────────────
+// =============================================================================
+
+// resolve_linker_path — find the actual path to a linker binary.
+//
+// - On Windows + MSVC + name "link.exe": tries find_msvc_linker_via_vswhere()
+//   first to get the real MSVC linker (not an MSYS2/MinGW shim at /usr/bin/
+//   link.exe that doesn't understand MSVC /DEFAULTLIB flags).
+// - Falls back to which::which(name) (bridged as sat_which) for all platforms.
+// - Returns empty string if not found (mirrors io::ErrorKind::NotFound).
+fn resolve_linker_path(
+    name: text,
+    os: Os,
+    env: Env
+) -> text:
+    // Windows MSVC special handling: use vswhere to find the real link.exe.
+    if os == Os::windows and env == Env::msvc and name == "link.exe":
+        let vswhere_path = find_msvc_linker_via_vswhere()
+        if vswhere_path != "":
+            give vswhere_path
+        end
+    end
+
+    // Fall back to PATH lookup (mirrors the `which` crate).
+    let resolved = sat_which(name)
+    give resolved
+
+// =============================================================================
+// ─── Private free functions: MSVC discovery (Windows only) ──────────────────
+// =============================================================================
+
+// find_msvc_version_dir — locate the MSVC version directory via vswhere.
+//
+// Checks for vswhere at:
+//   C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe
+// Runs: vswhere -latest -products * -requires
+//   Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+// Takes the install path and joins "VC/Tools/MSVC".
+// Reads the directory and returns the first entry starting with a digit
+// (the MSVC version, e.g. "14.40.33807").
+// Returns "" if vswhere is missing, the command fails, or no version dir found.
+fn find_msvc_version_dir() -> text:
+    let vswhere = "C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+    if not sat_file_exists(vswhere):
+        give ""
+    end
+
+    let args = [
+        "-latest",
+        "-products", "*",
+        "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+        "-property", "installationPath"
+    ]
+    let result = sat_process_run(vswhere, args)
+    if not result.success:
+        give ""
+    end
+
+    let install_path = trim(result.stdout)
+    if install_path == "":
+        give ""
+    end
+
+    let msvc_root = install_path + "/VC/Tools/MSVC"
+    if not sat_file_exists(msvc_root):
+        give ""
+    end
+
+    // Read the directory and find the first entry starting with a digit.
+    let entries = sat_read_dir(msvc_root)
+    for entry in entries:
+        if entry.length > 0 and entry[0] >= "0" and entry[0] <= "9":
+            give msvc_root + "/" + entry
+        end
+    end
+
+    give ""
+
+// find_msvc_linker_via_vswhere — locate link.exe within the MSVC toolchain.
+//
+// Calls find_msvc_version_dir() to get <installPath>/VC/Tools/MSVC/<ver>.
+// Tries these paths in order (returns first that is_file):
+//   1. <version_dir>/bin/HostX64/x64/link.exe
+//   2. <version_dir>/bin/HostX64/x86/link.exe
+//   3. <version_dir>/bin/HostX86/x64/link.exe
+//   4. <version_dir>/bin/HostX86/x86/link.exe
+// Returns "" if none found.
+fn find_msvc_linker_via_vswhere() -> text:
+    let version_dir = find_msvc_version_dir()
+    if version_dir == "":
+        give ""
+    end
+
+    // Try the four possible paths for link.exe.
+    let paths = [
+        version_dir + "/bin/HostX64/x64/link.exe",
+        version_dir + "/bin/HostX64/x86/link.exe",
+        version_dir + "/bin/HostX86/x64/link.exe",
+        version_dir + "/bin/HostX86/x86/link.exe"
+    ]
+
+    for path in paths:
+        if sat_file_exists(path):
+            give path
+        end
+    end
+
+    give ""
+
+// find_msvc_lib_dirs — discover MSVC and Windows SDK library directories.
+//
+// Adds:
+//   <msvc_version>/lib/spectre/x64  (MSVC CRT libs with spectre guard)
+//   <windows_kits_root>/<sdk_ver>/um/x64  (kernel32.lib, user32.lib, etc.)
+//   <windows_kits_root>/<sdk_ver>/ucrt/x64  (ucrt.lib)
+//
+// Windows Kits root: C:/Program Files (x86)/Windows Kits/10/Lib
+// Reads the directory; uses the first SDK version entry starting with a digit.
+// Returns an empty List if directories are not found (graceful degradation —
+// the linker may then fail with missing system libs, but the error is clear).
+fn find_msvc_lib_dirs() -> List<text>:
+    let mut dirs: List<text> = []
+
+    // MSVC spectre CRT libs.
+    let msvc_ver = find_msvc_version_dir()
+    if msvc_ver != "":
+        let spectre_dir = msvc_ver + "/lib/spectre/x64"
+        if sat_file_exists(spectre_dir):
+            dirs = dirs + [spectre_dir]
+        end
+    end
+
+    // Windows SDK lib paths.
+    let windows_kits_root = "C:/Program Files (x86)/Windows Kits/10/Lib"
+    if sat_file_exists(windows_kits_root):
+        let sdk_versions = sat_read_dir(windows_kits_root)
+        let mut sdk_ver = ""
+        for v in sdk_versions:
+            if v.length > 0 and v[0] >= "0" and v[0] <= "9":
+                sdk_ver = v
+                break
+            end
+        end
+
+        if sdk_ver != "":
+            // um/x64: kernel32.lib, user32.lib, gdi32.lib, etc.
+            let um_dir = windows_kits_root + "/" + sdk_ver + "/um/x64"
+            if sat_file_exists(um_dir):
+                dirs = dirs + [um_dir]
+            end
+
+            // ucrt/x64: ucrt.lib
+            let ucrt_dir = windows_kits_root + "/" + sdk_ver + "/ucrt/x64"
+            if sat_file_exists(ucrt_dir):
+                dirs = dirs + [ucrt_dir]
+            end
+        end
+    end
+
+    give dirs
+
+// =============================================================================
+// ─── Private free functions: platform description helpers ─────────────────────
+// =============================================================================
+
+// describe_os — human-readable OS name for diagnostics.
+//   Linux -> "Linux", Darwin -> "macOS", Windows -> "Windows",
+//   FreeBSD -> "FreeBSD", Unknown -> "Unknown".
+fn describe_os(os: Os) -> text:
+    if os == Os::linux:
+        give "Linux"
+    elif os == Os::macos:
+        give "macOS"
+    elif os == Os::windows:
+        give "Windows"
+    elif os == Os::freebsd:
+        give "FreeBSD"
+    elif os == Os::ios:
+        give "iOS"
+    elif os == Os::android:
+        give "Android"
+    else:
+        give "Unknown"
+    end
+
+// describe_env — human-readable environment name for diagnostics.
+//   Msvc -> "MSVC", Gnu -> "GNU", Musl -> "Musl", Unknown -> "Unknown".
+fn describe_env(env: Env) -> text:
+    if env == Env::msvc:
+        give "MSVC"
+    elif env == Env::gnu:
+        give "GNU"
+    elif env == Env::musl:
+        give "Musl"
+    else:
+        give "Unknown"
+    end
+
+// =============================================================================
+// ─── Helper: parse Python linker flags ────────────────────────────────────────
+// =============================================================================
+// When SAT_PYTHON_LIB is not set, the linker falls back to running
+// `python3-config --ldflags --embed` and parsing its output.
+// This function extracts the first -l<name> flag from the output.
+
+fn parse_python_ldflags(output: text) -> text:
+    // Look for -l<name> patterns in the output.
+    // Returns the library name (without the -l prefix), or "python3.13".
+    let parts = split(output, " ")
+    for part in parts:
+        if part starts_with "-l":
+            give part[2:]  // strip the "-l" prefix
+        end
+    end
+    give "python3.13"
+
+// =============================================================================
+// ─── Helper: parse Python library directory ─────────────────────────────────
+// =============================================================================
+// When SAT_PYTHON_LIBDIR is not set, parse the -L<path> flag from
+// `python3-config --ldflags --embed` output.
+
+fn parse_python_libdir(output: text) -> text:
+    let parts = split(output, " ")
+    for part in parts:
+        if part starts_with "-L":
+            give part[2:]  // strip the "-L" prefix
+        end
+    end
+    give ""   // no libdir found
+
+// =============================================================================
+// ─── Helper: path parent directory ───────────────────────────────────────────
+// =============================================================================
+// Extract the parent directory from a file path.
+// E.g. "target/foo.o" -> "target", "target/debug/bar" -> "target/debug"
+// This is a simplified version; in a real implementation, this would use
+// proper path manipulation from std::path.
+
+fn path_parent(path: text) -> text:
+    // Find the last path separator.
+    let idx = path.length - 1
+    while idx >= 0:
+        if path[idx] == "/" or path[idx] == "\\":
+            give path[0..idx]
+        end
+        idx -= 1
+    end
+    give "."
+
+// =============================================================================
+// ─── Helper: trim whitespace ─────────────────────────────────────────────────
+// =============================================================================
+
+fn trim(s: text) -> text:
+    let start = 0
+    let end = s.length
+    // Skip leading whitespace.
+    while start < end and (s[start] == " " or s[start] == "\n" or s[start] == "\t" or s[start] == "\r"):
+        start += 1
+    end
+    // Skip trailing whitespace.
+    while end > start and (s[end-1] == " " or s[end-1] == "\n" or s[end-1] == "\t" or s[end-1] == "\r"):
+        end -= 1
+    end
+    give s[start..end]
+
+// =============================================================================
+// ─── Helper: split text by delimiter ─────────────────────────────────────────
+// =============================================================================
+// Saturnite may not have a built-in split function; this provides one
+// for parsing command output.
+
+fn split(s: text, delimiter: text) -> List<text>:
+    let mut result: List<text> = []
+    let mut current = ""
+    let mut i = 0
+    while i < s.length:
+        if i + delimiter.length <= s.length and s[i..i+delimiter.length] == delimiter:
+            result = result + [current]
+            current = ""
+            i += delimiter.length
+        else:
+            current = current + s[i]
+            i += 1
+        end
+    end
+    result = result + [current]
+    give result
+
+// =============================================================================
+// SECTION 4: RE-EXPORTS (mod.rs equivalent)
+// =============================================================================
+//
+// In the Rust version, mod.rs does:
+//   pub mod emitter;   // the ObjectEmitter submodule
+//   pub mod linker;    // the Linker submodule
+//   pub use emitter::ObjectEmitter;
+//   pub use linker::Linker;
+//   pub use crate::target::TargetConfig;
+//
+// Since Saturnite has no sub-modules within a file, ObjectEmitter and Linker
+// are defined above and TargetConfig is imported via `use target::{...}`.
+// All types are module-level and available to importing modules via:
+//   use codegen::{ObjectEmitter, Linker, TargetConfig, check_linker, host_triple}
+//
+// =============================================================================
+// END OF MODULE
+// =============================================================================

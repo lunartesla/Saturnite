@@ -1,0 +1,161 @@
+module mir_opt
+
+// =============================================================================
+// MIR Optimization — Constant Folding
+// =============================================================================
+//
+// One-to-one Saturnite port of crates/stnx/src/mir/opt.rs
+//
+// Constant folding evaluates operations whose operands are all compile-time
+// constants, replacing them with the resulting MirConst. This pass operates
+// on MIR (not LLVM IR) so that type-aware decisions can be made before the
+// backend sees the code.
+
+// ─── Entry point ───
+// Run all passes on every function in the program.
+
+fn optimize(program: MirProgram) -> MirProgram:
+    for i in 0 .. program.functions.length:
+        let func = program.functions[i]
+        let folded = constant_folder_run(func)
+        program.functions[i] = folded
+    give program
+
+// ─── ConstantFolder ───
+
+fn constant_folder_run(func: MirFunction) -> MirFunction:
+    for block in func.blocks:
+        for stmt in block.stmts:
+            if stmt.kind == StmtKind::assign:
+                let folded = fold_rvalue(stmt.assign_rvalue)
+                stmt.assign_rvalue = folded
+    give func
+
+// ─── fold_rvalue ───
+fn fold_rvalue(rvalue: MirRvalue) -> MirRvalue:
+    if rvalue.kind == RvalueKind::binary:
+        let lhs_const = operand_const_opt(rvalue.bin_lhs)
+        let rhs_const = operand_const_opt(rvalue.bin_rhs)
+        if lhs_const.found and rhs_const.found:
+            let result = mir_const_fold_binop(rvalue.bin_op, lhs_const.const_val, rhs_const.const_val)
+            if result.found:
+                give MirRvalue:
+                    kind: RvalueKind::use_operand
+                    operand: MirOperand:
+                        kind: OperandKind::const_val
+                        const_val: result.const_val
+        // Fall through — not foldable
+        give rvalue
+    elif rvalue.kind == RvalueKind::unary:
+        let val = operand_const_opt(rvalue.un_operand)
+        if val.found:
+            let result = mir_const_fold_unop(rvalue.un_op, val.const_val)
+            if result.found:
+                give MirRvalue:
+                    kind: RvalueKind::use_operand
+                    operand: MirOperand:
+                        kind: OperandKind::const_val
+                        const_val: result.const_val
+        give rvalue
+    else:
+        give rvalue
+
+// ─── Helper: extract a MirConst from an operand ───
+// Returns a wrapper with a `found` flag and the const value.
+// Saturnite has no Option<T>, so we use the sentinel + found flag pattern.
+
+struct ConstOpt:
+    found: bool
+    const_val: MirConst
+
+const CONST_NONE: ConstOpt = ConstOpt: found: false, const_val: MirConst: kind: MirConstKind::i64_val, int_val: 0
+
+fn operand_const_opt(operand: MirOperand) -> ConstOpt:
+    if operand.kind == OperandKind::const_val:
+        give ConstOpt: found: true, const_val: operand.const_val
+    give CONST_NONE
+
+// ─── MirConst fold operations ───
+
+struct FoldResult:
+    found: bool
+    const_val: MirConst
+
+const FOLD_NONE: FoldResult = FoldResult: found: false, const_val: MirConst: kind: MirConstKind::i64_val, int_val: 0
+
+fn mir_const_fold_binop(op: MirBinOp, lhs: MirConst, rhs: MirConst) -> FoldResult:
+    // Type mismatch: return none (NOT a sentinel MirConst — Saturnite has no Option)
+    if lhs.kind != rhs.kind:
+        give FOLD_NONE
+
+    if lhs.kind == MirConstKind::i64_val:
+        let r = fold_i64(op, lhs.int_val, rhs.int_val)
+        if r.found:
+            give r
+    elif lhs.kind == MirConstKind::f64_val:
+        let r = fold_f64(op, lhs.float_val, rhs.float_val)
+        if r.found:
+            give r
+    else:
+        let r = fold_bool(op, lhs.bool_val, rhs.bool_val)
+        if r.found:
+            give r
+    give FOLD_NONE
+
+fn mir_const_fold_unop(op: MirUnOp, operand: MirConst) -> FoldResult:
+    if op == MirUnOp::neg:
+        if operand.kind == MirConstKind::i64_val:
+            give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::i64_val, int_val: -operand.int_val
+        elif operand.kind == MirConstKind::f64_val:
+            give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::f64_val, float_val: -operand.float_val
+    elif op == MirUnOp::not:
+        if operand.kind == MirConstKind::bool_val:
+            give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: not operand.bool_val
+    give FOLD_NONE
+
+// ─── fold_i64 ───
+fn fold_i64(op: MirBinOp, a: number, b: number) -> FoldResult:
+    if op == MirBinOp::add:  give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::i64_val, int_val: a + b
+    elif op == MirBinOp::sub: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::i64_val, int_val: a - b
+    elif op == MirBinOp::mul: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::i64_val, int_val: a * b
+    elif op == MirBinOp::div:
+        if b == 0:
+            give FOLD_NONE  // div by zero left to runtime
+        else:
+            give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::i64_val, int_val: a / b
+    elif op == MirBinOp::mod:
+        if b == 0:
+            give FOLD_NONE
+        else:
+            give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::i64_val, int_val: a % b
+    elif op == MirBinOp::eq: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a == b
+    elif op == MirBinOp::ne: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a != b
+    elif op == MirBinOp::lt: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a < b
+    elif op == MirBinOp::gt: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a > b
+    elif op == MirBinOp::le: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a <= b
+    elif op == MirBinOp::ge: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a >= b
+    elif op == MirBinOp::and: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: (a != 0) and (b != 0)
+    else: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: (a != 0) or (b != 0)
+
+// ─── fold_f64 ───
+fn fold_f64(op: MirBinOp, a: f64, b: f64) -> FoldResult:
+    if op == MirBinOp::add:  give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::f64_val, float_val: a + b
+    elif op == MirBinOp::sub: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::f64_val, float_val: a - b
+    elif op == MirBinOp::mul: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::f64_val, float_val: a * b
+    elif op == MirBinOp::div: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::f64_val, float_val: a / b
+    elif op == MirBinOp::mod: give FOLD_NONE  // floating-point modulo not supported
+    elif op == MirBinOp::eq: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a == b
+    elif op == MirBinOp::ne: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a != b
+    elif op == MirBinOp::lt: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a < b
+    elif op == MirBinOp::gt: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a > b
+    elif op == MirBinOp::le: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a <= b
+    elif op == MirBinOp::ge: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a >= b
+    else: give FOLD_NONE  // and/or on floats not supported
+
+// ─── fold_bool ───
+fn fold_bool(op: MirBinOp, a: bool, b: bool) -> FoldResult:
+    if op == MirBinOp::eq: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a == b
+    elif op == MirBinOp::ne: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a != b
+    elif op == MirBinOp::and: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a and b
+    elif op == MirBinOp::or: give FoldResult: found: true, const_val: MirConst: kind: MirConstKind::bool_val, bool_val: a or b
+    give FOLD_NONE  // arithmetic and ordering on bools not supported

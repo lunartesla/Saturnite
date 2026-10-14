@@ -1,0 +1,309 @@
+module mir
+
+// =============================================================================
+// MIR (Mid-level IR) — the control-flow-aware intermediate representation
+// =============================================================================
+//
+// One-to-one Saturnite port of crates/stnx/src/mir/mod.rs
+//
+// MIR sits between HIR and LLVM IR. It owns the compiler's control-flow graph
+// so that language-level optimizations and analyses happen on a target-
+// independent representation before LLVM sees the code.
+//
+// Design principles:
+// * Explicit CFG: every function is a graph of MirBasicBlocks.
+// * Flat locals: variables and temporaries are LocalIds stored in MirLocals.
+// * Rvalues, not nested expressions: every compound expression is lowered
+//   to an Assign that writes its result into a local.
+// * Calls are terminators: function calls end their block.
+
+// Imports: Saturnite uses `use module_name` then qualified paths
+// (no Rust-style {a, b, c} import syntax)
+
+// ─── Identifiers ───
+
+struct BlockId:
+    id: number
+
+struct LocalId:
+    id: number
+
+// ─── Type alias: MirType reuses HirType ───
+// (Saturnite doesn't have type aliases, so we use HirType directly everywhere)
+
+// ─── MirLocal ───
+// A local variable descriptor.
+struct MirLocal:
+    id: LocalId
+    ty: HirType
+    name: SymbolId
+    mutable: bool
+
+// ─── MirConst ───
+// A compile-time constant value.
+enum MirConstKind:
+    i64_val
+    f64_val
+    bool_val
+
+struct MirConst:
+    kind: MirConstKind
+    int_val: number
+    float_val: f64
+    bool_val: bool
+
+fn const_i64(val: number) -> MirConst:
+    give MirConst: kind: MirConstKind::i64_val, int_val: val
+
+fn const_f64(val: f64) -> MirConst:
+    give MirConst: kind: MirConstKind::f64_val, float_val: val
+
+fn const_bool(val: bool) -> MirConst:
+    give MirConst: kind: MirConstKind::bool_val, bool_val: val
+
+fn const_ty(c: MirConst) -> HirType:
+    if c.kind == MirConstKind::i64_val:
+        give HirType: kind: TypeKind::i64
+    elif c.kind == MirConstKind::f64_val:
+        give HirType: kind: TypeKind::f64
+    else:
+        give HirType: kind: TypeKind::bool
+
+// ─── MirOperand ───
+// A value that can be consumed without further computation.
+enum OperandKind:
+    const_val
+    local
+
+struct MirOperand:
+    kind: OperandKind
+    const_val: MirConst
+    local_id: LocalId
+
+fn operand_const(o: MirOperand) -> bool:
+    give o.kind == OperandKind::const_val
+
+// ─── Operators ───
+
+// MIR binary operator — mirrors ast::BinOp
+enum MirBinOp:
+    add
+    sub
+    mul
+    div
+    mod
+    eq
+    ne
+    lt
+    gt
+    le
+    ge
+    and
+    or
+
+fn binop_from_ast(op: BinOp) -> MirBinOp:
+    if op == BinOp::add:   give MirBinOp::add
+    elif op == BinOp::sub: give MirBinOp::sub
+    elif op == BinOp::mul: give MirBinOp::mul
+    elif op == BinOp::div: give MirBinOp::div
+    elif op == BinOp::mod: give MirBinOp::mod
+    elif op == BinOp::eq:  give MirBinOp::eq
+    elif op == BinOp::ne:  give MirBinOp::ne
+    elif op == BinOp::lt:  give MirBinOp::lt
+    elif op == BinOp::gt:  give MirBinOp::gt
+    elif op == BinOp::le:  give MirBinOp::le
+    elif op == BinOp::ge:  give MirBinOp::ge
+    elif op == BinOp::and: give MirBinOp::and
+    else:                give MirBinOp::or
+
+// MIR unary operator — mirrors ast::UnOp
+enum MirUnOp:
+    neg
+    not
+
+fn unop_from_ast(op: UnOp) -> MirUnOp:
+    if op == UnOp::neg: give MirUnOp::neg
+    else:               give MirUnOp::not
+
+// AugOp maps to the corresponding MirBinOp (+= -> Add, etc.)
+fn augop_to_binop(op: AugOp) -> MirBinOp:
+    if op == AugOp::add: give MirBinOp::add
+    elif op == AugOp::sub: give MirBinOp::sub
+    elif op == AugOp::mul: give MirBinOp::mul
+    else:                give MirBinOp::div
+
+// ─── External call kind ───
+enum MirExternalKind:
+    rust
+    python
+    native
+
+// ─── Rvalues ───
+
+// A value-producing computation.
+enum RvalueKind:
+    use_operand      // copy/clone an operand into a local
+    external_call    // call across an interop boundary
+    binary           // binary operation
+    unary            // unary operation
+    struct_lit       // struct construction
+    field_access     // p.x
+    enum_ctor        // Color::Red -> i64 tag
+    list_literal     // [1, 2, 3]
+    index            // list_get
+    length           // list_len
+    str_lit          // string literal -> global pointer
+
+struct MirRvalue:
+    kind: RvalueKind
+    // use_operand
+    operand: MirOperand
+    // external_call
+    ext_kind: MirExternalKind
+    ext_symbol: text
+    ext_args: List<MirOperand>
+    ext_ret_ty: HirType
+    // binary
+    bin_op: MirBinOp
+    bin_lhs: MirOperand
+    bin_rhs: MirOperand
+    // unary
+    un_op: MirUnOp
+    un_operand: MirOperand
+    // struct_lit
+    struct_def: SymbolId
+    struct_fields: List<FieldAssignment>
+    // field_access
+    field_access_local: LocalId
+    field_access_field: SymbolId
+    // enum_ctor
+    enum_def: SymbolId
+    enum_variant: SymbolId
+    // list_literal
+    list_elements: List<MirOperand>
+    // index
+    index_list_local: LocalId
+    index_value: MirOperand
+    // length
+    length_list_local: LocalId
+    // str_lit
+    str_symbol: SymbolId
+
+struct FieldAssignment:
+    field: SymbolId
+    value: MirOperand
+
+// ─── Statements ───
+
+enum StmtKind:
+    local_decl
+    assign
+
+struct MirStmt:
+    kind: StmtKind
+    // local_decl
+    local_id: LocalId
+    local_ty: HirType
+    local_mutable: bool
+    // assign
+    assign_local: LocalId
+    assign_rvalue: MirRvalue
+
+// ─── Terminators ───
+
+// A block terminator (every block has exactly one).
+enum TermKind:
+    goto       // unconditional branch
+    switch_int // switch on integer/bool value
+    call       // function call
+    return_val // return from function
+    unreachable // placeholder/unreachable code
+
+struct MirTerminator:
+    kind: TermKind
+    // goto
+    goto_target: BlockId
+    // switch_int
+    switch_scrutinee: MirOperand
+    switch_ty: HirType
+    switch_branches: List<SwitchBranch>
+    switch_else: BlockId
+    // call
+    call_func: DefId
+    call_args: List<MirOperand>
+    call_destination: LocalId
+    call_next: BlockId
+    // return_val
+    return_value: MirOperand
+    has_return_value: bool
+
+struct SwitchBranch:
+    value: number
+    target: BlockId
+
+// ─── Basic blocks ───
+
+struct MirBasicBlock:
+    id: BlockId
+    name: text
+    stmts: List<MirStmt>
+    terminator: MirTerminator
+
+// ─── Functions ───
+
+struct MirFunction:
+    def_id: DefId
+    name: SymbolId
+    params: List<FunctionParam>
+    return_type: HirType
+    locals: List<MirLocal>
+    param_locals: List<LocalId>
+    blocks: List<MirBasicBlock>
+    start_block: BlockId
+
+struct FunctionParam:
+    name: SymbolId
+    ty: HirType
+
+// ─── External library ───
+
+struct ExternalLibrary:
+    name: text
+    kind: MirExternalKind
+
+// ─── Program ───
+
+struct MirProgram:
+    functions: List<MirFunction>
+    symbols: SymbolInterner
+    structs: List<StructDef>
+    enums: List<EnumDef>
+    external_libraries: List<ExternalLibrary>
+
+// ─── Sentinels for builtins ───
+// These DefIds are reserved for compiler-internal builtins.
+
+const PRINTLN_DEF_ID: DefId = DefId: id: 4294967294
+const PRINTLN_STR_DEF_ID: DefId = DefId: id: 4294967293
+const CONCAT_STR_DEF_ID: DefId = DefId: id: 4294967292
+const STR_I64_DEF_ID: DefId = DefId: id: 4294967291
+
+// ─── Program accessors ───
+
+fn struct_def_lookup(program: MirProgram, sym: SymbolId) -> StructDef:
+    for s in program.structs:
+        if s.name == sym:
+            give s
+    give StructDef: def_id: DefId: id: 0, name: sym, generic_params: [], fields: [], span: SourceSpan: start: 0, end: 0, module: ModuleId: id: 0, visibility: Visibility::private
+
+fn enum_def_lookup(program: MirProgram, sym: SymbolId) -> EnumDef:
+    for e in program.enums:
+        if e.name == sym:
+            give e
+    give EnumDef: def_id: DefId: id: 0, name: sym, generic_params: [], variants: [], span: SourceSpan: start: 0, end: 0, module: ModuleId: id: 0, visibility: Visibility::private
+
+fn function_name(program: MirProgram, id: DefId) -> text:
+    for f in program.functions:
+        if f.def_id == id:
+            give program.symbols.lookup(f.name)
+    give ""

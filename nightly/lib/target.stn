@@ -1,0 +1,190 @@
+module target
+
+// =============================================================================
+// Target configuration
+// =============================================================================
+//
+// One-to-one Saturnite port of crates/stnx/src/target.rs
+
+// ─── Native bridge declarations (module-level, not inside functions) ───
+
+external native "libtarget" "sat_get_host_triple"() -> text
+external native "libtarget" "sat_create_target_machine"(
+    triple_str: text,
+    opt_level: number,
+    debug_info: bool
+) -> TargetMachine
+
+// ─── Architecture ───
+
+enum Arch:
+    x86_64
+    x86
+    aarch64
+    arm
+    riscv64
+    riscv32
+    wasm32
+
+// ─── Operating System ───
+
+enum Os:
+    linux
+    macos
+    windows
+    freebsd
+    ios
+    android
+
+// ─── Environment ───
+
+enum Env:
+    gnu
+    msvc
+    musl
+    none
+
+// ─── Target Triple ───
+
+struct TargetTriple:
+    arch: Arch
+    os: Os
+    env: Env
+    raw: text    // e.g., "x86_64-unknown-linux-gnu"
+
+fn host_triple() -> TargetTriple:
+    // In the Rust version, this uses target_lexicon to detect the host.
+    // In Saturnite, we read it from the environment or an external call.
+    let raw = sat_get_host_triple()
+    give TargetTriple:
+        arch: parse_arch(raw)
+        os: parse_os(raw)
+        env: parse_env(raw)
+        raw: raw
+
+fn parse_arch(raw: text) -> Arch:
+    if starts_with(raw, "x86_64"):  give Arch::x86_64
+    elif starts_with(raw, "aarch64"): give Arch::aarch64
+    elif starts_with(raw, "arm"):    give Arch::arm
+    elif starts_with(raw, "riscv64"): give Arch::riscv64
+    elif starts_with(raw, "riscv32"): give Arch::riscv32
+    elif starts_with(raw, "wasm32"): give Arch::wasm32
+    elif starts_with(raw, "i686") or starts_with(raw, "i386"): give Arch::x86
+    give Arch::x86_64  // default
+
+fn parse_os(raw: text) -> Os:
+    if contains(raw, "linux"):   give Os::linux
+    elif contains(raw, "darwin"):  give Os::macos
+    elif contains(raw, "windows"): give Os::windows
+    elif contains(raw, "freebsd"): give Os::freebsd
+    elif contains(raw, "ios"):     give Os::ios
+    elif contains(raw, "android"): give Os::android
+    give Os::linux  // default
+
+fn parse_env(raw: text) -> Env:
+    if contains(raw, "gnu"):  give Env::gnu
+    elif contains(raw, "msvc"): give Env::msvc
+    elif contains(raw, "musl"): give Env::musl
+    give Env::none
+
+// ─── Optimization level ───
+
+enum OptLevel:
+    none     // -O0: no optimization
+    less     // -O1: basic optimization
+    default  // -O2: moderate optimization (default for release)
+    aggressive // -O3: aggressive optimization
+    size     // -Os: optimize for size
+
+// ─── Build profile ───
+
+enum ProfileKind:
+    debug
+    release
+
+struct Profile:
+    kind: ProfileKind
+    opt_level: OptLevel
+    debug_info: bool
+
+fn default_debug_profile() -> Profile:
+    give Profile:
+        kind: ProfileKind::debug
+        opt_level: OptLevel::none
+        debug_info: true
+
+fn default_release_profile() -> Profile:
+    give Profile:
+        kind: ProfileKind::release
+        opt_level: OptLevel::aggressive
+        debug_info: false
+
+// ─── Target config ───
+
+struct TargetConfig:
+    triple: TargetTriple
+    arch: Arch
+    os: Os
+    env: Env
+
+fn new(triple: TargetTriple) -> TargetConfig:
+    give TargetConfig:
+        triple: triple
+        arch: triple.arch
+        os: triple.os
+        env: triple.env
+
+fn triple_str(self: TargetConfig) -> text:
+    give self.triple.raw
+
+fn create_target_machine(self: TargetConfig, profile: Profile) -> TargetMachine:
+    // In the Rust version, this creates an inkwell TargetMachine.
+    // In Saturnite, this delegates to an external Rust bridge.
+    let level = opt_level_to_num(profile.opt_level)
+    let handle = sat_create_target_machine(self.triple_str(), level, profile.debug_info)
+    give TargetMachine: handle: handle
+
+fn opt_level_to_num(level: OptLevel) -> number:
+    if level == OptLevel::none:          give 0
+    elif level == OptLevel::less:        give 1
+    elif level == OptLevel::default:     give 2
+    elif level == OptLevel::aggressive:  give 3
+    else:                                give 2
+
+// ─── Target machine handle (opaque) ───
+// In the Rust version, this is inkwell::targets::TargetMachine.
+// In Saturnite, we hold an opaque handle to the native object.
+
+struct TargetMachine:
+    handle: text  // opaque pointer/handle as a stringified address
+
+struct TargetError:
+    message: text
+    triple: text
+    triple_set: bool
+
+fn target_init_failed(message: text, triple: text) -> TargetError:
+    give TargetError:
+        message: message
+        triple: triple
+        triple_set: true
+
+fn target_lookup_failed(triple: text, message: text) -> TargetError:
+    give TargetError:
+        message: message
+        triple: triple
+        triple_set: true
+
+fn target_machine_failed(triple: text, message: text) -> TargetError:
+    give TargetError:
+        message: message
+        triple: triple
+        triple_set: true
+
+// ─── Output kind ───
+
+enum OutputKind:
+    object   // .o file
+    ir       // .ll file (LLVM IR)
+    asm      // assembly
+    executable

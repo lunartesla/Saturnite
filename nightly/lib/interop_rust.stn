@@ -1,0 +1,45 @@
+module interop_rust
+
+// =============================================================================
+// Rust Wrapper / ABI Metadata — Stage A
+// =============================================================================
+//
+// One-to-one Saturnite port of crates/stnx/src/interop_rust.rs
+//
+// Defines an explicit wrapper descriptor without parsing arbitrary Rust AST.
+
+use interop::{DependencyKind}
+
+// ─── AbiPrimitive ───
+// Supported ABI primitive types for the Rust interoperability boundary.
+
+enum AbiPrimitive:
+    i8
+    i16
+    i32
+    i64
+    u8
+    u16
+    u32
+    u64
+    f32
+    f64
+    bool
+    pointer
+
+// ─── RustWrapperFunction ───
+// A declared ABI-safe Rust function exposed through a wrapper.
+
+struct RustWrapperFunction:
+    symbol: text              // e.g. "sat_add_i64"
+    params: List<AbiPrimitive> // ABI-safe parameter types
+    ret: AbiPrimitive         // ABI-safe return type
+    requires_wrapper: bool    // whether a #[no_mangle] extern "C" declaration is needed
+
+// ─── RustDependencyWrapper ───
+// A Rust dependency wrapper descriptor. This avoids parsing Rust ASTs.
+
+struct RustDependencyWrapper:
+    kind: DependencyKind      // always Rust for this descriptor
+    name: text               // crate or wrapper identifier
+    functions: List<RustWrapperFunction>  // exposed ABI-safe functions

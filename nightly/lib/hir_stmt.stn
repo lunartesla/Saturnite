@@ -1,0 +1,119 @@
+module hir_stmt
+
+// =============================================================================
+// HIR Statements — compiler-level statement representation
+// =============================================================================
+//
+// One-to-one Saturnite port of crates/stnx/src/hir/stmt.rs
+
+use hir_expr::{HirExprRef, HirExprArena}
+use hir_symbol::{SymbolId}
+// Imports: use module_name — reference types as module_name::Type
+use ast_types::{SourceSpan}
+
+// ─── StmtKind (discriminants for HirStmt) ───
+enum StmtKind:
+    let_stmt       // let binding
+    expr_stmt      // bare expression statement
+    return_stmt    // return
+    println_stmt   // println(expr) — builtin
+    println_str    // say "..." — builtin (0.5)
+    raise          // raise expr — stub (0.5)
+    give           // give expr — 0.5 synonym for return
+    say            // say expr — 0.5 synonym for println
+    struct_def     // struct definition
+    enum_def       // enum definition
+
+// ─── HirStmt ───
+struct HirStmt:
+    kind: StmtKind
+    span: SourceSpan
+    // let
+    let_name: SymbolId
+    let_mutable: bool
+    let_ty: HirType
+    let_has_type: bool
+    let_value: HirExprRef
+    // return / give (optional value)
+    return_value: HirExprRef
+    has_value: bool
+    // println / say / raise
+    print_expr: HirExprRef
+    // struct def
+    struct_def_name: SymbolId
+    struct_generic_params: List<SymbolId>
+    struct_fields: List<StructFieldDef>
+    // enum def
+    enum_def_name: SymbolId
+    enum_generic_params: List<SymbolId>
+    enum_variants: List<SymbolId>
+
+struct StructFieldDef:
+    name: SymbolId
+    ty: HirType
+
+// ─── Construction helpers ───
+
+fn make_let(name: SymbolId, mutable: bool, ty: HirType, ty_set: bool, value: HirExprRef, span: SourceSpan) -> HirStmt:
+    give HirStmt:
+        kind: StmtKind::let_stmt
+        span: span
+        let_name: name
+        let_mutable: mutable
+        let_ty: ty
+        let_has_type: ty_set
+        let_value: value
+
+fn make_expr_stmt(expr: HirExprRef, span: SourceSpan) -> HirStmt:
+    give HirStmt:
+        kind: StmtKind::expr_stmt
+        span: span
+        print_expr: expr
+
+fn make_return(value: HirExprRef, has_val: bool, span: SourceSpan) -> HirStmt:
+    give HirStmt:
+        kind: StmtKind::return_stmt
+        span: span
+        return_value: value
+        has_value: has_val
+
+fn make_give(value: HirExprRef, has_val: bool, span: SourceSpan) -> HirStmt:
+    give HirStmt:
+        kind: StmtKind::give
+        span: span
+        return_value: value
+        has_value: has_val
+
+fn make_println(expr: HirExprRef, span: SourceSpan) -> HirStmt:
+    give HirStmt:
+        kind: StmtKind::println_stmt
+        span: span
+        print_expr: expr
+
+fn make_say(expr: HirExprRef, span: SourceSpan) -> HirStmt:
+    give HirStmt:
+        kind: StmtKind::say
+        span: span
+        print_expr: expr
+
+fn make_raise(expr: HirExprRef, span: SourceSpan) -> HirStmt:
+    give HirStmt:
+        kind: StmtKind::raise
+        span: span
+        print_expr: expr
+
+fn make_struct_def(name: SymbolId, generics: List<SymbolId>, fields: List<StructFieldDef>, span: SourceSpan) -> HirStmt:
+    give HirStmt:
+        kind: StmtKind::struct_def
+        span: span
+        struct_def_name: name
+        struct_generic_params: generics
+        struct_fields: fields
+
+fn make_enum_def(name: SymbolId, generics: List<SymbolId>, variants: List<SymbolId>, span: SourceSpan) -> HirStmt:
+    give HirStmt:
+        kind: StmtKind::enum_def
+        span: span
+        enum_def_name: name
+        enum_generic_params: generics
+        enum_variants: variants

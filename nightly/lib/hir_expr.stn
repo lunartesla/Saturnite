@@ -1,0 +1,283 @@
+module hir_expr
+
+// =============================================================================
+// HIR Expressions — compiler-level expression representation
+// =============================================================================
+//
+// One-to-one Saturnite port of crates/stnx/src/hir/expr.rs
+//
+// Every HirExpr carries its resolved HirType and a SourceSpan.
+// String identifiers have been replaced with SymbolId/DefId so later stages
+// (MIR, LLVM codegen) never need to perform string lookups.
+
+// Imports: use module_name then reference types as module_name::Type
+// (Saturnite does not support Rust-style {a, b, c} imports)
+
+// ─── HirExprKind ───
+// Expression variants. All identifiers are resolved:
+// - Variable uses a SymbolId (not a String)
+// - Call uses a DefId (not a String)
+enum ExprKind:
+    integer      // i64 literal
+    float        // f64 literal
+    bool_lit     // bool literal
+    str_lit      // string literal (SymbolId)
+    unit_val     // unit expression
+    variable     // resolved variable reference (SymbolId)
+    assign       // assignment to mutable variable
+    aug_assign   // augmented assignment (+=, -=, etc.)
+    binary       // binary operation
+    unary        // unary operation
+    call         // function call (DefId)
+    if_expr      // if/elif/else
+    for_expr     // for loop
+    while_expr   // while loop
+    range_expr   // range (start..end)
+    struct_literal // struct construction
+    field_access // p.x
+    list_literal // [1, 2, 3]
+    index        // list[i]
+    length       // list.length
+    enum_constructor // Color::Red
+
+// ─── HirExpr ───
+// A compiler-level expression with resolved type and source span.
+struct HirExpr:
+    kind: ExprKind
+    ty: HirType
+    span: SourceSpan
+    // Payload fields — only meaningful for certain kinds:
+    // integer
+    int_val: number
+    // float
+    float_val: f64
+    // bool_lit
+    bool_val: bool
+    // str_lit
+    str_symbol: SymbolId
+    // variable / assign / aug_assign
+    symbol: SymbolId
+    // assign value
+    assign_value: HirExprRef
+    // aug_assign
+    aug_op: number   // AugOp discriminant
+    // binary / unary
+    bin_op: number   // BinOp discriminant
+    un_op: number    // UnOp discriminant
+    lhs: HirExprRef
+    rhs: HirExprRef
+    // call
+    func_def: DefId
+    call_args: List<HirExprRef>
+    type_args: List<HirType>
+    // if/elif/else
+    if_cond: HirExprRef
+    if_then: List<HirStmt>
+    if_elif: List<IfElifBranch>
+    if_else: List<HirStmt>
+    // for
+    for_var: SymbolId
+    for_iter: HirExprRef
+    for_body: List<HirStmt>
+    // while
+    while_cond: HirExprRef
+    while_body: List<HirStmt>
+    // range
+    range_start: HirExprRef
+    range_end: HirExprRef
+    range_inclusive: bool
+    // struct literal
+    struct_symbol: SymbolId
+    struct_fields: List<StructFieldInit>
+    struct_type_args: List<HirType>
+    // field access
+    field_access_expr: HirExprRef
+    field_symbol: SymbolId
+    // list literal
+    list_items: List<HirExprRef>
+    // index
+    index_list: HirExprRef
+    index_expr: HirExprRef
+    // length
+    length_expr: HirExprRef
+    // enum constructor
+    enum_symbol: SymbolId
+    enum_variant: SymbolId
+
+struct HirExprRef:
+    idx: number
+
+struct HirExprArena:
+    items: List<HirExpr>
+
+// ─── HirExprArena operations (free functions, since Saturnite has no impl blocks) ───
+
+fn hir_expr_arena_new() -> HirExprArena:
+    give HirExprArena: items: []
+
+fn hir_expr_arena_alloc(arena: HirExprArena, expr: HirExpr) -> number:
+    let idx = arena.items.length
+    arena.items = arena.items + [expr]
+    give idx
+
+fn hir_expr_arena_get(arena: HirExprArena, idx: number) -> HirExpr:
+    give arena.items[idx]
+
+// ─── Supporting types ───
+
+struct IfElifBranch:
+    condition: HirExprRef
+    body: List<HirStmt>
+
+struct StructFieldInit:
+    field_name: SymbolId
+    value: HirExprRef
+
+// ─── Expression construction helpers ───
+// These mirror the constructors used in the Rust HIR lowering code.
+
+fn make_integer(val: number, ty: HirType, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::integer
+        int_val: val
+        ty: ty
+        span: span
+
+fn make_bool(val: bool, ty: HirType, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::bool_lit
+        bool_val: val
+        ty: ty
+        span: span
+
+fn make_str_lit(sym: SymbolId, ty: HirType, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::str_lit
+        str_symbol: sym
+        ty: ty
+        span: span
+
+fn make_var(sym: SymbolId, ty: HirType, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::variable
+        symbol: sym
+        ty: ty
+        span: span
+
+fn make_binary(op: number, lhs: HirExprRef, rhs: HirExprRef, ty: HirType, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::binary
+        bin_op: op
+        lhs: lhs
+        rhs: rhs
+        ty: ty
+        span: span
+
+fn make_call(func: DefId, args: List<HirExprRef>, ty: HirType, type_args: List<HirType>, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::call
+        func_def: func
+        call_args: args
+        type_args: type_args
+        ty: ty
+        span: span
+
+fn make_field_access(expr: HirExprRef, field: SymbolId, ty: HirType, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::field_access
+        field_access_expr: expr
+        field_symbol: field
+        ty: ty
+        span: span
+
+fn make_struct_literal(sym: SymbolId, fields: List<StructFieldInit>, ty: HirType, type_args: List<HirType>, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::struct_literal
+        struct_symbol: sym
+        struct_fields: fields
+        struct_type_args: type_args
+        ty: ty
+        span: span
+
+fn make_enum_constructor(enum_sym: SymbolId, variant: SymbolId, ty: HirType, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::enum_constructor
+        enum_symbol: enum_sym
+        enum_variant: variant
+        ty: ty
+        span: span
+
+fn make_list_literal(items: List<HirExprRef>, ty: HirType, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::list_literal
+        list_items: items
+        ty: ty
+        span: span
+
+fn make_index(list: HirExprRef, index: HirExprRef, ty: HirType, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::index
+        index_list: list
+        index_expr: index
+        ty: ty
+        span: span
+
+fn make_length(expr: HirExprRef, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::length
+        length_expr: expr
+        ty: HirType: kind: TypeKind::i64
+        span: span
+
+fn make_range(start: HirExprRef, end: HirExprRef, inclusive: bool, ty: HirType, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::range_expr
+        range_start: start
+        range_end: end
+        range_inclusive: inclusive
+        ty: ty
+        span: span
+
+fn make_if(cond: HirExprRef, then: List<HirStmt>, elif: List<IfElifBranch>, else_b: List<HirStmt>, ty: HirType, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::if_expr
+        if_cond: cond
+        if_then: then
+        if_elif: elif
+        if_else: else_b
+        ty: ty
+        span: span
+
+fn make_for(var: SymbolId, iter: HirExprRef, body: List<HirStmt>, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::for_expr
+        for_var: var
+        for_iter: iter
+        for_body: body
+        ty: HirType: kind: TypeKind::unit
+        span: span
+
+fn make_while(cond: HirExprRef, body: List<HirStmt>, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::while_expr
+        while_cond: cond
+        while_body: body
+        ty: HirType: kind: TypeKind::unit
+        span: span
+
+fn make_assign(target: SymbolId, value: HirExprRef, ty: HirType, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::assign
+        symbol: target
+        assign_value: value
+        ty: ty
+        span: span
+
+fn make_aug_assign(target: SymbolId, op: number, value: HirExprRef, ty: HirType, span: SourceSpan) -> HirExpr:
+    give HirExpr:
+        kind: ExprKind::aug_assign
+        symbol: target
+        aug_op: op
+        assign_value: value
+        ty: ty
+        span: span

@@ -1,0 +1,38 @@
+module interop_python
+
+// =============================================================================
+// Python Bridge Contract — Stage C (real runtime design, deferred execution)
+// =============================================================================
+//
+// One-to-one Saturnite port of crates/stnx/src/interop_python.rs
+//
+// This module defines the conversion rules and lifetime requirements.
+// Full CPython execution remains deferred until interpreter/GIL
+// architecture is reviewed; no fake execution is provided.
+
+// ─── PythonConversion ───
+// Supported first-pass Python value conversions.
+// Unsupported objects must become opaque PythonObject handles.
+
+enum PythonConversion:
+    int_to_int
+    float_to_float
+    bool_to_bool
+    str_to_str
+    list_i64_to_python_list
+    unit_to_none
+    opaque    // unsupported / dynamic value — must not become arbitrary Saturnite value
+
+// ─── PythonObjectHandle ───
+// Opaque handle boundary for unsupported Python objects.
+// This is only a design representation; real reference counting /
+// interpreter lifetime is deferred.
+
+struct PythonObjectHandle:
+    id: number     // opaque identifier (not a raw pointer exposed to Saturnite code)
+
+// ─── Python runtime requirements ───
+// Documented, not yet executed. First implementation is intentionally
+// single-threaded.
+
+const PYTHON_SINGLE_THREADED: boolean = true

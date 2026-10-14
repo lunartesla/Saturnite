@@ -1,0 +1,167 @@
+module tokens
+
+// =============================================================================
+// Token kinds — the lexical vocabulary of Saturnite
+// =============================================================================
+//
+// Maps 1:1 to the Rust compiler's TokenKind enum.
+// Each token carries a byte-span (Range<usize>) in the source.
+
+enum TokenKind:
+    // ─── Legacy keywords (0.2 syntax) ───
+    fn_kw
+    let_kw
+    mut_kw
+    if_kw
+    elif_kw
+    else_kw
+    for_kw
+    while_kw
+    in_kw
+    return_kw
+    i64_kw
+    f64_kw
+    bool_kw
+    str_kw
+    unit_kw
+    true_kw
+    false_kw
+    println_kw
+    struct_kw
+    enum_kw
+    mod_kw
+    use_kw
+    pub_kw
+    as_kw
+
+    // ─── 0.5 native syntax keywords ───
+    module_kw       // "module name" — advisory module declaration
+    give_kw         // "give expr" — synonym for return
+    say_kw          // "say expr" — synonym for println
+    raise_kw        // "raise expr" — error raise
+    text_kw         // "text" — type alias for str
+    number_kw       // "number" — type alias for i64
+    external_kw     // "external" — FFI declaration
+
+    // ─── Literals ───
+    ident          // identifier name
+    integer        // i64 value
+    float          // f64 value
+    str_lit        // string content
+
+    // ─── Operators ───
+    plus           // +
+    minus          // -
+    star           // *
+    slash          // /
+    percent        // %
+    assign         // =
+    plus_assign    // +=
+    minus_assign   // -=
+    star_assign    // *=
+    slash_assign   // /=
+    eq_eq          // ==
+    not_eq         // !=
+    lt             // <
+    gt             // >
+    lt_eq          // <=
+    gt_eq          // >=
+    and            // &&
+    or             // ||
+    bang           // !
+    dot_dot        // ..  (exclusive range)
+    dot_dot_ellipsis // ... (inclusive range)
+    dot            // .
+    double_colon   // ::
+    pipe           // |>  pipeline operator
+
+    // ─── Punctuation ───
+    lparen         // (
+    rparen         // )
+    lbrace         // {
+    rbrace         // }
+    lbracket       // [
+    rbracket       // ]
+    comma          // ,
+    colon          // :
+    r_arrow        // ->
+
+    // ─── Synthetic indentation tokens (from indent pre-pass) ───
+    indent         // one indent level deeper
+    dedent         // one indent level shallower
+    newline        // logical newline
+
+    // ─── Meta ───
+    error
+    eof
+
+struct Token:
+    kind: TokenKind
+    // Token payload (union-like — only valid for specific kinds)
+    // For ident: the identifier string
+    ident_val: text
+    // For integer: the value
+    int_val: number
+    // For float: the value
+    float_val: f64
+    // For str_lit: the string content
+    str_val: text
+    // Byte span
+    span_start: number
+    span_end: number
+
+// ─── Reserved (sentinel) tokens for builtins ───
+const PRINTLN_DEF_ID: number = 4294967294  // u32::MAX - 1
+const PRINTLN_STR_DEF_ID: number = 4294967293  // u32::MAX - 2
+const CONCAT_STR_DEF_ID: number = 4294967292  // u32::MAX - 3
+const STR_I64_DEF_ID: number = 4294967291  // u32::MAX - 4
+
+// ─── Keyword lookup table ───
+// Maps a keyword string to its TokenKind for the lexer.
+
+struct KeywordEntry:
+    text: text
+    kind: TokenKind
+
+fn keyword_table() -> List<KeywordEntry>:
+    give [
+        KeywordEntry: text: "fn",      kind: fn_kw
+        KeywordEntry: text: "let",     kind: let_kw
+        KeywordEntry: text: "mut",     kind: mut_kw
+        KeywordEntry: text: "if",      kind: if_kw
+        KeywordEntry: text: "elif",    kind: elif_kw
+        KeywordEntry: text: "else",    kind: else_kw
+        KeywordEntry: text: "for",     kind: for_kw
+        KeywordEntry: text: "while",   kind: while_kw
+        KeywordEntry: text: "in",      kind: in_kw
+        KeywordEntry: text: "return",  kind: return_kw
+        KeywordEntry: text: "i64",     kind: i64_kw
+        KeywordEntry: text: "f64",     kind: f64_kw
+        KeywordEntry: text: "bool",    kind: bool_kw
+        KeywordEntry: text: "str",     kind: str_kw
+        KeywordEntry: text: "unit",    kind: unit_kw
+        KeywordEntry: text: "true",    kind: true_kw
+        KeywordEntry: text: "false",   kind: false_kw
+        KeywordEntry: text: "println", kind: println_kw
+        KeywordEntry: text: "struct",  kind: struct_kw
+        KeywordEntry: text: "enum",    kind: enum_kw
+        KeywordEntry: text: "mod",     kind: mod_kw
+        KeywordEntry: text: "use",     kind: use_kw
+        KeywordEntry: text: "pub",     kind: pub_kw
+        KeywordEntry: text: "as",      kind: as_kw
+        KeywordEntry: text: "module",  kind: module_kw
+        KeywordEntry: text: "give",    kind: give_kw
+        KeywordEntry: text: "say",     kind: say_kw
+        KeywordEntry: text: "raise",   kind: raise_kw
+        KeywordEntry: text: "text",    kind: text_kw
+        KeywordEntry: text: "number",  kind: number_kw
+        KeywordEntry: text: "external", kind: external_kw
+    ]
+
+// ─── Keyword lookup ───
+fn lookup_keyword(text: text) -> TokenKind:
+    let table = keyword_table()
+    for entry in table:
+        if entry.text == text:
+            give entry.kind
+    give TokenKind::ident

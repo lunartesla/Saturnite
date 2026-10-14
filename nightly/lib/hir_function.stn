@@ -1,0 +1,240 @@
+module hir_function
+
+// =============================================================================
+// HIR Functions, Structs, Enums, and the top-level program
+// =============================================================================
+//
+// One-to-one Saturnite port of crates/stnx/src/hir/function.rs
+//
+// Saturnite has no `impl` blocks or `Option<T>`. Methods become free functions
+// with the struct as the first parameter. Optional lookups return the value
+// directly, with callers checking existence via a `found` flag pattern or
+// by comparing against a sentinel.
+
+// Imports: use module_name — reference types as module_name::Type
+// (Saturnite does not support Rust-style {a, b, c} imports)
+
+// ─── HirFunction ───
+struct HirFunction:
+    def_id: DefId
+    name: SymbolId
+    generic_params: List<SymbolId>
+    params: List<FunctionParam>
+    return_type: HirType
+    body: List<HirStmt>
+    span: SourceSpan
+    module: ModuleId
+    visibility: Visibility
+
+struct FunctionParam:
+    name: SymbolId
+    ty: HirType
+
+// ─── StructDef ───
+struct StructDef:
+    def_id: DefId
+    name: SymbolId
+    generic_params: List<SymbolId>
+    fields: List<StructFieldDef>
+    span: SourceSpan
+    module: ModuleId
+    visibility: Visibility
+
+// ─── EnumDef ───
+// Each variant is represented as an i64 tag at the LLVM level.
+struct EnumDef:
+    def_id: DefId
+    name: SymbolId
+    generic_params: List<SymbolId>
+    variants: List<SymbolId>
+    span: SourceSpan
+    module: ModuleId
+    visibility: Visibility
+
+// ─── HirUseDecl ───
+// HIR representation of `use foo::bar`.
+struct HirUseDecl:
+    def_id: DefId
+    path: List<SymbolId>
+    alias: SymbolId
+    module: ModuleId
+    visibility: Visibility
+    ecosystem: ExternalKind
+    ecosystem_set: bool
+    span: SourceSpan
+
+// ─── HirModDecl ───
+// HIR representation of `mod foo;`.
+struct HirModDecl:
+    def_id: DefId
+    name: SymbolId
+    child_module: ModuleId
+    child_module_set: bool
+    module: ModuleId
+    visibility: Visibility
+    span: SourceSpan
+
+// ─── HirExternalFunction ───
+// A lowered `external` declaration: an explicit foreign function call
+// across an interoperability boundary.
+struct HirExternalFunction:
+    def_id: DefId
+    kind: ExternalKind
+    ecosystem: text
+    symbol: text
+    name: SymbolId
+    param_names: List<SymbolId>
+    param_types: List<HirType>
+    return_type: HirType
+    span: SourceSpan
+    module: ModuleId
+
+// ─── Module metadata ───
+struct ModuleInfo:
+    id: ModuleId
+    path: List<SymbolId>
+    name: text
+    parent: ModuleId
+    parent_set: bool
+    source_file: text
+    source_file_set: bool
+
+struct ModuleScope:
+    name_to_def: List<NameBinding>
+
+struct NameBinding:
+    name: SymbolId
+    def_id: DefId
+
+struct DefToModule:
+    def_id: DefId
+    module: ModuleId
+
+// ─── DefTable ───
+struct DefTable:
+    entries: List<DefEntry>
+
+struct DefEntry:
+    module: ModuleId
+    local_index: number
+    kind: DefKind
+
+enum DefKind:
+    function
+    struct_def
+    enum_def
+    module_decl
+    use_decl
+    external
+
+// ─── HirProgram ───
+// The top-level HIR program.
+struct HirProgram:
+    functions: List<HirFunction>
+    structs: List<StructDef>
+    enums: List<EnumDef>
+    symbols: SymbolInterner
+    external_functions: List<HirExternalFunction>
+    modules: List<ModuleInfo>
+    root_module: ModuleId
+    module_paths: List<DefToModule>
+    module_scopes: List<ModuleScope>
+    use_decls: List<HirUseDecl>
+    mod_decls: List<HirModDecl>
+    def_table: DefTable
+
+// ─── Program accessors ───
+// (free functions, since Saturnite has no impl blocks)
+
+fn function(program: HirProgram, id: DefId) -> HirFunction:
+    if id.id < program.functions.length:
+        give program.functions[id.id]
+    // Return a sentinel/empty function if not found
+    give HirFunction:
+        def_id: NO_DEF
+        name: NO_SYMBOL
+        generic_params: []
+        params: []
+        return_type: HirType: kind: TypeKind::unit
+        body: []
+        span: SourceSpan: start: 0, end: 0
+        module: ROOT_MODULE
+        visibility: Visibility::private
+
+fn symbol_name(program: HirProgram, id: SymbolId) -> text:
+    give interner_lookup(program.symbols, id)
+
+fn function_by_name(program: HirProgram, name: text) -> HirFunction:
+    for func in program.functions:
+        if interner_lookup(program.symbols, func.name) == name:
+            give func
+    give function_not_found()
+
+fn struct_by_name(program: HirProgram, name: text) -> StructDef:
+    for s in program.structs:
+        if interner_lookup(program.symbols, s.name) == name:
+            give s
+    give struct_not_found()
+
+fn enum_by_name(program: HirProgram, name: text) -> EnumDef:
+    for e in program.enums:
+        if interner_lookup(program.symbols, e.name) == name:
+            give e
+    give enum_not_found()
+
+fn struct_def(program: HirProgram, sym: SymbolId) -> StructDef:
+    for s in program.structs:
+        if s.name == sym:
+            give s
+    give struct_not_found()
+
+fn enum_def(program: HirProgram, sym: SymbolId) -> EnumDef:
+    for e in program.enums:
+        if e.name == sym:
+            give e
+    give enum_not_found()
+
+// ─── Sentinel return values ───
+fn function_not_found() -> HirFunction:
+    give HirFunction:
+        def_id: NO_DEF
+        name: NO_SYMBOL
+        generic_params: []
+        params: []
+        return_type: HirType: kind: TypeKind::unit
+        body: []
+        span: SourceSpan: start: 0, end: 0
+        module: ROOT_MODULE
+        visibility: Visibility::private
+
+fn struct_not_found() -> StructDef:
+    give StructDef:
+        def_id: NO_DEF
+        name: NO_SYMBOL
+        generic_params: []
+        fields: []
+        span: SourceSpan: start: 0, end: 0
+        module: ROOT_MODULE
+        visibility: Visibility::private
+
+fn enum_not_found() -> EnumDef:
+    give EnumDef:
+        def_id: NO_DEF
+        name: NO_SYMBOL
+        generic_params: []
+        variants: []
+        span: SourceSpan: start: 0, end: 0
+        module: ROOT_MODULE
+        visibility: Visibility::private
+
+// Re-export SymbolInterner methods (free functions)
+fn interner_new() -> SymbolInterner:
+    // Delegate to hir_symbol
+    use hir_symbol
+    give hir_symbol::interner_new()
+
+fn interner_lookup(interner: SymbolInterner, id: SymbolId) -> text:
+    use hir_symbol
+    give hir_symbol::interner_lookup(interner, id)
+
+const ROOT_MODULE: ModuleId = ModuleId: id = 0

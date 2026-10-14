@@ -1,0 +1,309 @@
+module ast
+
+// =============================================================================
+// AST — Abstract Syntax Tree
+// =============================================================================
+//
+// Saturnite enums are C-style (tag-only, represented as i64 at LLVM level).
+// Complex ADTs like Expr and Stmt use a "flat struct + tag" representation
+// with arena-based child references (indices into a List<Expr> arena).
+// This mirrors how the Rust compiler's AST uses Box<Expr> but adapted to
+// Saturnite's value-type semantics.
+//
+// ─── Type system ───
+//
+// Native Saturnite types map to compiler-internal types:
+// number -> i64   text -> str   bool -> bool   f64 -> f64   unit -> ()
+
+enum Type:
+    i64
+    f64
+    bool
+    str
+    unit
+    struct_type
+    enum_type
+    list
+
+// ─── Operators ───
+
+enum BinOp:
+    add
+    sub
+    mul
+    div
+    mod
+    eq
+    ne
+    lt
+    gt
+    le
+    ge
+    and
+    or
+
+enum UnOp:
+    neg
+    not
+
+enum AugOp:
+    add
+    sub
+    mul
+    div
+
+// ─── Source span ───
+
+struct SourceSpan:
+    start: number
+    end: number
+
+// ─── Visibility ───
+
+enum Visibility:
+    private
+    public
+
+// ─── External interop kinds ───
+
+enum ExternalKind:
+    rust
+    python
+    native
+
+// ─── Expression kinds (discriminants for the Expr struct) ───
+
+enum ExprKind:
+    integer       // literal integer
+    float         // literal float
+    bool_lit      // literal boolean
+    str_lit       // string literal
+    unit_val      // unit expression
+    var           // variable reference
+    assign        // assignment to mutable variable
+    aug_assign    // augmented assignment (+=, -=, etc.)
+    binary        // binary operation
+    unary         // unary operation
+    call          // function call
+    if_expr       // if/elif/else
+    for_expr      // for loop
+    while_expr    // while loop
+    range_expr    // range literal (a..b or a...b)
+    struct_literal // struct construction
+    field_access  // p.x
+    index         // list[i]
+    length        // list.length
+    enum_constructor // Color::Red
+    pipeline      // a |> f(x)
+    closure       // x -> body
+    list_literal  // [1, 2, 3]
+    interpolated  // "hello {name}"
+
+// ─── AST Expression (flat struct with tag + all possible fields) ───
+// Child expressions are referenced by index into an ExprArena.
+
+struct Expr:
+    kind: ExprKind
+    // integer
+    int_val: number
+    // float
+    float_val: f64
+    // bool_lit
+    bool_val: bool
+    // str_lit
+    str_val: text
+    // var
+    var_name: text
+    // assign / aug_assign
+    assign_target: text
+    assign_value_idx: number   // index into arena
+    aug_op: AugOp
+    // binary / unary
+    bin_op: BinOp
+    un_op: UnOp
+    lhs_idx: number    // index into arena
+    rhs_idx: number    // index into arena
+    // call
+    call_func: text
+    call_args: List<number>     // indices into arena
+    call_named_args: List<NamedArg>
+    call_type_args: List<Type>
+    // if/elif/else
+    if_cond_idx: number
+    if_then: List<Stmt>
+    if_elif: List<ElifBranch>
+    if_else: List<Stmt>
+    // for
+    for_var: text
+    for_iter_idx: number
+    for_body: List<Stmt>
+    // while
+    while_cond_idx: number
+    while_body: List<Stmt>
+    // range
+    range_start_idx: number
+    range_end_idx: number
+    range_inclusive: bool
+    // struct literal
+    struct_name: text
+    struct_fields: List<FieldInit>
+    struct_type_args: List<Type>
+    // field access
+    field_access_expr_idx: number
+    field_name: text
+    // index
+    index_list_idx: number
+    index_idx: number
+    // length
+    length_expr_idx: number
+    // enum constructor
+    enum_name: text
+    enum_variant: text
+    // pipeline
+    pipeline_lhs_idx: number
+    pipeline_rhs_idx: number
+    // closure
+    closure_params: List<ClosureParam>
+    closure_body_idx: number
+    // list literal
+    list_items: List<number>
+    // interpolated string
+    interp_parts: List<StrPart>
+    // span (always present)
+    span: SourceSpan
+
+struct ExprArena:
+    items: List<Expr>
+
+// ─── Named argument ───
+
+struct NamedArg:
+    name: text
+    value_idx: number
+
+// ─── Elif branch ───
+
+struct ElifBranch:
+    condition_idx: number
+    body: List<Stmt>
+
+// ─── Closure parameter ───
+
+struct ClosureParam:
+    name: text
+    ty: Type
+
+// ─── String interpolation part ───
+
+enum StrPartKind:
+    literal
+    expr
+
+struct StrPart:
+    kind: StrPartKind
+    text_val: text       // for literal
+    expr_idx: number     // for expr, index into arena
+
+// ─── Field initializer ───
+
+struct FieldInit:
+    name: text
+    value_idx: number
+
+// ─── Statements ───
+
+enum StmtKind:
+    let_stmt
+    expr_stmt
+    return_stmt
+    println_stmt
+    say_stmt
+    raise_stmt
+    give_stmt
+    struct_def
+    enum_def
+
+struct Stmt:
+    kind: StmtKind
+    // let
+    let_name: text
+    let_mutable: bool
+    let_ty: Type
+    let_value_idx: number
+    // expr / return / give (value is an expression index)
+    value_idx: number
+    has_value: bool
+    // println / say / raise
+    print_expr_idx: number
+    // struct def
+    struct_def_name: text
+    struct_generic_params: List<text>
+    struct_fields: List<FieldDef>
+    // enum def
+    enum_def_name: text
+    enum_generic_params: List<text>
+    enum_variants: List<text>
+    // span
+    span: SourceSpan
+
+struct FieldDef:
+    name: text
+    ty: Type
+
+// ─── Items (top-level) ───
+
+enum ItemKind:
+    function
+    struct_def
+    enum_def
+    mod_decl
+    use_decl
+    module_decl
+    main_block
+    external_function
+
+struct Item:
+    name: text
+    visibility: Visibility
+    kind: ItemKind
+    // function
+    func_name: text
+    func_generic_params: List<text>
+    func_params: List<FieldDef>
+    func_return_type: Type
+    func_body: List<Stmt>
+    // struct def
+    item_struct_name: text
+    item_struct_generic_params: List<text>
+    item_struct_fields: List<FieldDef>
+    // enum def
+    item_enum_name: text
+    item_enum_generic_params: List<text>
+    item_enum_variants: List<text>
+    // use decl
+    use_path: List<text>
+    use_alias: text
+    use_alias_set: bool
+    use_ecosystem: ExternalKind
+    use_ecosystem_set: bool
+    // main block
+    main_stmts: List<Stmt>
+    // external function
+    ext_kind: ExternalKind
+    ext_ecosystem: text
+    ext_symbol: text
+    ext_params: List<FieldDef>
+    ext_return_type: Type
+    span: SourceSpan
+
+struct Function:
+    name: text
+    generic_params: List<text>
+    params: List<FieldDef>
+    return_type: Type
+    body: List<Stmt>
+    span: SourceSpan
+
+struct Program:
+    items: List<Item>
+    functions: List<Function>

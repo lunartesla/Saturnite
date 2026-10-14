@@ -1,0 +1,325 @@
+module lexer
+
+// =============================================================================
+// Lexer — token preparation and desugaring for 0.5 native syntax
+// =============================================================================
+//
+// One-to-one Saturnite port of:
+//   crates/stnx/src/lexer/mod.rs (Lexer, LexicalToken, convert)
+//   crates/stnx/src/lexer/token.rs (Token, TokenKind)
+//   crates/stnx/src/lexer/indent.rs (indent pre-pass)
+//   crates/stnx/src/lexer/prepare.rs (prepare entry point, desugar_blocks)
+//
+// Pipeline: source text -> Lexer (logos) -> indent::run -> desugar_blocks -> tokens
+// The parser only receives the final token stream from prepare().
+
+// ─── Token (flat struct — Saturnite enums are tag-only) ───
+struct Token:
+    kind: TokenKind
+    // payload fields (only valid for specific kinds):
+    ident_val: text
+    int_val: number
+    float_val: f64
+    str_val: text
+    span_start: number
+    span_end: number
+
+// Note: TokenKind is defined in tokens.stn — see that file for the full
+// enum. Here we use it via the shared type system.
+
+// ─── OpenBlock (for desugar pass) ───
+struct OpenBlock:
+    field_mode: bool
+    body_depth: number
+
+// ─── Prepare entry point ───
+// Lex, run the indent pre-pass, and desugar native colon-blocks into
+// brace blocks. This is the token entry point used by the compile pipeline.
+// In Saturnite, we use an external bridge to logos for the raw lexing,
+// then implement the indent and desugar passes natively.
+
+external native "libsaturnite_runtime" "sat_lexer_lex"(src: text) -> List<Token>
+
+fn prepare(src: text) -> List<Token>:
+    // Step 1: Lex the source using the external logos bridge
+    let raw = sat_lexer_lex(src)
+
+    // Step 2: Run the indent pre-pass
+    let indented = indent_run(src, raw)
+
+    // Step 3: Desugar colon-blocks into brace blocks
+    // (consumes Indent/Dedent/Newline tokens, emits LBrace/RBrace)
+    let result = desugar_blocks(src, indented)
+    give result
+
+// ─── Indent pre-pass ───
+// Consumes the raw token Vec and produces a new Vec<Token> with synthetic
+// Indent/Dedent/Newline tokens inserted based on indentation level.
+
+fn indent_run(src: text, raw: List<Token>) -> List<Token>:
+    // Initialize
+    let mut out: List<Token> = []
+    let mut indent_stack: List<number> = [0]   // starts with indent level 0
+    let mut cursor = 0  // byte offset of end of last processed token
+
+    // For each token in raw:
+    for tok in raw:
+        // Compute the line start of this token
+        let span_start = tok.span_start
+        let line_start = find_line_start(src, span_start)
+
+        // Determine if a NEWLINE was crossed between cursor and line_start
+        let crossed_newline = cursor <= line_start
+
+        if crossed_newline:
+            // Process intermediate newlines and blank lines
+            let mut walk = cursor
+            while walk < line_start:
+                let nl_pos = src.find_char(walk, '\n')
+                if nl_pos < 0 or nl_pos >= line_start:
+                    break  // no more newlines before the token
+                let line_content = src[walk .. nl_pos]
+                if not is_blank_or_comment_line(line_content):
+                    let indent = compute_indent(line_content)
+                    out = apply_indent(indent, indent_stack, out, src)
+                // Emit a Newline token (zero-width)
+                out = emit_newline(out, nl_pos)
+                walk = nl_pos + 1
+
+            // Handle the current token's own line
+            let line_prefix = src[line_start .. span_start]
+            let indent = compute_indent(line_prefix)
+            out = apply_indent(indent, indent_stack, out, src)
+
+        // Push the actual token
+        out = out + [tok]
+        cursor = tok.span_end
+
+    // After all tokens: close all open blocks
+    while indent_stack.length > 1:
+        out = emit_dedent(out, cursor)
+        indent_stack = indent_stack[..indent_stack.length - 1]
+    // Final newline
+    out = emit_newline(out, cursor)
+
+    give out
+
+// ─── Indent helper functions ───
+
+fn find_line_start(src: text, offset: number) -> number:
+    // Find the byte offset immediately after the last '\n' before offset
+    if offset == 0:
+        give 0
+    let nl = src.rfind_char(offset - 1, '\n')  // search backwards from offset-1
+    if nl >= 0:
+        give nl + 1
+    give 0
+
+fn is_blank_or_comment_line(line: text) -> bool:
+    let trimmed = line.trim_start()
+    if trimmed.length == 0:
+        give true
+    if trimmed starts_with "//":
+        give true
+    give false
+
+fn compute_indent(prefix: text) -> number:
+    // Count leading spaces and tabs
+    let count = 0
+    for ch in prefix:
+        if ch == ' ' or ch == '\t':
+            count += 1
+        else:
+            break
+    give count
+
+fn apply_indent(indent: number, indent_stack: List<number>, out: List<Token>, src: text) -> boolean:
+    // Returns true if an error occurred
+    let top = indent_stack[indent_stack.length - 1]
+    if indent > top:
+        indent_stack = indent_stack + [indent]
+        emit_indent(out, 0)
+        give false
+    elif indent < top:
+        // Pop entries until top <= indent
+        while indent_stack.length > 1 and indent_stack[indent_stack.length - 1] > indent:
+            emit_dedent(out, 0)
+            indent_stack = indent_stack[..indent_stack.length - 1]
+        // Check for mismatch
+        if indent_stack[indent_stack.length - 1] != indent:
+            // Mismatched indentation — record error and push to recover
+            give true   // error flag
+            indent_stack = indent_stack + [indent]
+        give false
+    give false
+
+fn emit_indent(out: List<Token>, pos: number) -> List<Token>:
+    out = out + [Token:
+        kind: TokenKind::indent
+        span_start: pos
+        span_end: pos]
+    give out
+
+fn emit_dedent(out: List<Token>, pos: number) -> List<Token>:
+    out = out + [Token:
+        kind: TokenKind::dedent
+        span_start: pos
+        span_end: pos]
+    give out
+
+fn emit_newline(out: List<Token>, pos: number) -> List<Token>:
+    out = out + [Token:
+        kind: TokenKind::newline
+        span_start: pos
+        span_end: pos]
+    give out
+
+// ─── Desugar blocks ───
+// Rewrite the token stream: colon-blocks become braces, synthetic
+// Newline/Indent/Dedent tokens are consumed, and struct/enum field
+// lines get separators.
+
+fn desugar_blocks(src: text, tokens: List<Token>) -> List<Token>:
+    let mut out: List<Token> = []
+    let mut open: List<OpenBlock> = []
+    let mut depth = 0
+    let awaiting_body: OpenBlock = OpenBlock: field_mode: false, body_depth: 0
+    let mut awaiting_body_set = false
+    let mut last_kw = 0  // 0 = none, use token kind IDs for keywords
+    let eof_span_start = src.length.saturating_sub(1)
+    let eof_span_end = src.length
+
+    for i in 0 .. tokens.length:
+        let tok = tokens[i]
+        if tok.kind == TokenKind::newline:
+            if awaiting_body_set:
+                // Colon followed by Newline: body starts on next line
+                pass  // just consume the newline
+            elif open.length > 0:
+                let inner = open[open.length - 1]
+                if inner.field_mode:
+                    if not block_closes_after(tokens, i, inner.body_depth, depth):
+                        out = out + [Token:
+                            kind: TokenKind::comma
+                            span_start: tok.span_start
+                            span_end: tok.span_end]
+                // Top-level and statement-mode newlines are dropped
+            last_kw = 0
+        elif tok.kind == TokenKind::indent:
+            if awaiting_body_set:
+                open = open + [awaiting_body]
+                awaiting_body_set = false
+            depth += 1
+            last_kw = 0
+        elif tok.kind == TokenKind::dedent:
+            if awaiting_body_set:
+                // Error: expected indented block after ':'
+                // In Saturnite, we raise an error
+                raise "expected an indented block after ':'"
+            depth = max(0, depth - 1)
+            // Close blocks whose body_depth exceeds the new depth
+            while open.length > 0:
+                let inner = open[open.length - 1]
+                if depth < inner.body_depth:
+                    open = open[..open.length - 1]
+                    out = out + [Token:
+                        kind: TokenKind::rbrace
+                        span_start: tok.span_start
+                        span_end: tok.span_end]
+                else:
+                    break
+            last_kw = 0
+        elif tok.kind == TokenKind::colon:
+            // Check if this is a block-opening colon (followed by Newline)
+            let next_is_newline = false
+            if i + 1 < tokens.length:
+                if tokens[i + 1].kind == TokenKind::newline:
+                    next_is_newline = true
+
+            if next_is_newline:
+                // Determine field mode
+                let is_struct_or_enum = last_kw == TokenKind::struct_kw or last_kw == TokenKind::enum_kw
+
+                // Check for `main:` shorthand
+                let prev_is_main = false
+                if open.length == 0 and not is_struct_or_enum and out.length > 0:
+                    let last = out[out.length - 1]
+                    if last.kind == TokenKind::ident and last.ident_val == "main":
+                        prev_is_main = true
+
+                // Check for struct literal construction (bare Ident: at any depth)
+                let prev_is_struct_lit = false
+                if not is_struct_or_enum and not prev_is_main and out.length > 0:
+                    let last = out[out.length - 1]
+                    if last.kind == TokenKind::ident:
+                        prev_is_struct_lit = true
+
+                let field_mode = is_struct_or_enum or prev_is_struct_lit
+
+                if prev_is_main:
+                    // Replace the bare `main` identifier with legacy function header
+                    out = out[..out.length - 1]  // pop "main"
+                    out = out + [
+                        Token: kind: TokenKind::fn_kw, span_start: tok.span_start, span_end: tok.span_end
+                        Token: kind: TokenKind::ident, ident_val: "main", span_start: tok.span_start, span_end: tok.span_end
+                        Token: kind: TokenKind::lparen, span_start: tok.span_start, span_end: tok.span_end
+                        Token: kind: TokenKind::rparen, span_start: tok.span_start, span_end: tok.span_end
+                        Token: kind: TokenKind::r_arrow, span_start: tok.span_start, span_end: tok.span_end
+                        Token: kind: TokenKind::i64_kw, span_start: tok.span_start, span_end: tok.span_end
+                    ]
+
+                // Emit the opening brace
+                out = out + [Token:
+                    kind: TokenKind::lbrace
+                    span_start: tok.span_start
+                    span_end: tok.span_end]
+
+                // Set awaiting_body
+                awaiting_body = OpenBlock: field_mode: field_mode, body_depth: depth + 1
+                awaiting_body_set = true
+            else:
+                // Type annotation colon — emit as-is
+                out = out + [tok]
+            last_kw = 0
+        else:
+            // Regular token — track last keyword and emit
+            if tok.kind in [TokenKind::ident, TokenKind::comma, TokenKind::lt, TokenKind::gt]:
+                // sticky — preserve last_kw
+                pass
+            elif tok.kind in [TokenKind::fn_kw, TokenKind::struct_kw, TokenKind::enum_kw,
+                              TokenKind::if_kw, TokenKind::elif_kw, TokenKind::else_kw,
+                              TokenKind::for_kw, TokenKind::while_kw, TokenKind::let_kw,
+                              TokenKind::return_kw, TokenKind::give_kw, TokenKind::say_kw,
+                              TokenKind::raise_kw, TokenKind::mod_kw, TokenKind::module_kw,
+                              TokenKind::use_kw, TokenKind::pub_kw, TokenKind::println_kw]:
+                last_kw = tok.kind
+            else:
+                last_kw = 0
+            out = out + [tok]
+
+    // Error checks
+    if awaiting_body_set:
+        raise "expected an indented block after ':'"
+    if open.length > 0:
+        raise "unclosed indented block: expected the block body to end before EOF"
+
+    give out
+
+// ─── Block close lookahead ───
+// Check if Dedents following a newline at index `idx` close the block
+// whose body is at body_depth.
+fn block_closes_after(tokens: List<Token>, idx: number, body_depth: number, depth: number) -> boolean:
+    let mut d = depth
+    for t in tokens[idx + 1 ..]:
+        if t.kind == TokenKind::dedent:
+            d = max(0, d - 1)
+            if d < body_depth:
+                give true
+        elif t.kind == TokenKind::indent:
+            d += 1
+        elif t.kind == TokenKind::newline:
+            pass  // continue
+        else:
+            give false
+    // EOF
+    give d < body_depth

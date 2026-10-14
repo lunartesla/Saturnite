@@ -1,0 +1,117 @@
+module interop
+
+// =============================================================================
+// Interoperability — declarative foreign function call contract
+// =============================================================================
+//
+// One-to-one Saturnite port of crates/stnx/src/interop.rs
+//
+// The external-call contract is declarative: it records what the compiler
+// knows at compile time (symbol, parameter types, return type, ABI, target
+// restriction). It does NOT attempt to understand arbitrary foreign source.
+//
+// Rust and Python remain separate bridges (per campaign rules); `Native` is the
+// path for plain C-ABI shared libraries.
+
+// ─── DependencyKind ───
+// Dependency source / ecosystem. This is the authoritative distinction
+// required by Phase 9: Rust and Python must not be collapsed into a vague
+// "foreign library" mechanism.
+
+enum DependencyKind:
+    saturnite    // A Saturnite package / native dependency
+    rust         // A Rust crate dependency (wrapper/ABI boundary required)
+    python       // A Python package dependency (runtime/API boundary required)
+    native       // A native/C ABI library dependency
+
+// ─── DependencyEntry ───
+// A dependency entry in saturn.toml with explicit kind metadata.
+
+struct DependencyEntry:
+    kind: DependencyKind
+    version: text
+    target: text
+    target_set: bool   // whether `target` was specified
+
+// ─── ExternalFunctionKind ───
+// The runtime that services an external call. This is a compile-time
+// classification. It records which bridge is responsible for the call at
+// runtime; it does NOT decide the bridge at runtime.
+
+enum ExternalFunctionKind:
+    rust      // Rust crate function via #[no_mangle] extern "C" wrapper
+    python    // Python module function via interpreter bridge
+    native    // Native C-ABI symbol via shared library
+
+// ─── HirTypeRef ───
+// A compiler-internal type reference used in the external-call contract.
+// This is an intentionally restricted, ABI-safe subset. It mirrors the
+// Saturnite primitive types so the type checker can validate external calls
+// against normal Saturnite types without a parallel type system.
+
+enum HirTypeRefKind:
+    i8
+    i16
+    i32
+    i64
+    u8
+    u16
+    u32
+    u64
+    f32
+    f64
+    bool
+    cstr       // C-compatible NUL-terminated string pointer
+    pointer    // Opaque pointer (explicitly declared; not an escape hatch)
+
+struct HirTypeRef:
+    kind: HirTypeRefKind
+
+// ─── ExternalFunctionDecl ───
+// The compiler's authoritative record of an external function call.
+// Produced from explicit declaration metadata (never by parsing arbitrary
+// foreign source) and consumed by:
+// - the semantic/type-checking pass — to validate call-site argument/return types
+// - the MIR/codegen backend — to emit the correct LLVM declaration and call
+// - the runtime bridge — to locate and invoke the foreign symbol
+
+struct ExternalFunctionDecl:
+    kind: ExternalFunctionKind
+    ecosystem: text    // crate name, module name, or library name
+    symbol: text       // the foreign symbol to bind to
+    params: List<HirTypeRef>  // ABI-safe parameter types
+    ret: HirTypeRef    // ABI-safe return type
+    target: text       // optional target restriction (e.g. "linux")
+    target_set: bool   // whether target was specified
+
+// ─── ExternalBinding ───
+// A resolved external binding: the compile-time declaration paired with the
+// concrete runtime artifact it resolved to.
+
+struct ExternalBinding:
+    decl: ExternalFunctionDecl
+    artifact: text     // path to the artifact (empty for Python)
+
+// ─── to_saturnite conversion ───
+// Convert a HirTypeRef to its Saturnite HirType equivalent, if the external
+// type has a direct Saturnite representation.
+// Returns HirType with kind=unit as a sentinel (NONE) for CStr and Pointer,
+// which have no direct Saturnite primitive.
+
+fn to_saturnite(ty: HirTypeRef) -> HirType:
+    if ty.kind == HirTypeRefKind::i8 or ty.kind == HirTypeRefKind::i16 or ty.kind == HirTypeRefKind::i32 or ty.kind == HirTypeRefKind::i64:
+        give HirType: kind: TypeKind::i64
+    elif ty.kind == HirTypeRefKind::u8 or ty.kind == HirTypeRefKind::u16 or ty.kind == HirTypeRefKind::u32 or ty.kind == HirTypeRefKind::u64:
+        give HirType: kind: TypeKind::i64
+    elif ty.kind == HirTypeRefKind::f32 or ty.kind == HirTypeRefKind::f64:
+        give HirType: kind: TypeKind::f64
+    elif ty.kind == HirTypeRefKind::bool:
+        give HirType: kind: TypeKind::bool
+    elif ty.kind == HirTypeRefKind::i64:
+        give HirType: kind: TypeKind::i64
+    elif ty.kind == HirTypeRefKind::str:
+        give HirType: kind: TypeKind::str
+    else:
+        // CStr and Pointer have no direct Saturnite representation.
+        // Return unit as a sentinel (NONE-like). Callers must check.
+        give HirType: kind: TypeKind::unit

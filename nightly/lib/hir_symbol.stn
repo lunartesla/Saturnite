@@ -1,0 +1,139 @@
+module hir_symbol
+
+// =============================================================================
+// HIR Symbol Table — string interning and definition IDs
+// =============================================================================
+//
+// One-to-one Saturnite port of crates/stnx/src/hir/symbol.rs
+//
+// Replaces string-based name resolution with stable numeric identifiers.
+// Every identifier, function name, and string literal is interned once and
+// referred to by a SymbolId. Top-level definitions get a DefId.
+//
+// NOTE: Saturnite has no `impl` blocks or `Option<T>`. Methods become free
+// functions with the struct as the first parameter. Optional values use
+// sentinel IDs (e.g., SymbolId(0xFFFFFFFF) = "not found").
+
+// ─── SymbolId ───
+// Stable identifier for an interned string (variable name, function name,
+// string literal, etc.). Cheap to copy, hash, and compare.
+
+struct SymbolId:
+    id: number
+
+const NO_SYMBOL: SymbolId = SymbolId: id: 4294967295  // u32::MAX sentinel
+
+// ─── DefId ───
+// Stable identifier for a top-level definition (function, struct, enum,
+// external function). Assigned during HIR lowering.
+
+struct DefId:
+    id: number
+
+const NO_DEF: DefId = DefId: id = 4294967295  // u32::MAX sentinel
+
+// ─── DefKind ───
+// What kind of definition a DefId refers to.
+enum DefKind:
+    function
+    struct_def
+    enum_def
+    module       // module declaration (mod foo;)
+    use_decl     // import declaration (use foo::bar)
+    external     // external function (FFI)
+
+struct DefEntry:
+    module: ModuleId
+    local_index: number
+    kind: DefKind
+
+// ─── SymbolInterner ───
+// A simple, allocation-efficient string interner.
+// Strings are stored once; intern() returns a SymbolId.
+
+struct SymbolInterner:
+    strings: List<text>
+    indices: List<SymbolIndexEntry>
+
+struct SymbolIndexEntry:
+    text: text
+    id: SymbolId
+
+// ─── SymbolInterner operations (free functions) ───
+
+fn interner_new() -> SymbolInterner:
+    give SymbolInterner:
+        strings: []
+        indices: []
+
+// Intern a string, returning its SymbolId.
+// If already interned, the existing SymbolId is returned.
+fn interner_intern(interner: SymbolInterner, s: text) -> SymbolId:
+    for entry in interner.indices:
+        if entry.text == s:
+            give entry.id
+    // Not found — add it
+    let id = SymbolId: id = interner.strings.length
+    interner.strings = interner.strings + [s]
+    interner.indices = interner.indices + [SymbolIndexEntry: text: s, id: id]
+    give id
+
+// Look up the string for a SymbolId.
+// Returns empty string if the id was not produced by this interner.
+fn interner_lookup(interner: SymbolInterner, id: SymbolId) -> text:
+    if id.id < interner.strings.length:
+        give interner.strings[id.id]
+    give ""
+
+// Returns the next available SymbolId that would be assigned by intern().
+fn interner_next_id(interner: SymbolInterner) -> SymbolId:
+    give SymbolId: id = interner.strings.length
+
+// ─── DefTable ───
+// Maps every globally-unique DefId to its owning ModuleId, local index,
+// and DefKind. The DefId is the index at which the entry is stored.
+
+struct DefTable:
+    entries: List<DefEntry>
+
+fn deftable_new() -> DefTable:
+    give DefTable:
+        entries: []
+
+fn deftable_register(table: DefTable, entry: DefEntry) -> DefId:
+    let id = DefId: id = table.entries.length
+    table.entries = table.entries + [entry]
+    give id
+
+fn deftable_lookup(table: DefTable, id: DefId) -> DefEntry:
+    if id.id < table.entries.length:
+        give table.entries[id.id]
+    // Fallback entry if not found
+    give DefEntry:
+        module: ModuleId: id: 0
+        local_index: 0
+        kind: DefKind::function
+
+fn deftable_len(table: DefTable) -> number:
+    give table.entries.length
+
+fn deftable_is_empty(table: DefTable) -> bool:
+    give table.entries.length == 0
+
+// ─── Visibility ───
+// Mirrors the AST Visibility enum but lives in HIR so later stages
+// can make access decisions without re-parsing.
+enum Visibility:
+    private
+    public
+
+// ─── ModuleId ───
+// Defined here and referenced by DefTable/Entry. ModuleId is a separate
+// u32 space from DefId.
+struct ModuleId:
+    id: number
+
+const ROOT_MODULE: ModuleId = ModuleId: id = 0
+
+fn module_id_new(id: number) -> ModuleId:
+    give ModuleId: id = id

@@ -1,0 +1,40 @@
+module semantic
+
+// =============================================================================
+// Semantic Analysis — driver module
+// =============================================================================
+//
+// One-to-one Saturnite port of crates/stnx/src/semantic.rs
+//
+// Semantic analysis entry point. In Saturnite 0.3, this delegates to the
+// HIR lowering pass, which performs name resolution, type checking, and
+// mutability enforcement as a single unified pass that produces a typed
+// HirProgram.
+
+// ─── analyze ───
+// Pass/fail version for backward compatibility with 0.2 callers.
+
+fn analyze(program: Program) -> boolean:
+    // Delegates to HIR lowering
+    lower_unit(program)
+    give true
+
+// ─── analyze_and_lower ───
+// Preferred entry point for the 0.3 pipeline: lex -> parse -> lower -> codegen
+
+fn analyze_and_lower(program: Program) -> HirProgram:
+    lower(program)
+
+// ─── analyze_and_lower_with_graph ───
+// Phase 5B entry point for multi-module programs. Passes the supplied
+// ModuleGraph to HIR lowering, then runs the dedicated resolver pass.
+
+fn analyze_and_lower_with_graph(program: Program, graph: ModuleGraph) -> HirProgram:
+    let mut hir = lower_with_graph(program, graph)
+    resolve_modules(hir)
+    give hir
+
+// ─── re-exports ───
+// The HIR types are re-exported so callers can use either
+// `stnx::semantic::Hir*` or `stnx::hir::Hir*`.
+// In Saturnite, the module system handles this via `use hir`.

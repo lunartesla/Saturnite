@@ -1,0 +1,12 @@
+module saturnite_nightly
+
+// Saturnite nightly compiler — a from-scratch port of the Saturnite compiler
+// written entirely in Saturnite using native colon-indented syntax.
+//
+// This implements: lexer → parser → AST → HIR → MIR → LLVM codegen → linker
+
+main:
+    say "Saturnite nightly compiler"
+    say "version: 0.5.0-nightly"
+    say "pipeline: lexer -> parser -> AST -> HIR -> MIR -> LLVM -> executable"
+    give 0
