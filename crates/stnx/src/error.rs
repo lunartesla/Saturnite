@@ -156,3 +156,20 @@ impl From<miette::Report> for CompilerError {
 
 pub type TargetResult<T> = Result<T, TargetError>;
 pub type LinkResult<T> = Result<T, LinkError>;
+
+/// Errors produced during Rust wrapper crate build orchestration.
+#[derive(Error, Debug)]
+#[error("wrapper build error: {message}")]
+pub struct BuildError {
+    pub message: String,
+}
+
+impl BuildError {
+    pub fn wrapper_build(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+pub type BuildResult<T> = Result<T, BuildError>;

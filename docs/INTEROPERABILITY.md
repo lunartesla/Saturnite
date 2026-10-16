@@ -1,64 +1,141 @@
-# INTEROPERABILITY.md
+# Saturnite Interoperability Guide
 
-Status: IMPLEMENTED (full end-to-end Rust crate and Python library interoperability).
+This document describes the actual supported Rust and Python interoperability
+capabilities. The implementation has been verified end-to-end.
 
-## Implemented
+## Status
 
-### Rust Crate Interoperability (Stage A-B)
-- `DependencyKind` / `DependencyEntry` (explicit kind distinction)
-- Rust ABI subset (`AbiPrimitive`) — I8/I16/I32/I64/U8/U16/U32/U64/F32/F64/Bool/Pointer
-- `RustWrapperFunction` / `RustDependencyWrapper` descriptor
-- External function declaration syntax: `external rust "crate_name" "symbol_name"(params) -> ret`
-- Automatic linking of `lib<crate_name>.a` static libraries from:
-  - Output directory (`target/`)
-  - Current working directory
-  - `<cwd>/libs/<crate_name>/`
-  - `<cwd>/libs/`
-  - `/usr/local/lib/`
-  - `<dir>/<crate_name>/target/release/` (cargo build output)
-- Rust fixtures: `fixtures/rust/libsaturnite_interop.rs` (add_i64, multiply_i64) — builds to `libsaturnite_interop.a`
-- End-to-end verified: `sat_add_i64(20, 22)` returns 42 via direct LLVM call to Rust staticlib
+**Implemented:** Rust crate calls via auto-generated wrappers with Cargo-built
+static libraries, and Python module calls via the embedded CPython runtime.
 
-### Python Library Interoperability (Stage C-D)
-- Python conversion contract (`PythonConversion`) — Int↔Int, Float↔Float, Bool↔Bool, Str↔Str, ListI64↔PythonList, Unit↔None, Opaque
-- `PythonObjectHandle` opaque boundary design
-- Thin C shim: `runtime/pyrt.h` + `runtime/pyrt_impl.c` — no CPython source copied
-- Single-threaded embedded CPython interpreter (initialized once, lives for process lifetime)
-- Flat ABI: `sat_py_call_flat(spec, search_path, kinds[], values[], arg_count, out)`
-  - Spec format: `"module::function"` (split on first `::`)
-  - Parallel `int32_t kinds[]` / `int64_t values[]` arrays (f64 bit-cast to i64)
-  - Returns `sat_py_result` struct with union field for primitives or opaque handle
-- External function declaration syntax: `external python "module_name" "function_name"(params) -> ret`
-- Automatic linking of Python libraries (`-lpython3.13 -lpthread -ldl -lutil -lm`)
-- Python search path discovered via `python3-config` at link time
-- Python fixtures: `fixtures/python/test_math.py`
-- End-to-end verified: `test_math.add(20, 22)` returns 42 via embedded interpreter
+## Rust Crate Interoperability
 
-### Shared Infrastructure
-- Dependency model supports optional `target` restriction (`DependencyEntry::target`)
-- MIR carries `external_libraries` vector through monomorphization
-- Linker resolves and links declared external libraries automatically
-- Clear diagnostics for missing libraries (lists all searched paths)
-- `-no-pie` linking for compatibility with non-PIE runtime object
-- PIC codegen (`RelocMode::PIC`) for position-independent objects
+### Import syntax
 
-## Deferred
-- Full dependency resolver / package manager
-- Lockfile (`saturn.lock`)
-- Cache layer for wrapper artifacts
-- Multi-threaded Python integration
-- Cross-platform target verification beyond `target` string
-- Automated wrapper generation for arbitrary crates
+```saturnite
+use rust:crate_name
+```
 
-## Unsupported (explicit)
-- Arbitrary Rust ABI without wrapper
-- `Vec<T>`, `String`, `HashMap`, `Option<T>`, `Result<T,E>`, trait objects, closures, async, generics as direct ABI
-- Python syntax parsing / interpreter rewrite
-- Universal FFI framework
-- Dynamic Python object system that leaks into Saturnite static semantics
+Imports a Rust crate whose wrapper metadata is available under
+`target/saturnite/wrappers/<crate_name>_saturnite.json`.
 
-## Rust Source Policy
-No rustc source copied. No rustc internals vendored.
+### Calling functions
 
-## Python Source Policy
-No CPython source copied. No Python interpreter rewritten.
+Qualified call syntax — `crate.function(args)`:
+
+```saturnite
+use rust:example_crate
+
+fn main() -> i64:
+    give example_crate.add(20, 22)
+```
+
+### Wrapper metadata format
+
+```json
+{
+  "crate_name": "example_crate",
+  "functions": [
+    {
+      "name": "add",
+      "symbol": "example_add",
+      "params": ["i64", "i64"],
+      "ret": "i64",
+      "qualified_name": "example_crate.add"
+    }
+  ]
+}
+```
+
+### Supported Rust types (ABI-safe)
+
+`i64`, `i32`, `i16`, `i8`, `u64`, `u32`, `u16`, `u8`, `f64`, `f32`, `bool`,
+`unit`. Integers narrower than `i64`/`u64` are widened. Floating-point supports
+both `f32`→`f64` widening and truncation.
+
+### Linking
+
+Static libraries are searched in:
+- Output directory (`target/`)
+- Current working directory
+- `<cwd>/libs/<crate_name>/`
+- `<cwd>/libs/`
+- `<dir>/<crate_name>/target/release/` (Cargo build output)
+
+File patterns: `lib<name>.a` (Linux/macOS) or `<name>.lib` (Windows MSVC).
+
+### End-to-end test
+
+Located in `fixtures/rust/example_crate/`. Build with Cargo:
+
+```bash
+cargo build --release --manifest-path fixtures/rust/example_crate/Cargo.toml
+```
+
+The Saturnite example at `examples/interop_rust.stn` calls `example_crate.add(20, 22)`
+and returns `42`.
+
+## Python Library Interoperability
+
+### Import syntax
+
+```saturnite
+use python:module_name
+```
+
+### Calling functions
+
+```saturnite
+use python:math
+
+fn main() -> f64:
+    give math.sqrt(81.0)
+```
+
+### Runtime bridge
+
+The CPython C API bridge lives in `crates/stnx/runtime/`. Key functions:
+
+- `sat_py_set_search_path` — initializes the embedded interpreter and sets `sys.path`
+- `sat_py_import_and_cache` — imports and caches a module (linear-scan cache)
+- `sat_py_get_attr` — retrieves an attribute from a module or object handle
+- `sat_py_call_method` — invokes a method on a handle via `PyObject_CallMethod`
+
+All calls go through `sat_py_call_flat` which takes a `"module::function"` spec
+string, a `search_path`, parallel `kinds[]`/`values[]` arrays, and an out parameter
+for the result. The result struct distinguishes success, `None`, wrong-type, and
+Python exceptions.
+
+### Supported Python types
+
+`i64` (int within range), `f64` (float), `bool` (boolean), `unit` (None),
+`str` (UTF-8 text). Other types return an opaque handle that must be released
+via `sat_py_release_handle`.
+
+### End-to-end test
+
+Wrapper metadata for `math` at `target/saturnite/wrappers/math_saturnite.json`
+enables `math.sqrt(81.0)` to execute through the embedded CPython interpreter.
+
+## Shared External-Call Infrastructure
+
+Both ecosystems share the `MirRvalue::ExternalCall { kind, symbol, args, ret_ty }`
+representation in MIR. Code generation differs:
+
+- **Rust/Native:** Direct LLVM `call` to the resolved symbol
+- **Python:** Call to `sat_py_call_flat` with the `"module::func"` spec string
+
+## Linker Support
+
+On Windows MSVC, when `link.exe` is unavailable, the compiler falls back to
+`rust-lld` (shipped with the Rust toolchain) in `lld-link` mode. This provides
+full MSVC-link compatibility without requiring Visual Studio Build Tools.
+
+## Limitations
+
+- Complex types (`Vec<T>`, `String`, `HashMap`) require handwritten adapters or
+  are represented as opaque handles.
+- Generic Rust APIs and trait objects need user-provided adapters.
+- Python's GIL is held for the duration of each call; true multithreading across
+  the boundary requires explicit handle management.
+- Cross-compilation to targets without matching runtime artifacts is not supported.

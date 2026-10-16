@@ -727,7 +727,7 @@ impl<'hir> MirLower<'hir> {
         &mut self,
         ext: &crate::hir::function::HirExternalFunction,
         args: &[HirExpr],
-        result_ty: MirType,
+        _result_ty: MirType,
     ) -> CompilerResult<MirOperand> {
         let mut arg_ops: Vec<MirOperand> = Vec::with_capacity(args.len());
         for arg in args {
@@ -759,6 +759,7 @@ impl<'hir> MirLower<'hir> {
                 },
                 symbol: codegen_symbol,
                 args: arg_ops,
+                arg_types: ext.param_types.clone(),
                 ret_ty,
             },
         });

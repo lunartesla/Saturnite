@@ -17,12 +17,14 @@ pub mod build;
 pub mod cli;
 pub mod cmd;
 pub mod discover;
+pub mod lockfile;
 pub mod manifest;
 pub mod profile;
 
 pub use build::BuildContext;
 pub use cli::SaturnCli;
 pub use discover::ProjectDiscovery;
+pub use lockfile::{Lockfile, LockedDependency};
 pub use manifest::Manifest;
 pub use profile::{executable_name, platform_triple, BuildProfile, PlatformInfo};
 

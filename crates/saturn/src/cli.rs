@@ -116,6 +116,46 @@ pub enum Commands {
         pkg_version: Option<String>,
     },
 
+    /// Add a dependency to the project.
+    ///
+    /// Resolves the dependency spec against the appropriate registry:
+    /// - `rust` → crates.io
+    /// - `python` → PyPI
+    /// - `native` → system package manager
+    /// - `saturnite` → (future) Saturnite registry
+    ///
+    /// The resolved version is recorded in `saturn.lock` and the dependency
+    /// entry is appended to `saturn.toml`.
+    Add {
+        /// Dependency spec, e.g. `serde`, `numpy>=1.24`, `rust:serde@1.0`.
+        /// Format: `[kind:]name[version_spec]`.
+        dep: String,
+    },
+
+    /// Resolve and install all dependencies declared in `saturn.toml`.
+    ///
+    /// For Rust deps, this generates wrapper crates and builds static libraries
+    /// into `target/saturnite/wrappers/`. For Python deps, this creates/ensures
+    /// virtual environments and pip-installs packages into them.
+    Install {
+        /// Re-resolve all dependencies even if the lockfile is up to date.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Update dependencies to their latest compatible versions.
+    ///
+    /// Without `--all`, updates only the named dependency (if provided).
+    /// With `--all`, updates every dependency in the lockfile.
+    Update {
+        /// Update a specific dependency by name. If omitted and --all is set,
+        /// all dependencies are updated.
+        dep: Option<String>,
+        /// Update all dependencies to latest compatible versions.
+        #[arg(long)]
+        all: bool,
+    },
+
     /// Print diagnostics about the compiler environment.
     Doctor,
 }

@@ -727,3 +727,232 @@ fn test_list_iteration_lower_rejects_non_list_iterable() {
     let result = lower(&program);
     assert!(result.is_err(), "for loop over a bare i64 must be rejected");
 }
+
+// ---------------------------------------------------------------------------
+// 0.5.4 Phase 5D: ExternalCall arg_types propagation in MIR
+// ---------------------------------------------------------------------------
+
+/// Find all ExternalCall rvalues in a MIR program, returning references to
+/// the matched ExternalCall fields.
+fn collect_external_calls(mir: &stnx::mir::MirProgram) -> Vec<(&MirRvalue,)> {
+    let mut out = Vec::new();
+    for f in &mir.functions {
+        for b in &f.blocks {
+            for s in &b.stmts {
+                if let MirStmtKind::Assign {
+                    rvalue: rv @ MirRvalue::ExternalCall { .. },
+                    ..
+                } = &s.kind
+                {
+                    out.push((rv,));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Helper: find the first ExternalCall in the main function and return its fields.
+fn first_external_call(mir: &stnx::mir::MirProgram) -> Option<(&str, &[stnx::hir::HirType], &str, stnx::mir::MirExternalKind)> {
+    for f in &mir.functions {
+        if mir.symbols.lookup(f.name) == Some("main") {
+            for b in &f.blocks {
+                for s in &b.stmts {
+                    if let MirStmtKind::Assign {
+                        rvalue:
+                            MirRvalue::ExternalCall {
+                                kind,
+                                symbol,
+                                arg_types,
+                                ret_ty: _,
+                                ..
+                            },
+                        ..
+                    } = &s.kind
+                    {
+                        return Some((symbol.as_str(), arg_types.as_slice(), "", kind.clone()));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn test_mir_external_call_str_arg_type_propagated() {
+    let mir = to_mir(
+        r#"external python "builtins" "len"(x: str) -> i64
+           fn main() -> i64 { len("hello") }
+           fn len(s: str) -> i64 { 0 }"#,
+    );
+    let call = first_external_call(&mir).expect("should have an ExternalCall");
+    assert_eq!(call.1, &[stnx::hir::HirType::Str]);
+}
+
+#[test]
+fn test_mir_external_call_bool_arg_type_propagated() {
+    let mir = to_mir(
+        r#"external python "builtins" "validate"(x: bool) -> i64
+           fn main() -> i64 { validate(true) }
+           fn validate(b: bool) -> i64 { 0 }"#,
+    );
+    let call = first_external_call(&mir).expect("should have an ExternalCall");
+    assert_eq!(call.1, &[stnx::hir::HirType::Bool]);
+}
+
+#[test]
+fn test_mir_external_call_i64_arg_type_propagated() {
+    let mir = to_mir(
+        r#"external python "math" "floor"(x: i64) -> i64
+           fn main() -> i64 { floor(42) }
+           fn floor(i: i64) -> i64 { 0 }"#,
+    );
+    let call = first_external_call(&mir).expect("should have an ExternalCall");
+    assert_eq!(call.1, &[stnx::hir::HirType::I64]);
+}
+
+#[test]
+fn test_mir_external_call_f64_arg_type_propagated() {
+    let mir = to_mir(
+        r#"external python "math" "sqrt"(x: f64) -> f64
+           fn main() -> f64 { sqrt(81.0) }
+           fn sqrt(f: f64) -> f64 { 0.0 }"#,
+    );
+    let call = first_external_call(&mir).expect("should have an ExternalCall");
+    assert_eq!(call.1, &[stnx::hir::HirType::F64]);
+}
+
+#[test]
+fn test_mir_external_call_unit_arg_type_propagated() {
+    let mir = to_mir(
+        r#"external python "random" "seed"() -> i64
+           fn main() -> i64 { seed() }
+           fn seed() -> i64 { 0 }"#,
+    );
+    let call = first_external_call(&mir).expect("should have an ExternalCall");
+    assert!(call.1.is_empty(), "no-arg external call should have empty arg_types");
+}
+
+#[test]
+fn test_mir_external_call_multiple_arg_types_order_preserved() {
+    let mir = to_mir(
+        r#"external python "os" "write"(fd: i64, data: str, count: i64) -> i64
+           fn main() -> i64 { write(0, "hello", 5) }
+           fn write(fd: i64, data: str, count: i64) -> i64 { 0 }"#,
+    );
+    let call = first_external_call(&mir).expect("should have an ExternalCall");
+    assert_eq!(
+        call.1,
+        &[stnx::hir::HirType::I64, stnx::hir::HirType::Str, stnx::hir::HirType::I64]
+    );
+}
+
+#[test]
+fn test_mir_external_call_rust_kind_propagated() {
+    let mir = to_mir(
+        r#"external rust "serde" "serialize"(x: i64) -> i64
+           fn main() -> i64 { serialize(42) }
+           fn serialize(i: i64) -> i64 { 0 }"#,
+    );
+    let call = first_external_call(&mir).expect("should have an ExternalCall");
+    assert_eq!(call.3, stnx::mir::MirExternalKind::Rust);
+}
+
+#[test]
+fn test_mir_external_call_python_kind_propagated() {
+    let mir = to_mir(
+        r#"external python "math" "sqrt"(x: f64) -> f64
+           fn main() -> f64 { sqrt(81.0) }
+           fn sqrt(f: f64) -> f64 { 0.0 }"#,
+    );
+    let call = first_external_call(&mir).expect("should have an ExternalCall");
+    assert_eq!(call.3, stnx::mir::MirExternalKind::Python);
+}
+
+#[test]
+fn test_mir_external_call_native_kind_propagated() {
+    let mir = to_mir(
+        r#"external native "libm" "floor"(x: f64) -> f64
+           fn main() -> f64 { floor(3.7) }
+           fn floor(f: f64) -> f64 { 0.0 }"#,
+    );
+    let call = first_external_call(&mir).expect("should have an ExternalCall");
+    assert_eq!(call.3, stnx::mir::MirExternalKind::Native);
+}
+
+#[test]
+fn test_mir_external_call_python_symbol_uses_module_colon_function() {
+    // For Python externals, the symbol is "module::function" so that
+    // sat_py_call_flat can split it for the module name lookup.
+    let mir = to_mir(
+        r#"external python "json" "dumps"(x: i64) -> i64
+           fn main() -> i64 { dumps(42) }
+           fn dumps(i: i64) -> i64 { 0 }"#,
+    );
+    let call = first_external_call(&mir).expect("should have an ExternalCall");
+    assert_eq!(call.0, "json::dumps");
+}
+
+#[test]
+fn test_mir_external_call_rust_symbol_is_plain_symbol() {
+    // For Rust externals, the symbol stays as-is (no module:: prefix).
+    let mir = to_mir(
+        r#"external rust "serde" "add"(x: i64, y: i64) -> i64
+           fn main() -> i64 { add(1, 2) }
+           fn add(a: i64, b: i64) -> i64 { 0 }"#,
+    );
+    let call = first_external_call(&mir).expect("should have an ExternalCall");
+    assert_eq!(call.0, "add");
+}
+
+#[test]
+fn test_mir_external_call_mixed_arg_types_all_kinds() {
+    // Exercise all ABI-safe types: i64, f64, bool, str, unit (via no-arg call).
+    let mir = to_mir(
+        r#"external python "api" "process"(a: i64, b: f64, c: bool, d: str) -> i64
+           fn main() -> i64 { process(1, 2.0, true, "hi") }
+           fn process(a: i64, b: f64, c: bool, d: str) -> i64 { 0 }"#,
+    );
+    let call = first_external_call(&mir).expect("should have an ExternalCall");
+    assert_eq!(
+        call.1,
+        &[
+            stnx::hir::HirType::I64,
+            stnx::hir::HirType::F64,
+            stnx::hir::HirType::Bool,
+            stnx::hir::HirType::Str,
+        ]
+    );
+}
+
+#[test]
+fn test_mir_external_call_ret_type_propagated() {
+    // The ret_ty should match the declared return type.
+    let mir = to_mir(
+        r#"external python "math" "sqrt"(x: f64) -> f64
+           fn main() -> f64 { sqrt(81.0) }
+           fn sqrt(f: f64) -> f64 { 0.0 }"#,
+    );
+    for f in &mir.functions {
+        if mir.symbols.lookup(f.name) == Some("main") {
+            for b in &f.blocks {
+                for s in &b.stmts {
+                    if let MirStmtKind::Assign {
+                        local,
+                        rvalue:
+                            MirRvalue::ExternalCall {
+                                ret_ty, ..
+                            },
+                        ..
+                    } = &s.kind
+                    {
+                        let ty = f.locals.iter().find(|l| l.id == *local);
+                        assert_eq!(ty.expect("local should exist").ty, *ret_ty);
+                        assert_eq!(*ret_ty, stnx::hir::HirType::F64);
+                    }
+                }
+            }
+        }
+    }
+}

@@ -23,6 +23,9 @@ use inkwell::IntPredicate;
 use inkwell::OptimizationLevel as InkwellOptLevel;
 use std::collections::HashMap;
 
+// Re-export the canonical ABI version from the interop module.
+pub use crate::interop::SAT_ABI_VERSION;
+
 /// DefId sentinel for the builtin `println` function.
 const PRINTLN_DEF_ID: crate::hir::symbol::DefId = crate::hir::symbol::DefId(u32::MAX - 1);
 
@@ -387,14 +390,9 @@ impl<'ctx> MirCodeGenContext<'ctx> {
                 kind,
                 symbol,
                 args,
+                arg_types,
                 ret_ty,
-            } => gen_external_call(self, kind, symbol, args, ret_ty, prog),
-            MirRvalue::ExternalCall {
-                kind,
-                symbol,
-                args,
-                ret_ty,
-            } => gen_external_call(self, kind, symbol, args, ret_ty, prog),
+            } => gen_external_call(self, kind, symbol, args, arg_types, ret_ty, prog),
             MirRvalue::Length { list_local } => {
                 let (list_alloca, list_llvm_ty) =
                     self.local_allocas.get(list_local).ok_or_else(|| {
@@ -939,6 +937,7 @@ fn gen_external_call<'ctx>(
     kind: &MirExternalKind,
     symbol: &str,
     args: &[MirOperand],
+    arg_types: &[MirType],
     ret_ty: &MirType,
     prog: &MirProgram,
 ) -> CompilerResult<BasicValueEnum<'ctx>> {
@@ -1021,15 +1020,17 @@ fn gen_external_call<'ctx>(
                 CompilerError::codegen(format!("failed to allocate py values: {}", e))
             })?;
             for (i, v) in arg_vals.iter().enumerate() {
-                let kind = match v {
-                    BasicValueEnum::IntValue(iv) => {
-                        if iv.get_type().get_bit_width() == 1 {
-                            SAT_PY_BOOL
-                        } else {
-                            SAT_PY_I64
-                        }
-                    }
-                    BasicValueEnum::FloatValue(_) => SAT_PY_F64,
+                // Determine the Python value kind from the MIR type, not the
+                // LLVM value type. This is necessary because Str args are
+                // materialized as i64 (pointer cast), which would otherwise be
+                // indistinguishable from i64 args.
+                let mir_ty = arg_types.get(i).cloned().unwrap_or(MirType::I64);
+                let kind = match mir_ty {
+                    HirType::Bool => SAT_PY_BOOL,
+                    HirType::I64 => SAT_PY_I64,
+                    HirType::F64 => SAT_PY_F64,
+                    HirType::Str => SAT_PY_STR,
+                    HirType::Unit => SAT_PY_NONE,
                     _ => SAT_PY_NONE,
                 };
                 let kind_slot = unsafe {
@@ -1120,7 +1121,7 @@ fn gen_external_call<'ctx>(
             let call_fn = ctx
                 .module
                 .add_function("sat_py_call_flat", call_fn_ty, None);
-            let call = ctx
+            let _call = ctx
                 .builder
                 .build_call(
                     call_fn,

@@ -209,6 +209,10 @@ pub enum MirRvalue {
         kind: MirExternalKind,
         symbol: String,
         args: Vec<MirOperand>,
+        /// Type of each argument, parallel to `args`. Needed by codegen to
+        /// determine the correct ABI "kind" tag for Python calls (e.g.
+        /// `SAT_PY_STR` for string args vs `SAT_PY_I64` for numeric args).
+        arg_types: Vec<MirType>,
         ret_ty: MirType,
     },
     /// Binary operation on two operands.

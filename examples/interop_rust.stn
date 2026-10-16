@@ -1,0 +1,15 @@
+// Rust ecosystem interop example.
+// Demonstrates importing and calling a Rust crate function.
+//
+// To build, you need:
+// 1. A Rust fixture crate in fixtures/rust/example_crate/
+// 2. Wrapper metadata at target/saturnite/wrappers/example_crate_saturnite.json
+//
+// saturn build examples/interop_rust.stn -o interop_rust
+
+use rust:example_crate
+
+fn main() -> i64:
+    // Calls example_crate.add(20, 22) via the generated wrapper
+    let result = example_crate.add(20, 22)
+    give result

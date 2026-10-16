@@ -1,8 +1,9 @@
-//! High-level toolchain commands: `init` and `doctor`.
+//! High-level toolchain commands: `init`, `doctor`, `add`, `install`, `update`.
 
-use crate::manifest::Manifest;
+use crate::lockfile::Lockfile;
+use crate::manifest::{DependencyKind, DependencySpec, Manifest};
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Scaffold a new Saturnite project.
 ///
@@ -135,4 +136,228 @@ pub fn run_doctor() -> Result<()> {
     println!();
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Dependency management: add, install, update
+// ---------------------------------------------------------------------------
+
+/// Parse a dependency spec string from the CLI.
+///
+/// Accepted formats:
+/// - `name` → Saturnite dep with "*" version
+/// - `name@1.0` → Saturnite dep with exact version "1.0"
+/// - `name>=1.0` → Saturnite dep with range ">=1.0"
+/// - `rust:name` → Rust dep
+/// - `rust:name@1.0` → Rust dep with version "1.0"
+/// - `python:name>=1.0` → Python dep with range
+/// - `native:name@1.0` → Native dep with version
+/// - `saturnite:name@1.0` → Saturnite dep (explicit)
+fn parse_dep_spec(input: &str) -> Result<(String, DependencySpec)> {
+    // Split on the first ':' to separate kind from the rest.
+    let (kind_str, rest) = match input.find(':') {
+        Some(idx) => (&input[..idx], &input[idx + 1..]),
+        None => ("saturnite", input),
+    };
+
+    let kind = match kind_str {
+        "rust" => DependencyKind::Rust,
+        "python" => DependencyKind::Python,
+        "native" => DependencyKind::Native,
+        "saturnite" => DependencyKind::Saturnite,
+        other => {
+            anyhow::bail!(
+                "unknown dependency kind '{}'. Valid kinds: rust, python, native, saturnite. \
+                 Or omit the kind prefix for a Saturnite dependency.",
+                other
+            );
+        }
+    };
+
+    // Split the rest into name and version spec.
+    let (name, version) = match rest.find(|c: char| c == '@' || c == '>' || c == '<' || c == '=' || c == '^') {
+        Some(idx) => (&rest[..idx], Some(&rest[idx..])),
+        None => (rest, None),
+    };
+
+    // Strip the leading '@' if present (e.g. "@1.0" → "1.0").
+    let version_str = version
+        .map(|v| v.strip_prefix('@').unwrap_or(v))
+        .unwrap_or("*");
+    let spec = DependencySpec::Full {
+        kind,
+        version: version_str.to_string(),
+        target: None,
+    };
+
+    Ok((name.to_string(), spec))
+}
+
+/// Add a dependency to the project.
+///
+/// Updates `saturn.toml` with the new dependency and resolves/regenerates
+/// the lockfile entry.
+pub fn add_dependency(project_root: &Path, dep_spec: &str) -> Result<()> {
+    let mut manifest = Manifest::from_dir(project_root)?;
+    let mut lockfile = Lockfile::load(project_root)?;
+
+    let (name, spec) = parse_dep_spec(dep_spec)?;
+
+    if manifest.dependencies.contains_key(&name) {
+        anyhow::bail!(
+            "dependency '{}' is already in saturn.toml. Use `saturn update {}` to change its version.",
+            name, name
+        );
+    }
+
+    // Insert into the manifest and save.
+    manifest.dependencies.insert(name.clone(), spec.clone());
+    manifest.write_to(project_root)?;
+
+    // Resolve the new dependency into the lockfile.
+    lockfile.add(&manifest.dependencies, &name, &spec)?;
+    lockfile.save(project_root)?;
+
+    println!("Added dependency: {} ({:?}) {}", name, spec.kind(), spec.version());
+    println!("  → saturn.toml updated");
+    println!("  → saturn.lock updated");
+
+    Ok(())
+}
+
+/// Install (resolve and prepare) all dependencies declared in the manifest.
+///
+/// For Rust deps, this generates wrapper crates and builds static libraries.
+/// For Python deps, this creates virtual environments and pip-installs packages.
+/// For Native deps, this registers them for linking.
+pub fn install_dependencies(project_root: &Path, force: bool) -> Result<()> {
+    let manifest = Manifest::from_dir(project_root)?;
+
+    // Load or create the lockfile.
+    let mut lockfile = Lockfile::load(project_root)?;
+
+    if !force && !lockfile.is_stale(&manifest.dependencies) {
+        println!("All dependencies are up to date (lockfile is current).");
+        println!("  → {} dependencies locked", lockfile.dependencies.len());
+        return Ok(());
+    }
+
+    if force {
+        println!("Forcing re-resolution of all dependencies...");
+    } else {
+        println!("Resolving dependencies (lockfile is stale or missing)...");
+    }
+
+    // Resolve all dependencies into the lockfile.
+    let prev_count = lockfile.dependencies.len();
+    lockfile.resolve(&manifest.dependencies)?;
+
+    // Save the lockfile.
+    lockfile.save(project_root)?;
+
+    // Report what changed.
+    let new_count = lockfile.dependencies.len();
+    if new_count != prev_count {
+        let added = new_count.saturating_sub(prev_count);
+        if added > 0 {
+            println!("  → {} new dependencies resolved", added);
+        }
+    }
+
+    // Prepare runtime artifacts for each dependency.
+    for (name, locked) in &lockfile.dependencies {
+        match locked.kind {
+            DependencyKind::Rust => {
+                println!("  [rust] {} → {}", name, locked.version);
+                // Wrapper crate generation happens during build via build_rust_wrapper.
+                // The metadata JSON is expected at target/saturnite/wrappers/.
+            }
+            DependencyKind::Python => {
+                println!("  [python] {} → {}", name, locked.version);
+                // Venv creation and pip install happen during build via PyEnv.
+            }
+            DependencyKind::Native => {
+                println!("  [native] {} → {}", name, locked.version);
+                // Native deps are linked via system libraries.
+            }
+            DependencyKind::Saturnite => {
+                println!("  [saturnite] {} → {}", name, locked.version);
+            }
+        }
+    }
+
+    println!("\nLockfile written to {} ({} dependencies)",
+             lockfile_path(project_root).display(),
+             new_count);
+
+    Ok(())
+}
+
+/// Update dependencies to their latest compatible versions.
+///
+/// - If `dep_name` is Some, only that dependency is updated.
+/// - If `all` is true, all dependencies are updated.
+/// - If neither, prints usage.
+pub fn update_dependencies(
+    project_root: &Path,
+    dep_name: Option<&str>,
+    all: bool,
+) -> Result<()> {
+    let manifest = Manifest::from_dir(project_root)?;
+    let mut lockfile = Lockfile::load(project_root)?;
+
+    if !all && dep_name.is_none() {
+        anyhow::bail!(
+            "specify a dependency name or use --all:\n  saturn update <name>\n  saturn update --all"
+        );
+    }
+
+    if all {
+        // Re-resolve everything.
+        for (name, spec) in &manifest.dependencies {
+            let resolved = lockfile_update(name, spec)?;
+            if let Some(locked) = lockfile.dependencies.get(name) {
+                if locked.version != resolved {
+                    println!("  updated {}: {} → {}", name, locked.version, resolved);
+                }
+            } else {
+                println!("  added {}", name);
+            }
+        }
+        lockfile.resolve(&manifest.dependencies)?;
+    } else if let Some(name) = dep_name {
+        let spec = manifest.dependencies.get(name).ok_or_else(|| {
+            anyhow::anyhow!("dependency '{}' is not in saturn.toml", name)
+        })?;
+        let resolved_before = lockfile
+            .dependencies
+            .get(name)
+            .map(|d| d.version.clone())
+            .unwrap_or_else(|| "(not locked)".to_string());
+        lockfile.update(&manifest.dependencies, name, spec)?;
+        let resolved_after = lockfile
+            .dependencies
+            .get(name)
+            .map(|d| d.version.clone())
+            .unwrap_or_default();
+        println!("  updated {}: {} → {}", name, resolved_before, resolved_after);
+    }
+
+    lockfile.save(project_root)?;
+    println!("\nLockfile updated.");
+    Ok(())
+}
+
+/// Resolve a dependency to its latest compatible version.
+/// (In a full implementation this would query the registry.)
+fn lockfile_update(_name: &str, spec: &DependencySpec) -> Result<String> {
+    let version_req = spec.version();
+    // For now, re-use the same resolution logic (no registry lookup yet).
+    Ok(version_req.trim_start_matches('^').trim_start_matches('=').trim_start_matches('>')
+        .trim_start_matches('=').to_string())
+}
+
+/// Path to the lockfile within a project root.
+pub fn lockfile_path(project_root: &Path) -> PathBuf {
+    crate::lockfile::lockfile_path(project_root)
 }

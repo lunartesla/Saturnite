@@ -8,6 +8,12 @@ mod common;
 
 use common::{analyze_src, compile_src, ir_only};
 
+/// Normalize CRLF (\r\n) to LF (\n) so that tests pass on Windows where
+/// `println!` emits `\r\n` line endings.
+fn normalize_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
 #[test]
 fn test_list_single_element_compiles_and_runs() {
     let src = r#"
@@ -79,7 +85,7 @@ fn main() -> i64 {
     let (code, stdout) = bin.run();
     assert_eq!(code, 0);
     assert_eq!(
-        stdout, "7\n9\n",
+        normalize_newlines(&stdout), "7\n9\n",
         "list elements must evaluate left-to-right"
     );
 }
@@ -117,7 +123,7 @@ fn main() -> i64 {
     let bin = compile_src(src);
     let (code, stdout) = bin.run();
     assert_eq!(code, 0);
-    assert_eq!(stdout, "10\n");
+    assert_eq!(normalize_newlines(&stdout), "10\n");
 }
 
 #[test]
@@ -132,7 +138,7 @@ fn main() -> i64 {
     let bin = compile_src(src);
     let (code, stdout) = bin.run();
     assert_eq!(code, 0);
-    assert_eq!(stdout, "20\n");
+    assert_eq!(normalize_newlines(&stdout), "20\n");
 }
 
 #[test]
@@ -147,7 +153,7 @@ fn main() -> i64 {
     let bin = compile_src(src);
     let (code, stdout) = bin.run();
     assert_eq!(code, 0);
-    assert_eq!(stdout, "30\n");
+    assert_eq!(normalize_newlines(&stdout), "30\n");
 }
 
 #[test]
@@ -162,7 +168,7 @@ fn main() -> i64 {
     let bin = compile_src(src);
     let (code, stdout) = bin.run();
     assert_eq!(code, 0);
-    assert_eq!(stdout, "3\n");
+    assert_eq!(normalize_newlines(&stdout), "3\n");
 }
 
 #[test]
@@ -178,7 +184,7 @@ fn main() -> i64 {
     let bin = compile_src(src);
     let (code, stdout) = bin.run();
     assert_eq!(code, 0);
-    assert_eq!(stdout, "20\n");
+    assert_eq!(normalize_newlines(&stdout), "20\n");
 }
 
 #[test]
@@ -224,7 +230,7 @@ fn main() -> i64 {
     let bin = compile_src(src);
     let (code, stdout) = bin.run();
     assert_eq!(code, 0);
-    assert_eq!(stdout, "30\n");
+    assert_eq!(normalize_newlines(&stdout), "30\n");
 }
 
 #[test]
@@ -267,7 +273,7 @@ fn main() -> i64 {
     let (code, stdout) = bin.run();
     assert_eq!(code, 0);
     assert_eq!(
-        stdout, "10\n20\n30\n",
+        normalize_newlines(&stdout), "10\n20\n30\n",
         "list iteration should print each element in order"
     );
 }
@@ -383,7 +389,7 @@ fn main() -> i64 {
     let bin = compile_src(src);
     let (code, stdout) = bin.run();
     assert_eq!(code, 0);
-    assert_eq!(stdout, "10\n20\n30\n");
+    assert_eq!(normalize_newlines(&stdout), "10\n20\n30\n");
 }
 
 #[test]
@@ -407,7 +413,7 @@ fn main() -> i64 {
     let (code, stdout) = bin.run();
     assert_eq!(code, 0);
     assert_eq!(
-        stdout, "1\n2\n3\n",
+        normalize_newlines(&stdout), "1\n2\n3\n",
         "computed list should iterate its elements"
     );
 }
@@ -432,7 +438,7 @@ fn main() -> i64 {
     let (code, stdout) = bin.run();
     assert_eq!(code, 0);
     assert_eq!(
-        stdout, "7\n9\n7\n9\n",
+        normalize_newlines(&stdout), "7\n9\n7\n9\n",
         "iterable evaluated left-to-right (7,9), then elements read in order (7,9)"
     );
 }
@@ -454,7 +460,7 @@ fn main() -> i64 {
     let bin = compile_src(src);
     let (code, stdout) = bin.run();
     assert_eq!(code, 0);
-    assert_eq!(stdout, "4\n", "body must run once per element");
+    assert_eq!(normalize_newlines(&stdout), "4\n", "body must run once per element");
 }
 
 #[test]
@@ -471,7 +477,7 @@ fn main() -> i64 {
     let bin = compile_src(src);
     let (code, stdout) = bin.run();
     assert_eq!(code, 0);
-    assert_eq!(stdout, "0\n1\n2\n", "range for loop must still work");
+    assert_eq!(normalize_newlines(&stdout), "0\n1\n2\n", "range for loop must still work");
 }
 
 #[test]
@@ -488,7 +494,7 @@ fn main() -> i64 {
     let (code, stdout) = bin.run();
     assert_eq!(code, 0);
     assert_eq!(
-        stdout, "0\n1\n2\n3\n",
+        normalize_newlines(&stdout), "0\n1\n2\n3\n",
         "inclusive range for loop must still work"
     );
 }

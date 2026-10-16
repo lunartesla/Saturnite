@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
             input,
             release,
             debug,
-            output,
+            output: _,
             no_link,
             save_temps,
             verbose,
@@ -118,6 +118,27 @@ fn main() -> anyhow::Result<()> {
 
         Commands::Doctor => {
             saturn::cmd::run_doctor()?;
+            Ok(())
+        }
+
+        Commands::Add { dep } => {
+            let cwd = std::env::current_dir()?;
+            let project = saturn::discover::ProjectDiscovery::discover(&cwd)?;
+            saturn::cmd::add_dependency(&project.root, &dep)?;
+            Ok(())
+        }
+
+        Commands::Install { force } => {
+            let cwd = std::env::current_dir()?;
+            let project = saturn::discover::ProjectDiscovery::discover(&cwd)?;
+            saturn::cmd::install_dependencies(&project.root, force)?;
+            Ok(())
+        }
+
+        Commands::Update { dep, all } => {
+            let cwd = std::env::current_dir()?;
+            let project = saturn::discover::ProjectDiscovery::discover(&cwd)?;
+            saturn::cmd::update_dependencies(&project.root, dep.as_deref(), all)?;
             Ok(())
         }
     }

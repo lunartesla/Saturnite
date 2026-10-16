@@ -1,0 +1,15 @@
+// Python ecosystem interop example.
+// Demonstrates importing and calling a Python module function.
+//
+// To build, you need:
+// 1. Python installed and discoverable
+// 2. Wrapper metadata at <project>/target/saturnite/wrappers/math_saturnite.json
+//
+// saturn build examples/interop_python.stn -o interop_python
+
+use python:math
+
+fn main() -> f64:
+    // Calls math.sqrt(81.0) via the Python runtime bridge
+    let result = math.sqrt(81.0)
+    give result

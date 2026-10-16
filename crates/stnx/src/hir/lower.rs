@@ -30,12 +30,17 @@ fn span_to_source_span(r: &std::ops::Range<usize>) -> SourceSpan {
 
 /// Convert an AST [`Visibility`] to the HIR [`HirVisibility`].
 /// Whether a `HirType` is in the ABI-safe subset supported by external
-/// calls. Complex types (Str, Struct, Enum, List, Generic, Apply) are
+/// calls. Complex types (Struct, Enum, List, Generic, Apply) are
 /// rejected at declaration time so an unsafe bridge can never be built.
+///
+/// The ABI-safe set is: `i64`, `f64`, `bool`, `str`, and `Unit` (void).
+/// `Str` is represented as a C-compatible `i8*` (NUL-terminated) at the
+/// LLVM level, so it crosses the boundary safely when the runtime bridge
+/// owns the lifetime on both sides.
 fn is_abi_safe(ty: &HirType) -> bool {
     matches!(
         ty,
-        HirType::I64 | HirType::F64 | HirType::Bool | HirType::Unit
+        HirType::I64 | HirType::F64 | HirType::Bool | HirType::Str | HirType::Unit
     )
 }
 
@@ -616,25 +621,25 @@ impl HirLower {
                     params.iter().map(|(n, _)| self.symbols.intern(n)).collect();
                 let return_hir = ast_type_to_hir(return_type, &mut self.symbols, &enum_names, None);
                 // Validate that the declared types are ABI-safe. External
-                // calls only support the primitive ABI subset; complex types
-                // (Str, Struct, Enum, List, Generic, Apply) are rejected
-                // with a clear diagnostic rather than silently producing an
-                // unsafe bridge.
+                // calls only support the primitive ABI subset (i64, f64,
+                // bool, str, Unit); complex types (Struct, Enum, List,
+                // Generic, Apply) are rejected with a clear diagnostic
+                // rather than silently producing an unsafe bridge.
                 for (i, ty) in param_types.iter().enumerate() {
                     if !is_abi_safe(ty) {
                         return Err(CompilerError::semantic(format!(
                             "external function `{}` parameter {} has type {:?}, which is not ABI-safe. \
-                             External calls only support the primitive ABI subset (i64, f64, bool).",
+                             External calls only support i64, f64, bool, str, and Unit.",
                             symbol,
                             i + 1,
                             ty
                         )));
                     }
                 }
-                if !is_abi_safe(&return_hir) && !matches!(return_hir, HirType::Unit) {
+                if !is_abi_safe(&return_hir) {
                     return Err(CompilerError::semantic(format!(
                         "external function `{}` has return type {:?}, which is not ABI-safe. \
-                         External calls only support the primitive ABI subset (i64, f64, bool) and Unit.",
+                         External calls only support i64, f64, bool, str, and Unit.",
                         symbol, return_hir
                     )));
                 }
@@ -1214,17 +1219,17 @@ impl HirLower {
                         if !is_abi_safe(ty) {
                             return Err(CompilerError::semantic(format!(
                                 "external function `{}` parameter {} has type {:?}, which is not ABI-safe. \
-                                 External calls only support the primitive ABI subset (i64, f64, bool).",
+                                 External calls only support i64, f64, bool, str, and Unit.",
                                 symbol,
                                 i + 1,
                                 ty
                             )));
                         }
                     }
-                    if !is_abi_safe(&return_hir) && !matches!(return_hir, HirType::Unit) {
+                    if !is_abi_safe(&return_hir) {
                         return Err(CompilerError::semantic(format!(
                             "external function `{}` has return type {:?}, which is not ABI-safe. \
-                             External calls only support the primitive ABI subset (i64, f64, bool) and Unit.",
+                             External calls only support i64, f64, bool, str, and Unit.",
                             symbol, return_hir
                         )));
                     }
@@ -1294,17 +1299,17 @@ impl HirLower {
                         if !is_abi_safe(ty) {
                             return Err(CompilerError::semantic(format!(
                                 "external function `{}` parameter {} has type {:?}, which is not ABI-safe. \
-                                 External calls only support the primitive ABI subset (i64, f64, bool).",
+                                 External calls only support i64, f64, bool, str, and Unit.",
                                 symbol,
                                 i + 1,
                                 ty
                             )));
                         }
                     }
-                    if !is_abi_safe(&return_hir) && !matches!(return_hir, HirType::Unit) {
+                    if !is_abi_safe(&return_hir) {
                         return Err(CompilerError::semantic(format!(
                             "external function `{}` has return type {:?}, which is not ABI-safe. \
-                             External calls only support the primitive ABI subset (i64, f64, bool) and Unit.",
+                             External calls only support i64, f64, bool, str, and Unit.",
                             symbol, return_hir
                         )));
                     }
@@ -1571,7 +1576,7 @@ impl HirLower {
                 continue;
             };
 
-            let alias_str = self.symbols.lookup(ud.alias).unwrap_or("");
+            let _alias_str = self.symbols.lookup(ud.alias).unwrap_or("");
             let pkg_str = ud
                 .path
                 .iter()
@@ -1626,22 +1631,19 @@ impl HirLower {
                     .collect();
                 let return_type = type_str_to_hir(&func_meta.ret);
 
-                // Validate ABI safety (only i64, f64, bool, unit, str are allowed)
+                // Validate ABI safety (only i64, f64, bool, str, and unit are allowed)
                 for (i, ty) in param_types.iter().enumerate() {
-                    if !is_abi_safe(ty) && !matches!(ty, HirType::Str) {
+                    if !is_abi_safe(ty) {
                         return Err(CompilerError::semantic(format!(
                             "ecosystem function `::{}' parameter {} has unsupported type {:?}. \
-                             External calls only support i64, f64, bool, and str.",
+                             External calls only support i64, f64, bool, str, and unit.",
                             func_meta.name,
                             i + 1,
                             ty
                         )));
                     }
                 }
-                if !is_abi_safe(&return_type)
-                    && !matches!(return_type, HirType::Str)
-                    && !matches!(return_type, HirType::Unit)
-                {
+                if !is_abi_safe(&return_type) {
                     return Err(CompilerError::semantic(format!(
                         "ecosystem function `::{}' has unsupported return type {:?}. \
                          External calls only support i64, f64, bool, str, and Unit.",
@@ -3750,5 +3752,191 @@ mod tests {
         graph.add_module(child_module);
 
         graph
+    }
+
+    // ---------------------------------------------------------------------------
+    // Phase 5C unit tests: HIR lowering of external function declarations
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_hir_lowers_external_python_function() {
+        let hir = lower_src(
+            r#"external python "json" "dumps"(x: i64) -> i64
+               fn main() -> i64 { 0 }"#,
+        );
+        assert_eq!(hir.external_functions.len(), 1);
+        let ext = &hir.external_functions[0];
+        assert_eq!(ext.kind, crate::ast::ExternalKind::Python);
+        assert_eq!(ext.ecosystem, "json");
+        assert_eq!(ext.symbol, "dumps");
+        assert_eq!(ext.param_types, vec![HirType::I64]);
+        assert_eq!(ext.return_type, HirType::I64);
+        assert_eq!(ext.param_names.len(), 1);
+        assert_eq!(ext.module, ModuleId::ROOT);
+    }
+
+    #[test]
+    fn test_hir_lowers_external_rust_function() {
+        let hir = lower_src(
+            r#"external rust "serde" "Serialize"(x: i64, y: i64) -> i64
+               fn main() -> i64 { 0 }"#,
+        );
+        assert_eq!(hir.external_functions.len(), 1);
+        let ext = &hir.external_functions[0];
+        assert_eq!(ext.kind, crate::ast::ExternalKind::Rust);
+        assert_eq!(ext.ecosystem, "serde");
+        assert_eq!(ext.symbol, "Serialize");
+        assert_eq!(ext.param_types, vec![HirType::I64, HirType::I64]);
+        assert_eq!(ext.return_type, HirType::I64);
+    }
+
+    #[test]
+    fn test_hir_lowers_external_native_function() {
+        let hir = lower_src(
+            r#"external native "libm" "pow"(x: f64, y: f64) -> f64
+               fn main() -> i64 { 0 }"#,
+        );
+        assert_eq!(hir.external_functions.len(), 1);
+        let ext = &hir.external_functions[0];
+        assert_eq!(ext.kind, crate::ast::ExternalKind::Native);
+        assert_eq!(ext.ecosystem, "libm");
+        assert_eq!(ext.symbol, "pow");
+        assert_eq!(ext.param_types, vec![HirType::F64, HirType::F64]);
+        assert_eq!(ext.return_type, HirType::F64);
+    }
+
+    #[test]
+    fn test_hir_lowers_external_str_param() {
+        let hir = lower_src(
+            r#"external python "sys" "exit"(msg: str) -> unit
+               fn main() -> i64 { 0 }"#,
+        );
+        assert_eq!(hir.external_functions.len(), 1);
+        let ext = &hir.external_functions[0];
+        assert_eq!(ext.param_types, vec![HirType::Str]);
+        assert_eq!(ext.return_type, HirType::Unit);
+    }
+
+    #[test]
+    fn test_hir_lowers_external_bool_param() {
+        let hir = lower_src(
+            r#"external python "builtins" "print"(x: bool) -> unit
+               fn main() -> i64 { 0 }"#,
+        );
+        assert_eq!(hir.external_functions.len(), 1);
+        let ext = &hir.external_functions[0];
+        assert_eq!(ext.param_types, vec![HirType::Bool]);
+        assert_eq!(ext.return_type, HirType::Unit);
+    }
+
+    #[test]
+    fn test_hir_lowers_external_zero_params() {
+        let hir = lower_src(
+            r#"external python "random" "random"() -> i64
+               fn main() -> i64 { 0 }"#,
+        );
+        assert_eq!(hir.external_functions.len(), 1);
+        let ext = &hir.external_functions[0];
+        assert!(ext.param_types.is_empty());
+        assert_eq!(ext.return_type, HirType::I64);
+    }
+
+    #[test]
+    fn test_hir_lowers_multiple_external_functions() {
+        let hir = lower_src(
+            r#"external python "m1" "f1"(x: i64) -> i64
+               external rust "m2" "f2"(y: f64) -> f64
+               fn main() -> i64 { 0 }"#,
+        );
+        assert_eq!(hir.external_functions.len(), 2);
+        assert_eq!(hir.external_functions[0].symbol, "f1");
+        assert_eq!(hir.external_functions[1].symbol, "f2");
+        assert_eq!(hir.external_functions[0].kind, crate::ast::ExternalKind::Python);
+        assert_eq!(hir.external_functions[1].kind, crate::ast::ExternalKind::Rust);
+    }
+
+    #[test]
+    fn test_hir_lowers_external_void_return() {
+        let hir = lower_src(
+            r#"external python "builtins" "print"(x: i64) -> unit
+               fn main() -> i64 { 0 }"#,
+        );
+        let ext = &hir.external_functions[0];
+        assert_eq!(ext.return_type, HirType::Unit);
+    }
+
+    #[test]
+    fn test_hir_lowers_external_mixed_params() {
+        let hir = lower_src(
+            r#"external python "os" "write"(fd: i64, data: str, count: i64) -> i64
+               fn main() -> i64 { 0 }"#,
+        );
+        let ext = &hir.external_functions[0];
+        assert_eq!(
+            ext.param_types,
+            vec![HirType::I64, HirType::Str, HirType::I64]
+        );
+        assert_eq!(ext.return_type, HirType::I64);
+    }
+
+    #[test]
+    fn test_hir_rejects_non_abi_safe_external_param() {
+        // Lists are not ABI-safe for external calls.
+        let src = r#"external python "m" "f"(x: List<i64>) -> i64
+                      fn main() -> i64 { 0 }"#;
+        let tokens: Vec<_> = Lexer::new(src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let program: Program = parser::parse(src, tokens).expect("parsing should succeed");
+        let result = lower(&program);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("not ABI-safe"),
+            "expected ABI-safe error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_hir_rejects_non_abi_safe_external_return() {
+        // Returning a struct is not ABI-safe for external calls.
+        let src = r#"struct Point { x: i64, y: i64 }
+                     external python "m" "f"() -> Point
+                     fn main() -> i64 { 0 }"#;
+        let tokens: Vec<_> = Lexer::new(src)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lexing should succeed");
+        let program: Program = parser::parse(src, tokens).expect("parsing should succeed");
+        let result = lower(&program);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("not ABI-safe"),
+            "expected ABI-safe error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_hir_external_function_registered_in_function_sigs() {
+        let hir = lower_src(
+            r#"external python "json" "dumps"(x: i64) -> i64
+               fn main() -> i64 { 0 }"#,
+        );
+        let ext = &hir.external_functions[0];
+        let name_id = ext.name;
+        let lookup = hir.symbols.lookup(name_id);
+        assert_eq!(lookup, Some("dumps"));
+    }
+
+    #[test]
+    fn test_hir_external_function_module_is_root() {
+        let hir = lower_src(
+            r#"external python "json" "dumps"(x: i64) -> i64
+               fn main() -> i64 { 0 }"#,
+        );
+        let ext = &hir.external_functions[0];
+        assert_eq!(ext.module, ModuleId::ROOT);
     }
 }

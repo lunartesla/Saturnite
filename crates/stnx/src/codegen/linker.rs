@@ -142,10 +142,6 @@ impl<'cfg> Linker<'cfg> {
             args.push("-lm".to_string());
         }
 
-        let has_python = externals
-            .iter()
-            .any(|e| e.kind == crate::mir::MirExternalKind::Python);
-
         let linker_name = linker_cmd.first().map(|s| s.as_str()).unwrap_or("cc");
 
         // Locate the linker binary. On Windows MSVC, `which::which` may find
@@ -211,7 +207,18 @@ impl<'cfg> Linker<'cfg> {
         output_path: &Path,
     ) -> Result<PathBuf, String> {
         let file_names: Vec<String> = match ext.kind {
-            crate::mir::MirExternalKind::Rust => vec![format!("lib{}.a", ext.name)],
+            crate::mir::MirExternalKind::Rust => {
+                // On Linux/macOS: lib<name>.a
+                // On Windows MSVC: <name>.lib (rustc produces MSVC-compatible .lib)
+                let mut names = vec![format!("lib{}.a", ext.name)];
+                if matches!(
+                    (self.target_config.os(), self.target_config.environment()),
+                    (OperatingSystem::Windows, Environment::Msvc)
+                ) {
+                    names.push(format!("{}.lib", ext.name));
+                }
+                names
+            }
             crate::mir::MirExternalKind::Native => match self.target_config.os() {
                 OperatingSystem::Darwin => {
                     vec![
@@ -262,7 +269,21 @@ impl<'cfg> Linker<'cfg> {
             (OperatingSystem::Linux, _) => vec!["cc".to_string()],
             (OperatingSystem::Darwin, _) => vec!["clang".to_string()],
             (OperatingSystem::Windows, Environment::Msvc) => {
-                vec!["link.exe".to_string()]
+                // Prefer the real MSVC link.exe (found via vswhere only —
+                // `which::which("link.exe")` can find an MSYS2/MinGW shim that
+                // doesn't understand MSVC flags). Fall back to `rust-lld -link`
+                // (LLVM's LLD in MSVC-link mode) when link.exe is unavailable,
+                // which is common on machines without Visual Studio Build Tools.
+                if find_msvc_linker_via_vswhere().is_some() {
+                    vec!["link.exe".to_string()]
+                } else {
+                    vec![
+                        find_rust_lld()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "rust-lld.exe".to_string()),
+                        "-link".to_string(),
+                    ]
+                }
             }
             (OperatingSystem::Windows, Environment::Gnu) => {
                 vec!["gcc".to_string()]
@@ -311,6 +332,7 @@ impl<'cfg> Linker<'cfg> {
                     "/DEFAULTLIB:msvcrt".to_string(),
                     "/DEFAULTLIB:ucrt".to_string(),
                     "/DEFAULTLIB:vcruntime".to_string(),
+                    "/MACHINE:X64".to_string(),
                 ];
                 // Add MSVC CRT and Windows SDK lib paths so the linker can
                 // find system libraries (libcmt, ucrt, etc.) without the LIB
@@ -350,12 +372,27 @@ pub fn check_linker_available(target_config: &TargetConfig) -> Result<(), Compil
     let env = target_config.environment();
 
     let linker = Linker::new(target_config);
-    let linker_name = linker.select_linker(os, env)[0].clone();
+    let linker_cmd = linker.select_linker(os, env);
+    let linker_name = linker_cmd[0].clone();
 
     // Resolve the linker path — on Windows MSVC, this may use `vswhere`
     // to find the real MSVC `link.exe` (not the MSYS2 shim).
     match resolve_linker_path(&linker_name, os, env) {
         Ok(path) => {
+            // `rust-lld` is a generic dispatcher; just verify the file exists.
+            // The actual linking (passing `-link` as the first arg) selects
+            // lld-link mode and works correctly.
+            if linker_name.eq_ignore_ascii_case("rust-lld.exe")
+                || linker_name.eq_ignore_ascii_case("rust-lld")
+            {
+                if path.is_file() {
+                    return Ok(());
+                }
+                return Err(CompilerError::Link(LinkError::linking_failed(
+                    linker_name.to_string(),
+                    Some(format!("rust-lld not found at {}", path.display())),
+                )));
+            }
             // MSVC's `link.exe` uses `/?` for help; all others accept `--version`.
             let check_arg = match (os, env) {
                 (OperatingSystem::Windows, Environment::Msvc) => "/?",
@@ -363,6 +400,19 @@ pub fn check_linker_available(target_config: &TargetConfig) -> Result<(), Compil
             };
             let check = Command::new(&path).arg(check_arg).output();
             match check {
+                // MSVC's link.exe /? returns a non-zero exit code, so any
+                // process launch that doesn't fail is sufficient to confirm
+                // the linker binary is present and runnable.
+                Ok(output) if matches!((os, env), (OperatingSystem::Windows, Environment::Msvc)) => {
+                    if output.status.code().is_some() {
+                        Ok(())
+                    } else {
+                        Err(CompilerError::Link(LinkError::linking_failed(
+                            linker_name.to_string(),
+                            Some(format!("linker crashed (signal)")),
+                        )))
+                    }
+                }
                 Ok(output) if output.status.success() => Ok(()),
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -421,7 +471,40 @@ fn resolve_linker_path(
             }
         }
     }
-    which::which(name).map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))
+    // For rust-lld, look in the toolchain.
+    if name.eq_ignore_ascii_case("rust-lld.exe") || name.eq_ignore_ascii_case("rust-lld") {
+        if let Some(path) = find_rust_lld() {
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+    }
+    which::which(name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))
+}
+
+/// Find `rust-lld.exe` from the Rust toolchain.
+///
+/// `rust-lld` is shipped with rustup and provides `lld-link` mode, which is
+/// MSVC-link-compatible. This is a fallback when no `link.exe` is available.
+fn find_rust_lld() -> Option<PathBuf> {
+    // Use `rustc --print sysroot` to locate the toolchain, then look for
+    // rust-lld.exe in the MSVC rustlib bin directory.
+    let sysroot = std::process::Command::new("rustc")
+        .arg("--print")
+        .arg("sysroot")
+        .output()
+        .ok()?;
+    if !sysroot.status.success() {
+        return None;
+    }
+    let sysroot = PathBuf::from(String::from_utf8_lossy(&sysroot.stdout).trim().to_string());
+    let candidate = sysroot.join("lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe");
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    // Fall back to PATH.
+    which::which("rust-lld.exe").ok()
 }
 
 /// Use `vswhere` to locate the Visual Studio installation path and return the

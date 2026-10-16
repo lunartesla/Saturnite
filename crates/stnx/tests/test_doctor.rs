@@ -164,14 +164,15 @@ fn test_doctor_command_reports_linker() {
     let (code, stdout) = run_doctor_command();
     assert_eq!(code, 0, "doctor command should succeed");
 
-    // Count occurrences of "Linker:" — there should be exactly one.
+    // The doctor must mention "Linker" at least once — either "Linker: available"
+    // when a linker is present, or "WARNING: Linker not available" when absent.
     // This verifies the redundant linker double-check was eliminated
     // (previously run_diagnostics() and run_doctor() both printed linker status).
-    let linker_count = stdout.matches("Linker:").count();
+    let linker_count = stdout.matches("Linker").count();
     assert_eq!(
         linker_count, 1,
-        "doctor should report linker status exactly once (redundant double-check removed); \
-         found {} occurrence(s) of 'Linker:' in output:\n{}",
+        "doctor should mention Linker exactly once (redundant double-check removed); \
+         found {} occurrence(s) of 'Linker' in output:\n{}",
         linker_count, stdout
     );
 }
@@ -211,7 +212,7 @@ fn test_doctor_command_output_contains_all_sections() {
         "OS:",
         "Environment",
         "Opt level:",
-        "Linker:",
+        "Linker",
         "inkwell",
         "LLVM",
         "Runtime:",

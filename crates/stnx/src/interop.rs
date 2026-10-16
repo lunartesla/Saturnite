@@ -19,6 +19,22 @@
 
 use serde::{Deserialize, Serialize};
 
+/// ABI version for the Saturnite external-call boundary.
+///
+/// This version tracks the contract between the compiler's external-call
+/// codegen and the runtime bridge (Rust shims, CPython bridge). When the
+/// ABI changes in a backward-incompatible way, bump this version so
+/// wrapper artifacts built against an older version are rejected.
+///
+/// This constant is embedded in generated Rust wrapper crates (via
+/// `#[link_section]` metadata) and checked at runtime by the Rust
+/// shim registration code in `rsrt_impl.c` (which defines
+/// `SAT_RUST_ABI_VERSION` to the same value).
+///
+/// Version history:
+/// - 1: Initial ABI — `i64`, `f64`, `bool`, `str` (as `i8*`), and `Unit`.
+pub const SAT_ABI_VERSION: u32 = 1;
+
 /// Dependency source / ecosystem. This is the authoritative distinction
 /// required by Phase 9: Rust and Python must not be collapsed into a
 /// vague "foreign library" mechanism.

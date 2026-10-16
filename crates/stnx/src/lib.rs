@@ -29,7 +29,9 @@ pub mod lexer;
 pub mod mir;
 pub mod module;
 pub mod parser;
+pub mod pyenv;
 pub mod resolver;
+pub mod rust_wrapper;
 pub mod semantic;
 pub mod target;
 
@@ -75,7 +77,8 @@ pub use target::{
 // here so downstream consumers can `use stnx::{LexError, ParseError, ...}`.
 
 pub use error::{
-    CompilerError, CompilerResult, LexError, LinkError, ParseError, TargetError, TargetResult,
+    BuildError, BuildResult, CompilerError, CompilerResult, LexError, LinkError, ParseError,
+    TargetError, TargetResult,
 };
 
 // --- Config re-exports ---
@@ -83,9 +86,11 @@ pub use error::{
 // `saturn.toml` configuration types and parsing logic.
 
 pub use config::{BuildConfig, DependencySpec, Package, SaturnConfig};
+pub use interop::SAT_ABI_VERSION;
 
 // --- Module system re-exports ---
 //
 // Module graph and project loading infrastructure for multi-file projects.
 
 pub use module::{Module, ModuleGraph, ModuleId, ModulePath, ModuleScope, Project};
+pub use pyenv::PyEnv;

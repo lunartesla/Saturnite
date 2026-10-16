@@ -221,7 +221,28 @@ entry = "main"
         } else {
             self.dependencies
                 .iter()
-                .map(|(k, v)| format!("{} = \"{}\"", k, v.version()))
+                .map(|(k, v)| match v {
+                    // Saturnite deps use the simple form; others need the full form.
+                    DependencySpec::Simple(v) => format!("{} = \"{}\"", k, v),
+                    DependencySpec::Full { kind, version, target } => {
+                        let kind_str = match kind {
+                            DependencyKind::Saturnite => "saturnite",
+                            DependencyKind::Rust => "rust",
+                            DependencyKind::Python => "python",
+                            DependencyKind::Native => "native",
+                        };
+                        match target {
+                            Some(t) => format!(
+                                "{} = {{ kind = \"{}\", version = \"{}\", target = \"{}\" }}",
+                                k, kind_str, version, t
+                            ),
+                            None => format!(
+                                "{} = {{ kind = \"{}\", version = \"{}\" }}",
+                                k, kind_str, version
+                            ),
+                        }
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         };

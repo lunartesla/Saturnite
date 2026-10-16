@@ -316,6 +316,7 @@ fn external_decl<'a>(
         .then(params())
         .then(ret_type())
         .map(
+            #[allow(unused_parens)]
             |((
                 ((((ext_span, _kind), (ecosystem, _eco_span)), (symbol, sym_span)), params),
                 ret_type,
@@ -2256,5 +2257,241 @@ mod tests {
             result.is_err(),
             "mod inside a function body should be a parse error"
         );
+    }
+
+    // --- Ecosystem extern declaration tests ---
+
+    #[test]
+    fn test_parse_external_python_decl() {
+        let prog = parse_src(r#"external python "json" "dumps"(x: i64) -> i64"#);
+        assert_eq!(prog.items.len(), 1);
+        match &prog.items[0].kind {
+            ItemKind::ExternalFunction { kind, ecosystem, symbol, params, return_type, .. } => {
+                assert_eq!(*kind, ExternalKind::Python);
+                assert_eq!(ecosystem, "json");
+                assert_eq!(symbol, "dumps");
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0], ("x".to_string(), Type::I64));
+                assert_eq!(*return_type, Type::I64);
+            }
+            other => panic!("expected ExternalFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_external_rust_decl() {
+        let prog = parse_src(r#"external rust "libc" "malloc"(n: i64) -> i64"#);
+        assert_eq!(prog.items.len(), 1);
+        match &prog.items[0].kind {
+            ItemKind::ExternalFunction { kind, ecosystem, symbol, params, return_type, .. } => {
+                assert_eq!(*kind, ExternalKind::Rust);
+                assert_eq!(ecosystem, "libc");
+                assert_eq!(symbol, "malloc");
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0], ("n".to_string(), Type::I64));
+                assert_eq!(*return_type, Type::I64);
+            }
+            other => panic!("expected ExternalFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_external_native_decl() {
+        let prog = parse_src(r#"external native "libm" "sin"(x: f64) -> f64"#);
+        assert_eq!(prog.items.len(), 1);
+        match &prog.items[0].kind {
+            ItemKind::ExternalFunction { kind, ecosystem, symbol, params, return_type, .. } => {
+                assert_eq!(*kind, ExternalKind::Native);
+                assert_eq!(ecosystem, "libm");
+                assert_eq!(symbol, "sin");
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0], ("x".to_string(), Type::F64));
+                assert_eq!(*return_type, Type::F64);
+            }
+            other => panic!("expected ExternalFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_external_multi_param() {
+        let prog = parse_src(
+            r#"external python "os" "path_join"(a: str, b: str, c: i64) -> str"#
+        );
+        match &prog.items[0].kind {
+            ItemKind::ExternalFunction { params, return_type, .. } => {
+                assert_eq!(params.len(), 3);
+                assert_eq!(params[0], ("a".to_string(), Type::Str));
+                assert_eq!(params[1], ("b".to_string(), Type::Str));
+                assert_eq!(params[2], ("c".to_string(), Type::I64));
+                assert_eq!(*return_type, Type::Str);
+            }
+            other => panic!("expected ExternalFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_external_void_return() {
+        let prog = parse_src(
+            r#"external rust "libc" "free"(ptr: i64) -> unit"#
+        );
+        match &prog.items[0].kind {
+            ItemKind::ExternalFunction { return_type, .. } => {
+                assert_eq!(*return_type, Type::Unit);
+            }
+            other => panic!("expected ExternalFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_external_without_params() {
+        let prog = parse_src(
+            r#"external python "sys" "version"() -> i64"#
+        );
+        match &prog.items[0].kind {
+            ItemKind::ExternalFunction { params, .. } => {
+                assert!(params.is_empty(), "no-param external should have empty params");
+            }
+            other => panic!("expected ExternalFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_external_invalid_kind_errors() {
+        // `external` with an unknown ecosystem kind should fail
+        let err = parse_fail(r#"external invalid "libc" "foo"() -> i64"#);
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("expected") || msg.contains("external"),
+            "error should mention the expected kind, got: {}", msg
+        );
+    }
+
+    // --- Qualified call expression tests ---
+
+    #[test]
+    fn test_parse_qualified_call_with_str_arg() {
+        let prog = parse_src(r#"
+fn main() -> i64 {
+    let n = builtins.len("hello")
+    n
+}
+"#);
+        // Should parse without errors; check that the function was created
+        assert!(prog.functions.len() >= 1);
+    }
+
+    #[test]
+    fn test_parse_qualified_call_multiple_arg_types() {
+        // Call with mixed arg types: i64, str, bool
+        let prog = parse_src(r#"
+fn main() -> i64 {
+    let result = py_math.compute(42, "text", true)
+    result
+}
+"#);
+        assert!(prog.functions.len() >= 1);
+    }
+
+    #[test]
+    fn test_parse_qualified_call_field_access_str_arg() {
+        // `module.value` (field access, not a call)
+        let prog = parse_src(r#"
+fn main() -> i64 {
+    let x = lib.value
+    x
+}
+"#);
+        assert!(prog.functions.len() >= 1);
+    }
+
+    #[test]
+    fn test_parse_mixed_ecosystem_imports() {
+        let src = r#"
+use python:json as json
+use rust:serde as serde
+use native:libc as libc
+use mymod::submod
+"#;
+        let prog = parse_src(src);
+
+        // First three should be ecosystem imports
+        let json = &prog.items[0];
+        match &json.kind {
+            ItemKind::UseDecl { path, alias, ecosystem } => {
+                assert_eq!(path, &vec!["json".to_string()]);
+                assert_eq!(alias.as_deref(), Some("json"));
+                assert_eq!(*ecosystem, Some(ExternalKind::Python));
+            }
+            other => panic!("expected UseDecl for json, got {:?}", other),
+        }
+
+        let serde = &prog.items[1];
+        match &serde.kind {
+            ItemKind::UseDecl { ecosystem, .. } => {
+                assert_eq!(*ecosystem, Some(ExternalKind::Rust));
+            }
+            other => panic!("expected UseDecl for serde, got {:?}", other),
+        }
+
+        let libc = &prog.items[2];
+        match &libc.kind {
+            ItemKind::UseDecl { ecosystem, .. } => {
+                assert_eq!(*ecosystem, Some(ExternalKind::Native));
+            }
+            other => panic!("expected UseDecl for libc, got {:?}", other),
+        }
+
+        // The fourth should be a regular path import (no ecosystem)
+        let mymod = &prog.items[3];
+        match &mymod.kind {
+            ItemKind::UseDecl { ecosystem, .. } => {
+                assert_eq!(*ecosystem, None);
+            }
+            other => panic!("expected UseDecl for mymod, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_ecosystem_import_simple_package() {
+        // `use rust:serde` — ecosystem with a simple package name
+        let prog = parse_src("use rust:serde as s\n");
+        assert_eq!(prog.items.len(), 1);
+        match &prog.items[0].kind {
+            ItemKind::UseDecl { path, ecosystem, alias } => {
+                assert_eq!(*ecosystem, Some(ExternalKind::Rust));
+                assert_eq!(path, &vec!["serde".to_string()]);
+                assert_eq!(alias.as_deref(), Some("s"));
+            }
+            other => panic!("expected UseDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_ecosystem_import_without_alias() {
+        // `use python:os` — no alias, package name is the implicit name
+        let prog = parse_src("use python:os\n");
+        assert_eq!(prog.items.len(), 1);
+        match &prog.items[0].kind {
+            ItemKind::UseDecl { path, alias, ecosystem } => {
+                assert_eq!(*ecosystem, Some(ExternalKind::Python));
+                assert_eq!(path, &vec!["os".to_string()]);
+                assert_eq!(*alias, None);
+            }
+            other => panic!("expected UseDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_ecosystem_import_preserves_visibility() {
+        let prog = parse_src("pub use python:numpy as np\n");
+        assert_eq!(prog.items.len(), 1);
+        assert_eq!(prog.items[0].visibility, Visibility::Public);
+        match &prog.items[0].kind {
+            ItemKind::UseDecl { ecosystem, alias, .. } => {
+                assert_eq!(*ecosystem, Some(ExternalKind::Python));
+                assert_eq!(alias.as_deref(), Some("np"));
+            }
+            _ => panic!("expected UseDecl"),
+        }
     }
 }

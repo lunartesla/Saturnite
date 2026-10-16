@@ -173,7 +173,7 @@ fn main() -> anyhow::Result<()> {
                 Some(input) => (input.clone(), None),
                 None => {
                     let cwd = std::env::current_dir()?;
-                    let mut project = Project::discover(&cwd)?;
+                    let project = Project::discover(&cwd)?;
                     let entry = project.resolve_entry_point()?;
                     if !entry.is_file() {
                         return Err(anyhow::anyhow!(
@@ -374,7 +374,7 @@ fn main() -> anyhow::Result<()> {
                 input.clone()
             } else {
                 let cwd = std::env::current_dir()?;
-                let mut project = Project::discover(&cwd)?;
+                let project = Project::discover(&cwd)?;
                 let entry = project.resolve_entry_point()?;
                 if !entry.is_file() {
                     return Err(anyhow::anyhow!(
@@ -407,7 +407,7 @@ fn main() -> anyhow::Result<()> {
                 input.clone()
             } else {
                 let cwd = std::env::current_dir()?;
-                let mut project = Project::discover(&cwd)?;
+                let project = Project::discover(&cwd)?;
                 let entry = project.resolve_entry_point()?;
                 if !entry.is_file() {
                     return Err(anyhow::anyhow!(
