@@ -961,20 +961,65 @@ fn test_pyrt_handles_c_runtime() {
 // If Python is not available, the test is skipped.
 // ---------------------------------------------------------------------------
 
-/// Check if Python is usable for end-to-end tests.
+/// Check if Python interpreter AND development headers/libraries are available
+/// for end-to-end tests. The interpreter alone is not sufficient — we also need
+/// `Python.h` and a linkable Python library to compile and link `pyrt_impl.c`.
 fn python_available() -> bool {
-    Command::new("python3")
+    let python_cmd = if Command::new("python3")
         .arg("-c")
         .arg("import sys; sys.exit(0)")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-        || Command::new("python")
-            .arg("-c")
-            .arg("import sys; sys.exit(0)")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+    {
+        "python3"
+    } else if Command::new("python")
+        .arg("-c")
+        .arg("import sys; sys.exit(0)")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        "python"
+    } else {
+        eprintln!("Python interpreter not found; skipping Python interop tests");
+        return false;
+    };
+
+    // Verify development headers are installed: Python.h must be in a valid
+    // include directory.
+    let py_inc = Command::new(python_cmd)
+        .arg("-c")
+        .arg(
+            "import sysconfig, os; inc=sysconfig.get_path('include'); \
+             exit(0 if os.path.isdir(inc) and os.path.isfile(os.path.join(inc, 'Python.h')) else 1)",
+        )
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    // Verify a linkable library is available (LDLIBRARY is non-empty).
+    let py_lib = Command::new(python_cmd)
+        .arg("-c")
+        .arg("import sysconfig; lib=sysconfig.get_config_var('LDLIBRARY'); exit(0 if lib else 1)")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !py_inc {
+        eprintln!(
+            "Python interpreter found but development headers (Python.h) missing; \
+             Python interop tests will be skipped"
+        );
+    }
+    if !py_lib {
+        eprintln!(
+            "Python interpreter found but development libraries (LDLIBRARY) missing; \
+             Python interop tests will be skipped"
+        );
+    }
+
+    py_inc && py_lib
 }
 
 #[test]

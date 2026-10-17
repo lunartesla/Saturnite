@@ -125,7 +125,9 @@ impl<'ctx> MirCodeGenContext<'ctx> {
         //              bool bridge_failed) — does not return.
         self.module.add_function(
             "sat_py_abort",
-            ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), bool_ty.into()], false),
+            self.context
+                .void_type()
+                .fn_type(&[ptr_ty.into(), ptr_ty.into(), bool_ty.into()], false),
             None,
         );
         // 0.5.1 string interpolation: `concat_str(i8*, i8*) -> i8*` and

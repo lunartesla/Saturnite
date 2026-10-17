@@ -114,15 +114,33 @@ fn main() -> i64 { dumps(42) }"#;
     );
 }
 
-/// Check that the sat_py_call_flat function declaration appears in IR.
+/// Check that the sat_py_call_flat function declaration appears in IR with
+/// the correct signature (returns i1/bool, takes 6 pointer-sized args).
 #[test]
 fn test_codegen_sat_py_call_flat_declaration() {
     let src = r#"external python "math" "sqrt"(x: f64) -> f64
 fn main() -> f64 { sqrt(81.0) }"#;
     let ir = ir_only(src);
+    // sat_py_call_flat returns i1 (bool) and takes (ptr, ptr, ptr, ptr, i64, ptr)
     assert!(
-        ir.contains("declare i1 @sat_py_call_flat"),
-        "IR should declare sat_py_call_flat"
+        ir.contains("declare i1 @sat_py_call_flat(ptr, ptr, ptr, ptr, i64, ptr)"),
+        "IR should declare sat_py_call_flat with bool return and correct params:\n{}",
+        ir
+    );
+}
+
+/// Check that sat_py_abort is declared with void return type, matching the C
+/// declaration `void sat_py_abort(const char*, const char*, bool)`.
+#[test]
+fn test_codegen_sat_py_abort_void_return() {
+    let src = r#"external python "math" "sqrt"(x: f64) -> f64
+fn main() -> f64 { sqrt(81.0) }"#;
+    let ir = ir_only(src);
+    // sat_py_abort returns void, not ptr — matching the C declaration.
+    assert!(
+        ir.contains("declare void @sat_py_abort"),
+        "IR should declare sat_py_abort with void return type (matching C declaration):\n{}",
+        ir
     );
 }
 
