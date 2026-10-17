@@ -181,7 +181,7 @@ fn test_update_specific_dependency() {
     assert_eq!(code, 0);
 
     // Update a specific dependency.
-    let (code, out, _err) = run_saturn(&proj_dir, &["update", "serde"]);
+    let (code, _out, _err) = run_saturn(&proj_dir, &["update", "serde"]);
     assert_eq!(code, 0, "saturn update serde should succeed");
 }
 

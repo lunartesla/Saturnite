@@ -15,6 +15,8 @@ serde_json = "1"
 toml = "0.8"
 anyhow = "1"
 stnx = { path = "../stnx" }
+reqwest = { version = "0.12", features = ["json", "gzip", "blocking"] }
+tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"

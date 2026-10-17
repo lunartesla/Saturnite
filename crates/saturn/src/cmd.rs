@@ -318,12 +318,9 @@ pub fn update_dependencies(project_root: &Path, dep_name: Option<&str>, all: boo
 
     if all {
         // Re-resolve everything.
-        for (name, spec) in &manifest.dependencies {
-            let resolved = lockfile_update(name, spec)?;
+        for (name, _spec) in &manifest.dependencies {
             if let Some(locked) = lockfile.dependencies.get(name) {
-                if locked.version != resolved {
-                    println!("  updated {}: {} → {}", name, locked.version, resolved);
-                }
+                println!("  locked {} → {}", name, locked.version);
             } else {
                 println!("  added {}", name);
             }
@@ -354,19 +351,6 @@ pub fn update_dependencies(project_root: &Path, dep_name: Option<&str>, all: boo
     lockfile.save(project_root)?;
     println!("\nLockfile updated.");
     Ok(())
-}
-
-/// Resolve a dependency to its latest compatible version.
-/// (In a full implementation this would query the registry.)
-fn lockfile_update(_name: &str, spec: &DependencySpec) -> Result<String> {
-    let version_req = spec.version();
-    // For now, re-use the same resolution logic (no registry lookup yet).
-    Ok(version_req
-        .trim_start_matches('^')
-        .trim_start_matches('=')
-        .trim_start_matches('>')
-        .trim_start_matches('=')
-        .to_string())
 }
 
 /// Path to the lockfile within a project root.
