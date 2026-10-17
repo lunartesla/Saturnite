@@ -753,7 +753,14 @@ fn collect_external_calls(mir: &stnx::mir::MirProgram) -> Vec<(&MirRvalue,)> {
 }
 
 /// Helper: find the first ExternalCall in the main function and return its fields.
-fn first_external_call(mir: &stnx::mir::MirProgram) -> Option<(&str, &[stnx::hir::HirType], &str, stnx::mir::MirExternalKind)> {
+fn first_external_call(
+    mir: &stnx::mir::MirProgram,
+) -> Option<(
+    &str,
+    &[stnx::hir::HirType],
+    &str,
+    stnx::mir::MirExternalKind,
+)> {
     for f in &mir.functions {
         if mir.symbols.lookup(f.name) == Some("main") {
             for b in &f.blocks {
@@ -831,7 +838,10 @@ fn test_mir_external_call_unit_arg_type_propagated() {
            fn seed() -> i64 { 0 }"#,
     );
     let call = first_external_call(&mir).expect("should have an ExternalCall");
-    assert!(call.1.is_empty(), "no-arg external call should have empty arg_types");
+    assert!(
+        call.1.is_empty(),
+        "no-arg external call should have empty arg_types"
+    );
 }
 
 #[test]
@@ -844,7 +854,11 @@ fn test_mir_external_call_multiple_arg_types_order_preserved() {
     let call = first_external_call(&mir).expect("should have an ExternalCall");
     assert_eq!(
         call.1,
-        &[stnx::hir::HirType::I64, stnx::hir::HirType::Str, stnx::hir::HirType::I64]
+        &[
+            stnx::hir::HirType::I64,
+            stnx::hir::HirType::Str,
+            stnx::hir::HirType::I64
+        ]
     );
 }
 
@@ -940,10 +954,7 @@ fn test_mir_external_call_ret_type_propagated() {
                 for s in &b.stmts {
                     if let MirStmtKind::Assign {
                         local,
-                        rvalue:
-                            MirRvalue::ExternalCall {
-                                ret_ty, ..
-                            },
+                        rvalue: MirRvalue::ExternalCall { ret_ty, .. },
                         ..
                     } = &s.kind
                     {

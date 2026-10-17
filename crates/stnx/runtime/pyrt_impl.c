@@ -14,6 +14,87 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Platform path separator for PATH-style lists. */
+#ifdef _WIN32
+#define SAT_PATH_SEP ";"
+#else
+#define SAT_PATH_SEP ":"
+#endif
+
+/* MSVC does not provide strtok_r or strdup; emulate them. */
+#ifdef _MSC_VER
+static char *sat_strtok_r(char *str, const char *delim, char **saveptr) {
+    char *p, *end;
+
+    if (str == NULL) {
+        str = *saveptr;
+    }
+
+    if (str == NULL || *str == '\0') {
+        *saveptr = str;
+        return NULL;
+    }
+
+    p = str;
+    /* Skip leading delimiters. */
+    while (*p) {
+        const char *d = delim;
+        int matched = 0;
+        while (*d) {
+            if (*p == *d) {
+                matched = 1;
+                break;
+            }
+            d++;
+        }
+        if (!matched) break;
+        p++;
+    }
+
+    if (*p == '\0') {
+        *saveptr = p;
+        return NULL;
+    }
+
+    end = p;
+    while (*end) {
+        const char *d = delim;
+        int matched = 0;
+        while (*d) {
+            if (*end == *d) {
+                matched = 1;
+                break;
+            }
+            d++;
+        }
+        if (matched) break;
+        end++;
+    }
+
+    if (*end != '\0') {
+        *end = '\0';
+        *saveptr = end + 1;
+    } else {
+        *saveptr = end;
+    }
+
+    return p;
+}
+
+static char *sat_strdup(const char *s) {
+    if (s == NULL) return NULL;
+    size_t len = strlen(s) + 1;
+    char *copy = (char *)malloc(len);
+    if (copy) {
+        memcpy(copy, s, len);
+    }
+    return copy;
+}
+
+#define strtok_r sat_strtok_r
+#define strdup sat_strdup
+#endif
+
 /// The single embedded CPython interpreter. Initialized once by
 /// `sat_py_init` and torn down by `sat_py_shutdown`.
 static int g_interpreter_initialized = 0;
@@ -82,6 +163,7 @@ static void record_exception(void) {
                 const char *s = PyUnicode_AsUTF8(name);
                 if (s != NULL) {
                     strncpy(g_error_class, s, sizeof(g_error_class) - 1);
+                    g_error_class[sizeof(g_error_class) - 1] = '\0';
                 }
             }
             Py_DECREF(name);
@@ -94,6 +176,7 @@ static void record_exception(void) {
             const char *s = PyUnicode_AsUTF8(msg);
             if (s != NULL) {
                 strncpy(g_error_message, s, sizeof(g_error_message) - 1);
+                g_error_message[sizeof(g_error_message) - 1] = '\0';
             }
         }
         Py_DECREF(msg);
@@ -228,14 +311,14 @@ sat_py_object_handle *sat_py_import_module(const char *name, const char *search_
             return NULL;
         }
         char *saveptr = NULL;
-        char *dir = strtok_r(copy, ":", &saveptr);
+        char *dir = strtok_r(copy, SAT_PATH_SEP, &saveptr);
         while (dir != NULL) {
             PyObject *py_dir = PyUnicode_FromString(dir);
             if (py_dir != NULL) {
                 PyList_Append(sys_path, py_dir);
                 Py_DECREF(py_dir);
             }
-            dir = strtok_r(NULL, ":", &saveptr);
+            dir = strtok_r(NULL, SAT_PATH_SEP, &saveptr);
         }
         free(copy);
     }
@@ -475,14 +558,14 @@ void sat_py_set_search_path(const char *search_path) {
         return;
     }
     char *saveptr = NULL;
-    char *dir = strtok_r(copy, ":", &saveptr);
+    char *dir = strtok_r(copy, SAT_PATH_SEP, &saveptr);
     while (dir != NULL) {
         PyObject *py_dir = PyUnicode_FromString(dir);
         if (py_dir != NULL) {
             PyList_Append(sys_path, py_dir);
             Py_DECREF(py_dir);
         }
-        dir = strtok_r(NULL, ":", &saveptr);
+        dir = strtok_r(NULL, SAT_PATH_SEP, &saveptr);
     }
     free(copy);
 }

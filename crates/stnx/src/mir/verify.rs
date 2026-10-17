@@ -228,8 +228,8 @@ mod tests {
     use crate::hir::symbol::{DefId, SymbolId, SymbolInterner};
     use crate::hir::types::HirType;
     use crate::mir::{
-        BlockId, LocalId, MirBasicBlock, MirFunction, MirLocal, MirOperand, MirProgram,
-        MirRvalue, MirStmt, MirStmtKind, MirTerminator, MirType,
+        BlockId, LocalId, MirBasicBlock, MirFunction, MirLocal, MirOperand, MirProgram, MirRvalue,
+        MirStmt, MirStmtKind, MirTerminator, MirType,
     };
 
     /// Build a minimal `MirProgram` with one function containing a single block
@@ -514,7 +514,13 @@ mod tests {
     #[test]
     fn test_verify_all_abi_safe_types_accepted() {
         // Verify that all five ABI-safe types pass verification.
-        for ty in [MirType::I64, MirType::F64, MirType::Bool, MirType::Str, MirType::Unit] {
+        for ty in [
+            MirType::I64,
+            MirType::F64,
+            MirType::Bool,
+            MirType::Str,
+            MirType::Unit,
+        ] {
             let prog = build_program_with_rvalue(MirRvalue::ExternalCall {
                 kind: crate::mir::MirExternalKind::Python,
                 symbol: "test::all_types".to_string(),

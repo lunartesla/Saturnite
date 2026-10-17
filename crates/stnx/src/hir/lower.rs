@@ -3851,8 +3851,14 @@ mod tests {
         assert_eq!(hir.external_functions.len(), 2);
         assert_eq!(hir.external_functions[0].symbol, "f1");
         assert_eq!(hir.external_functions[1].symbol, "f2");
-        assert_eq!(hir.external_functions[0].kind, crate::ast::ExternalKind::Python);
-        assert_eq!(hir.external_functions[1].kind, crate::ast::ExternalKind::Rust);
+        assert_eq!(
+            hir.external_functions[0].kind,
+            crate::ast::ExternalKind::Python
+        );
+        assert_eq!(
+            hir.external_functions[1].kind,
+            crate::ast::ExternalKind::Rust
+        );
     }
 
     #[test]

@@ -92,6 +92,32 @@ pub fn compile_src(src: &str) -> Artifact {
     }
 }
 
+/// Same as [`compile_src`] but with a project root set, enabling ecosystem
+/// imports (`use rust:crate`, `use python:module`) to read wrapper metadata
+/// from `<project_root>/target/saturnite/wrappers/`.
+pub fn compile_src_with_root(src: &str, project_root: &Path) -> Artifact {
+    let temp_dir = TempDir::new().expect("failed to create isolated temp dir");
+    let exe_path = temp_dir.path().join("program");
+
+    let tokens = prepare(src).expect("prepare failed");
+    let program = parser::parse(src, tokens).expect("parsing failed");
+    let hir = stnx::hir::HirLower::new()
+        .with_project_root(project_root.to_path_buf())
+        .lower_program(&program)
+        .expect("HIR lowering failed");
+    let mir = lower_to_mir(&hir);
+
+    let mut config = TargetConfig::host().expect("target init failed");
+    config.set_output_kind(OutputKind::Exe);
+    compile_from_mir_ext(&mir, exe_path.to_str().unwrap(), config, false)
+        .expect("codegen/linking failed");
+
+    Artifact {
+        path: exe_path,
+        _temp_dir: temp_dir,
+    }
+}
+
 /// Compile to a relocatable object file (.o) in an isolated temp directory.
 pub fn compile_to_object(src: &str) -> Artifact {
     let temp_dir = TempDir::new().expect("failed to create isolated temp dir");

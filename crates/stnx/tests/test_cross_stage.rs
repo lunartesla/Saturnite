@@ -145,9 +145,18 @@ fn test_abi_boundary_py_kind_enum_matches_ir() {
     // Verify that the SAT_PY_* constants in codegen.rs match the values
     // emitted in the LLVM IR for each type.
     let cases = [
-        ("external python \"m\" \"f\"(x: i64) -> i64\nfn main() -> i64 { f(1) }", "i32 2"),  // SAT_PY_I64
-        ("external python \"m\" \"f\"(x: f64) -> i64\nfn main() -> i64 { f(1.0) }", "i32 3"),  // SAT_PY_F64
-        ("external python \"m\" \"f\"(x: bool) -> i64\nfn main() -> i64 { f(true) }", "i32 1"), // SAT_PY_BOOL
+        (
+            "external python \"m\" \"f\"(x: i64) -> i64\nfn main() -> i64 { f(1) }",
+            "i32 2",
+        ), // SAT_PY_I64
+        (
+            "external python \"m\" \"f\"(x: f64) -> i64\nfn main() -> i64 { f(1.0) }",
+            "i32 3",
+        ), // SAT_PY_F64
+        (
+            "external python \"m\" \"f\"(x: bool) -> i64\nfn main() -> i64 { f(true) }",
+            "i32 1",
+        ), // SAT_PY_BOOL
     ];
     for (src, expected_kind) in &cases {
         let ir = ir_only(src);
@@ -255,7 +264,10 @@ fn test_python_external_with_i64_arg_compiles() {
 fn main() -> i64 { dumps(42) }"#;
     // ir_only should succeed (it doesn't link).
     let ir = ir_only(src);
-    assert!(ir.contains("sat_py_call_flat"), "IR should be valid and reference the bridge");
+    assert!(
+        ir.contains("sat_py_call_flat"),
+        "IR should be valid and reference the bridge"
+    );
 }
 
 #[test]

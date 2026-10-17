@@ -11,11 +11,15 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
-use stnx::interop::DependencyKind;
-use stnx::config::SaturnConfig;
-use stnx::parser;
-use stnx::lexer::prepare;
+use common::compile_src_with_root;
 use stnx::ast::ExternalKind;
+use stnx::config::SaturnConfig;
+use stnx::hir::HirLower;
+use stnx::interop::DependencyKind;
+use stnx::lexer::prepare;
+use stnx::mir::codegen::generate_ir_from_mir;
+use stnx::mir::lower::lower_program;
+use stnx::parser;
 
 /// Write a wrapper metadata JSON file into `target/saturnite/wrappers/`
 /// inside the given temp directory.
@@ -137,7 +141,10 @@ fn main() -> i64 {
 fn test_qualified_call_various_arg_counts() {
     let test_cases = vec![
         ("rust_lib.add(1)", "use rust:example_crate as rust_lib"),
-        ("rust_lib.add(1, 2, 3)", "use rust:example_crate as rust_lib"),
+        (
+            "rust_lib.add(1, 2, 3)",
+            "use rust:example_crate as rust_lib",
+        ),
         ("py_math.sqrt(81.0)", "use python:math as py_math"),
         ("ns.func()", "use rust:crate as ns"),
     ];
@@ -210,7 +217,10 @@ fn main() -> i64 {
             && ext_fn.ecosystem == "example_crate"
             && ext_fn.symbol == "sat_example_crate_add_i64"
     });
-    assert!(found, "external function 'rust_lib.add' should be registered in external_functions");
+    assert!(
+        found,
+        "external function 'rust_lib.add' should be registered in external_functions"
+    );
 
     // Check the function that was found for correct param/return types.
     let ext_fn = hir
@@ -276,8 +286,7 @@ fn main() -> i64 {
     let hir = lower_with_root(src, &temp.path().to_path_buf());
     // No external functions should have been auto-generated.
     assert!(
-        !hir
-            .external_functions
+        !hir.external_functions
             .iter()
             .any(|e| hir.symbols.lookup(e.name) == Some("rust_lib.add")),
         "no external functions should be registered without metadata"
@@ -305,9 +314,10 @@ fn main() -> i64 {
 "#;
 
     let hir = lower_with_root(src, &temp.path().to_path_buf());
-    let found = hir.external_functions.iter().any(|ext_fn| {
-        hir.symbols.lookup(ext_fn.name) == Some("py_math.add")
-    });
+    let found = hir
+        .external_functions
+        .iter()
+        .any(|ext_fn| hir.symbols.lookup(ext_fn.name) == Some("py_math.add"));
     assert!(found, "py_math.add should be registered");
 }
 
@@ -438,14 +448,17 @@ fn main() -> i64 {
             })
         })
     });
-    assert!(has_external_call, "MIR should contain an ExternalCall for Python sqrt");
+    assert!(
+        has_external_call,
+        "MIR should contain an ExternalCall for Python sqrt"
+    );
 }
 
 #[test]
 fn test_mir_external_call_python_arg_types_includes_str() {
+    use stnx::hir::HirType;
     use stnx::mir::lower::lower_program;
     use stnx::mir::MirRvalue;
-    use stnx::hir::HirType;
 
     let temp = TempDir::new().unwrap();
     let metadata = r#"{
@@ -474,7 +487,10 @@ fn main() -> i64 {
         for block in &func_body.blocks {
             for stmt in &block.stmts {
                 if let stnx::mir::MirStmtKind::Assign {
-                    rvalue: MirRvalue::ExternalCall { kind, arg_types, .. },
+                    rvalue:
+                        MirRvalue::ExternalCall {
+                            kind, arg_types, ..
+                        },
                     ..
                 } = &stmt.kind
                 {
@@ -490,7 +506,10 @@ fn main() -> i64 {
             }
         }
     }
-    assert!(found, "Should have found a Python ExternalCall with arg_types");
+    assert!(
+        found,
+        "Should have found a Python ExternalCall with arg_types"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -516,14 +535,12 @@ fn test_rust_wrapper_generation_produces_valid_staticlib() {
 
     let metadata = WrapperMetadata {
         crate_name: "example_crate".to_string(),
-        functions: vec![
-            EcosystemFunctionMeta {
-                name: "add".to_string(),
-                symbol: "sat_example_crate_add_i64".to_string(),
-                params: vec!["i64".to_string(), "i64".to_string()],
-                ret: "i64".to_string(),
-            },
-        ],
+        functions: vec![EcosystemFunctionMeta {
+            name: "add".to_string(),
+            symbol: "sat_example_crate_add_i64".to_string(),
+            params: vec!["i64".to_string(), "i64".to_string()],
+            ret: "i64".to_string(),
+        }],
     };
 
     let build_dir = wrapper_output_dir.join("example_crate_wrapper");
@@ -534,10 +551,7 @@ fn test_rust_wrapper_generation_produces_valid_staticlib() {
     // Replace the crates.io dependency with a path dependency.
     // Use forward slashes in the path to avoid TOML escape issues on Windows.
     let fixture_str = fixture_crate.to_string_lossy().replace('\\', "/");
-    let path_dep = format!(
-        "example_crate = {{ path = \"{}\" }}",
-        fixture_str
-    );
+    let path_dep = format!("example_crate = {{ path = \"{}\" }}", fixture_str);
     let toml = toml.replace("example_crate = \"0.1.0\"", &path_dep);
     std::fs::write(build_dir.join("Cargo.toml"), &toml).unwrap();
 
@@ -558,7 +572,9 @@ fn test_rust_wrapper_generation_produces_valid_staticlib() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 // Skip if cargo/rustc isn't available in this environment.
-                if stderr.contains("error: cargo or rustc") || stdout.is_empty() && stderr.is_empty() {
+                if stderr.contains("error: cargo or rustc")
+                    || stdout.is_empty() && stderr.is_empty()
+                {
                     eprintln!("Skipping test: cargo/rustc not available");
                     return;
                 }
@@ -577,7 +593,9 @@ fn test_rust_wrapper_generation_produces_valid_staticlib() {
             assert!(
                 found,
                 "static library should exist in {}; checked {:?} and {:?}",
-                release_dir.display(), lib_path, lib_path_lib
+                release_dir.display(),
+                lib_path,
+                lib_path_lib
             );
         }
         Err(e) => {
@@ -588,20 +606,18 @@ fn test_rust_wrapper_generation_produces_valid_staticlib() {
 
 #[test]
 fn test_rust_wrapper_generation_generates_correct_source() {
-    use stnx::rust_wrapper::generate_wrapper_src;
     use stnx::hir::lower::{EcosystemFunctionMeta, WrapperMetadata};
     use stnx::interop::SAT_ABI_VERSION;
+    use stnx::rust_wrapper::generate_wrapper_src;
 
     let metadata = WrapperMetadata {
         crate_name: "serde".to_string(),
-        functions: vec![
-            EcosystemFunctionMeta {
-                name: "serialize_to_string".to_string(),
-                symbol: "sat_serde_serialize_to_string".to_string(),
-                params: vec!["i64".to_string()],
-                ret: "i64".to_string(),
-            },
-        ],
+        functions: vec![EcosystemFunctionMeta {
+            name: "serialize_to_string".to_string(),
+            symbol: "sat_serde_serialize_to_string".to_string(),
+            params: vec!["i64".to_string()],
+            ret: "i64".to_string(),
+        }],
     };
 
     let src = generate_wrapper_src(&metadata, &metadata.functions);
@@ -618,8 +634,8 @@ fn test_rust_wrapper_generation_generates_correct_source() {
 
 #[test]
 fn test_rust_wrapper_generation_handles_multiple_functions() {
-    use stnx::rust_wrapper::generate_wrapper_src;
     use stnx::hir::lower::{EcosystemFunctionMeta, WrapperMetadata};
+    use stnx::rust_wrapper::generate_wrapper_src;
 
     let metadata = WrapperMetadata {
         crate_name: "math_lib".to_string(),
@@ -663,8 +679,8 @@ fn test_rust_wrapper_cargo_toml_uses_path_dependency() {
     // Verify that the generated Cargo.toml has the correct structure
     // for a path dependency (which is what the build function uses
     // when building from a local fixture).
-    use stnx::rust_wrapper::generate_cargo_toml;
     use stnx::hir::lower::WrapperMetadata;
+    use stnx::rust_wrapper::generate_cargo_toml;
 
     let metadata = WrapperMetadata {
         crate_name: "serde_json".to_string(),
@@ -693,7 +709,10 @@ fn test_pyenv_at_construct() {
     // The python_exe path should be set correctly.
     #[cfg(windows)]
     {
-        assert_eq!(venv.python_exe, PathBuf::from("/tmp/test_venv/Scripts/python.exe"));
+        assert_eq!(
+            venv.python_exe,
+            PathBuf::from("/tmp/test_venv/Scripts/python.exe")
+        );
     }
     #[cfg(not(windows))]
     {
@@ -736,7 +755,11 @@ fn test_pyenv_search_path_format() {
     // directory and the primary site-packages, so the path contains a separator.
     #[cfg(not(windows))]
     {
-        assert!(path.contains(":"), "path should contain ':' on Unix: {}", path);
+        assert!(
+            path.contains(":"),
+            "path should contain ':' on Unix: {}",
+            path
+        );
     }
     // On Windows the venv layout is a single Lib/site-packages, so there is no
     // separator — the path is just that directory.
@@ -836,16 +859,17 @@ fn test_pyrt_handles_c_runtime() {
     let pyrt_impl = runtime_dir.join("pyrt_impl.c");
 
     if !test_c.exists() || !pyrt_impl.exists() {
-        eprintln!("WARNING: pyrt test source not found at {}; skipping", test_c.display());
+        eprintln!(
+            "WARNING: pyrt test source not found at {}; skipping",
+            test_c.display()
+        );
         return;
     }
 
     // Check if python3-config is available.
     let py_inc_out = Command::new("python3-config").arg("--includes").output();
     let py_inc = match py_inc_out {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => {
             eprintln!("python3-config not found; skipping Python runtime handle tests");
             return;
@@ -857,9 +881,7 @@ fn test_pyrt_handles_c_runtime() {
         .args(["--ldflags", "--embed"])
         .output();
     let py_ldflags = match py_ld_out {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => {
             eprintln!("python3-config --ldflags failed; skipping Python runtime handle tests");
             return;
@@ -925,4 +947,282 @@ fn test_pyrt_handles_c_runtime() {
             eprintln!("Could not run pyrt test binary: {}; skipping", e);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Real end-to-end Python execution tests
+//
+// These tests compile and *run* a Saturnite program that calls Python via
+// `use python:module`. They require:
+//   1. A C compiler (cc/gcc/clang) — required for all compile_src tests
+//   2. Python 3 development headers/libraries — required for Python interop
+//   3. A functional Python module in the import path
+//
+// If Python is not available, the test is skipped.
+// ---------------------------------------------------------------------------
+
+/// Check if Python is usable for end-to-end tests.
+fn python_available() -> bool {
+    Command::new("python3")
+        .arg("-c")
+        .arg("import sys; sys.exit(0)")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+        || Command::new("python")
+            .arg("-c")
+            .arg("import sys; sys.exit(0)")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+}
+
+#[test]
+fn test_python_end_to_end_sqrt() {
+    if !python_available() {
+        eprintln!("Python not available; skipping end-to-end test");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+
+    // Create wrapper metadata for the `math` module.
+    // The "symbol" field is the function name as seen by the Python runtime
+    // (i.e., the attribute name on the imported module). The codegen layer
+    // prepends the module name via "ecosystem::symbol".
+    //
+    // We use math.ceil (returns i64) because the `say` builtin only supports
+    // i64, str, and enum types in the runtime.
+    let metadata = r#"{
+        "module": "math",
+        "functions": [
+            {"name": "ceil", "symbol": "ceil", "params": ["f64"], "ret": "i64"},
+            {"name": "sqrt", "symbol": "sqrt", "params": ["f64"], "ret": "f64"}
+        ]
+    }"#;
+    setup_wrapper_metadata(&temp, "math", metadata);
+
+    // Saturnite program that computes ceil(81.0) = 81 (i64, printable via say).
+    let src = r#"
+use python:math
+
+fn main() -> i64 {
+    let result = math.ceil(81.0)
+    say result
+    0
+}
+"#;
+
+    let artifact = compile_src_with_root(src, temp.path());
+    let (code, out) = artifact.run();
+    assert_eq!(code, 0, "program should exit cleanly");
+    assert_eq!(
+        out, "81\n",
+        "math.ceil(81.0) should output 81, got: {:?}",
+        out
+    );
+}
+
+#[test]
+fn test_python_end_to_end_multiple_args() {
+    if !python_available() {
+        eprintln!("Python not available; skipping end-to-end test");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+
+    // Create wrapper metadata for `math.ceil` which takes a float and returns int.
+    let metadata = r#"{
+        "module": "math",
+        "functions": [
+            {"name": "ceil", "symbol": "ceil", "params": ["f64"], "ret": "i64"}
+        ]
+    }"#;
+    setup_wrapper_metadata(&temp, "math", metadata);
+
+    let src = r#"
+use python:math
+
+fn main() -> i64 {
+    let result = math.ceil(3.7)
+    say result
+    0
+}
+"#;
+
+    let artifact = compile_src_with_root(src, temp.path());
+    let (code, out) = artifact.run();
+    assert_eq!(code, 0, "program should exit cleanly");
+    assert_eq!(out, "4\n", "math.ceil(3.7) should output 4, got: {:?}", out);
+}
+
+#[test]
+fn test_python_end_to_end_math_constants() {
+    if !python_available() {
+        eprintln!("Python not available; skipping end-to-end test");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+
+    let metadata = r#"{
+        "module": "math",
+        "functions": [
+            {"name": "sqrt", "symbol": "sqrt", "params": ["f64"], "ret": "f64"},
+            {"name": "ceil", "symbol": "ceil", "params": ["f64"], "ret": "i64"}
+        ]
+    }"#;
+    setup_wrapper_metadata(&temp, "math", metadata);
+
+    let src = r#"
+use python:math
+
+fn main() -> i64 {
+    let root = math.sqrt(25.0)
+    let ceiled = math.ceil(root)
+    0
+}
+"#;
+
+    let artifact = compile_src_with_root(src, temp.path());
+    let (code, _out) = artifact.run();
+    assert_eq!(code, 0, "program should exit cleanly");
+}
+
+#[test]
+fn test_python_end_to_end_str_return() {
+    // A Python function that returns a string. The Saturnite caller uses
+    // `say` on the returned string — this exercises the codegen path that
+    // extracts the `char*` from the sat_py_result union field (index 2)
+    // and returns it as a pointer-typed local for Str results.
+    if !python_available() {
+        eprintln!("Python not available; skipping end-to-end test");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+
+    // Use the `builtins` module (always available). We call builtins.str
+    // to convert an integer to a string, then `say` prints it.
+    let metadata = r#"{
+        "module": "builtins",
+        "functions": [
+            {"name": "str", "symbol": "str", "params": ["i64"], "ret": "str"}
+        ]
+    }"#;
+    setup_wrapper_metadata(&temp, "builtins", metadata);
+
+    let src = r#"
+use python:builtins as py
+
+fn main() -> i64 {
+    let s = py.str(42)
+    say s
+    0
+}
+"#;
+
+    let artifact = compile_src_with_root(src, temp.path());
+    let (code, out) = artifact.run();
+    assert_eq!(code, 0, "program should exit cleanly");
+    assert_eq!(
+        out, "42\n",
+        "builtins.str(42) should output '42', got: {:?}",
+        out
+    );
+}
+
+#[test]
+fn test_python_end_to_end_str_concat() {
+    // Call two Python functions that return strings, then use string
+    // interpolation (which calls concat_str) to combine them.
+    if !python_available() {
+        eprintln!("Python not available; skipping end-to-end test");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+
+    let metadata = r#"{
+        "module": "builtins",
+        "functions": [
+            {"name": "str", "symbol": "str", "params": ["i64"], "ret": "str"}
+        ]
+    }"#;
+    setup_wrapper_metadata(&temp, "builtins", metadata);
+
+    let src = r#"
+use python:builtins as py
+
+fn main() -> i64 {
+    let a = py.str(42)
+    let b = py.str(99)
+    say "values: {a} and {b}"
+    0
+}
+"#;
+
+    let artifact = compile_src_with_root(src, temp.path());
+    let (code, out) = artifact.run();
+    assert_eq!(code, 0, "program should exit cleanly");
+    assert_eq!(
+        out, "values: 42 and 99\n",
+        "interpolated Python strings should be correct, got: {:?}",
+        out
+    );
+}
+
+#[test]
+fn test_python_call_flat_ir_extracts_result_fields() {
+    // Verify that the codegen for Python external calls properly handles
+    // the sat_py_result struct — it must extract the `ok` flag and use
+    // select() to zero/NULL the result on failure.
+    if !python_available() {
+        eprintln!("Python not available; skipping IR test");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+
+    let metadata = r#"{
+        "module": "math",
+        "functions": [
+            {"name": "ceil", "symbol": "ceil", "params": ["f64"], "ret": "i64"}
+        ]
+    }"#;
+    setup_wrapper_metadata(&temp, "math", metadata);
+
+    let src = r#"
+use python:math
+
+fn main() -> i64 {
+    let result = math.ceil(81.0)
+    say result
+    0
+}
+"#;
+
+    // Generate IR only (no linking) to inspect the codegen.
+    let tokens = prepare(src).expect("prepare failed");
+    let program = parser::parse(src, tokens).expect("parsing failed");
+    let mut lower = stnx::hir::HirLower::new().with_project_root(temp.path().to_path_buf());
+    let hir = lower.lower_program(&program).expect("HIR lowering failed");
+    let mir = stnx::mir::lower::lower_program(&hir).expect("MIR lowering failed");
+    let ir = stnx::mir::codegen::generate_ir_from_mir(&mir).expect("IR generation failed");
+
+    // The IR must call sat_py_call_flat.
+    assert!(
+        ir.contains("sat_py_call_flat"),
+        "IR should contain sat_py_call_flat call:\n{}",
+        ir
+    );
+
+    // The IR must extract the `ok` field (extractvalue ... 0) and use
+    // a select instruction to handle the error path.
+    assert!(
+        ir.contains("select"),
+        "IR should contain a select instruction for error handling:\n{}",
+        ir
+    );
 }

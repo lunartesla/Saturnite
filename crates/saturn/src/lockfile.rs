@@ -81,8 +81,7 @@ impl Lockfile {
     /// Compute a hash of the manifest's dependencies section.
     /// Used to detect when the lockfile is stale.
     pub fn compute_manifest_hash(deps: &BTreeMap<String, DependencySpec>) -> String {
-        let canonical = toml::to_string(deps)
-            .unwrap_or_default();
+        let canonical = toml::to_string(deps).unwrap_or_default();
         // Simple FNV-1a hash (deterministic, no external deps).
         let mut hash: u64 = 0xcbf29ce484222325;
         for byte in canonical.as_bytes() {
@@ -276,17 +275,17 @@ fn parse_version(s: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
 /// For now, it returns the version requirement as the resolved version
 /// when no registry integration is available, and records the dependency
 /// so the lockfile structure is correct.
-fn resolve_from_registry(
-    _name: &str,
-    _kind: DependencyKind,
-    version_req: &str,
-) -> Result<String> {
+fn resolve_from_registry(_name: &str, _kind: DependencyKind, version_req: &str) -> Result<String> {
     // Check if version_req is already a specific version (e.g. "1.0.3").
     if version_req == "*" || version_req.starts_with('^') || version_req.starts_with(">=") {
         // For caret / range requirements, we'd query the registry.
         // Without registry integration, we strip the operator and use
         // the bare version as the resolved version.
-        let bare = version_req.trim_start_matches('^').trim_start_matches('=').trim_start_matches('>').trim_start_matches('=');
+        let bare = version_req
+            .trim_start_matches('^')
+            .trim_start_matches('=')
+            .trim_start_matches('>')
+            .trim_start_matches('=');
         let base = bare.split('.').take(2).collect::<Vec<_>>().join(".");
         Ok(format!("{}.0", base))
     } else {

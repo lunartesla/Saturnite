@@ -401,59 +401,74 @@ mod tests {
     fn test_lex_use_python_colon() {
         // `use python:numpy` — python is an Ident, colon is a Colon
         let tokens = lex_kinds_trim("use python:numpy");
-        assert_eq!(tokens, vec![
-            TokenKind::Use,
-            TokenKind::Ident("python".to_string()),
-            TokenKind::Colon,
-            TokenKind::Ident("numpy".to_string()),
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Use,
+                TokenKind::Ident("python".to_string()),
+                TokenKind::Colon,
+                TokenKind::Ident("numpy".to_string()),
+            ]
+        );
     }
 
     #[test]
     fn test_lex_use_rust_colon() {
         let tokens = lex_kinds_trim("use rust:serde");
-        assert_eq!(tokens, vec![
-            TokenKind::Use,
-            TokenKind::Ident("rust".to_string()),
-            TokenKind::Colon,
-            TokenKind::Ident("serde".to_string()),
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Use,
+                TokenKind::Ident("rust".to_string()),
+                TokenKind::Colon,
+                TokenKind::Ident("serde".to_string()),
+            ]
+        );
     }
 
     #[test]
     fn test_lex_use_native_colon() {
         let tokens = lex_kinds_trim("use native:libc");
-        assert_eq!(tokens, vec![
-            TokenKind::Use,
-            TokenKind::Ident("native".to_string()),
-            TokenKind::Colon,
-            TokenKind::Ident("libc".to_string()),
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Use,
+                TokenKind::Ident("native".to_string()),
+                TokenKind::Colon,
+                TokenKind::Ident("libc".to_string()),
+            ]
+        );
     }
 
     #[test]
     fn test_lex_use_python_with_alias() {
         let tokens = lex_kinds_trim("use python:numpy as np");
-        assert_eq!(tokens, vec![
-            TokenKind::Use,
-            TokenKind::Ident("python".to_string()),
-            TokenKind::Colon,
-            TokenKind::Ident("numpy".to_string()),
-            TokenKind::As,
-            TokenKind::Ident("np".to_string()),
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Use,
+                TokenKind::Ident("python".to_string()),
+                TokenKind::Colon,
+                TokenKind::Ident("numpy".to_string()),
+                TokenKind::As,
+                TokenKind::Ident("np".to_string()),
+            ]
+        );
     }
 
     #[test]
     fn test_lex_use_rust_dotted_path() {
         // `use rust:serde` is distinct from `use serde::de` (no ecosystem)
         let tokens = lex_kinds_trim("use serde::de");
-        assert_eq!(tokens, vec![
-            TokenKind::Use,
-            TokenKind::Ident("serde".to_string()),
-            TokenKind::DoubleColon,
-            TokenKind::Ident("de".to_string()),
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Use,
+                TokenKind::Ident("serde".to_string()),
+                TokenKind::DoubleColon,
+                TokenKind::Ident("de".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -494,24 +509,30 @@ mod tests {
     fn test_lex_qualified_call_syntax() {
         // `math.sqrt(81.0)` — dot, call, parens
         let tokens = lex_kinds_trim("math.sqrt(81.0)");
-        assert_eq!(tokens, vec![
-            TokenKind::Ident("math".to_string()),
-            TokenKind::Dot,
-            TokenKind::Ident("sqrt".to_string()),
-            TokenKind::LParen,
-            TokenKind::Float(81.0),
-            TokenKind::RParen,
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Ident("math".to_string()),
+                TokenKind::Dot,
+                TokenKind::Ident("sqrt".to_string()),
+                TokenKind::LParen,
+                TokenKind::Float(81.0),
+                TokenKind::RParen,
+            ]
+        );
     }
 
     #[test]
     fn test_lex_qualified_call_no_parens_is_field_access() {
         let tokens = lex_kinds_trim("math.value");
-        assert_eq!(tokens, vec![
-            TokenKind::Ident("math".to_string()),
-            TokenKind::Dot,
-            TokenKind::Ident("value".to_string()),
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Ident("math".to_string()),
+                TokenKind::Dot,
+                TokenKind::Ident("value".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -521,7 +542,8 @@ mod tests {
         for kw in ["python", "rust", "native"] {
             let tokens = lex_kinds(kw);
             // Strip trailing Eof/Newline
-            let real: Vec<_> = tokens.into_iter()
+            let real: Vec<_> = tokens
+                .into_iter()
                 .filter(|t| !matches!(t, TokenKind::Newline | TokenKind::Eof))
                 .collect();
             assert_eq!(
@@ -537,14 +559,17 @@ mod tests {
     fn test_lex_str_literal_argument() {
         // String literal argument to a qualified call
         let tokens = lex_kinds_trim(r#"py_builtins.len("hello")"#);
-        assert_eq!(tokens, vec![
-            TokenKind::Ident("py_builtins".to_string()),
-            TokenKind::Dot,
-            TokenKind::Ident("len".to_string()),
-            TokenKind::LParen,
-            TokenKind::StrLit("hello".to_string()),
-            TokenKind::RParen,
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Ident("py_builtins".to_string()),
+                TokenKind::Dot,
+                TokenKind::Ident("len".to_string()),
+                TokenKind::LParen,
+                TokenKind::StrLit("hello".to_string()),
+                TokenKind::RParen,
+            ]
+        );
     }
 
     #[test]

@@ -796,7 +796,7 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
             // We require the parens so that bare `namespace.member` field access
             // is still handled by the postfix operator below.
             .or(t_ident()
-                .then(dot().ignore_then(t_ident()))
+                .then(dot().ignore_then(t_member_ident()))
                 .then(
                     double_colon()
                         .ignore_then(lt())
@@ -1251,7 +1251,12 @@ fn recursive_expr<'a>() -> Recursive<Direct<'a, 'a, &'a [Token], Expr, ParserExt
 
         base_expr
             .clone()
-            .then(dot().ignore_then(t_ident()).repeated().collect::<Vec<_>>())
+            .then(
+                dot()
+                    .ignore_then(t_member_ident())
+                    .repeated()
+                    .collect::<Vec<_>>(),
+            )
             .map(|(base, accesses)| {
                 let mut expr = base;
                 for (field_name, field_span) in accesses {
@@ -1443,6 +1448,33 @@ fn t_ident<'a>() -> impl Parser<'a, &'a [Token], (String, Range<usize>), ParserE
         )
         .map(|t| match &t.kind {
             TokenKind::Ident(s) => (s.clone(), t.span.clone()),
+            _ => unreachable!(),
+        })
+}
+
+/// Like `t_ident`, but also accepts keyword tokens (e.g. `str`, `i64`, `bool`)
+/// as member names. Used for qualified calls like `py.str(42)` where `str`
+/// is lexed as `TokenKind::Str` rather than `TokenKind::Ident`.
+fn t_member_ident<'a>() -> impl Parser<'a, &'a [Token], (String, Range<usize>), ParserExtra<'a>> {
+    any::<&[Token], _>()
+        .filter(|t: &Token| {
+            matches!(&t.kind, TokenKind::Ident(s) if !is_keyword(s) || s == "length")
+                || matches!(
+                    &t.kind,
+                    TokenKind::Str
+                        | TokenKind::I64
+                        | TokenKind::F64
+                        | TokenKind::Bool
+                        | TokenKind::Unit
+                )
+        })
+        .map(|t| match &t.kind {
+            TokenKind::Ident(s) => (s.clone(), t.span.clone()),
+            TokenKind::Str => ("str".to_string(), t.span.clone()),
+            TokenKind::I64 => ("i64".to_string(), t.span.clone()),
+            TokenKind::F64 => ("f64".to_string(), t.span.clone()),
+            TokenKind::Bool => ("bool".to_string(), t.span.clone()),
+            TokenKind::Unit => ("unit".to_string(), t.span.clone()),
             _ => unreachable!(),
         })
 }
@@ -2266,7 +2298,14 @@ mod tests {
         let prog = parse_src(r#"external python "json" "dumps"(x: i64) -> i64"#);
         assert_eq!(prog.items.len(), 1);
         match &prog.items[0].kind {
-            ItemKind::ExternalFunction { kind, ecosystem, symbol, params, return_type, .. } => {
+            ItemKind::ExternalFunction {
+                kind,
+                ecosystem,
+                symbol,
+                params,
+                return_type,
+                ..
+            } => {
                 assert_eq!(*kind, ExternalKind::Python);
                 assert_eq!(ecosystem, "json");
                 assert_eq!(symbol, "dumps");
@@ -2283,7 +2322,14 @@ mod tests {
         let prog = parse_src(r#"external rust "libc" "malloc"(n: i64) -> i64"#);
         assert_eq!(prog.items.len(), 1);
         match &prog.items[0].kind {
-            ItemKind::ExternalFunction { kind, ecosystem, symbol, params, return_type, .. } => {
+            ItemKind::ExternalFunction {
+                kind,
+                ecosystem,
+                symbol,
+                params,
+                return_type,
+                ..
+            } => {
                 assert_eq!(*kind, ExternalKind::Rust);
                 assert_eq!(ecosystem, "libc");
                 assert_eq!(symbol, "malloc");
@@ -2300,7 +2346,14 @@ mod tests {
         let prog = parse_src(r#"external native "libm" "sin"(x: f64) -> f64"#);
         assert_eq!(prog.items.len(), 1);
         match &prog.items[0].kind {
-            ItemKind::ExternalFunction { kind, ecosystem, symbol, params, return_type, .. } => {
+            ItemKind::ExternalFunction {
+                kind,
+                ecosystem,
+                symbol,
+                params,
+                return_type,
+                ..
+            } => {
                 assert_eq!(*kind, ExternalKind::Native);
                 assert_eq!(ecosystem, "libm");
                 assert_eq!(symbol, "sin");
@@ -2314,11 +2367,13 @@ mod tests {
 
     #[test]
     fn test_parse_external_multi_param() {
-        let prog = parse_src(
-            r#"external python "os" "path_join"(a: str, b: str, c: i64) -> str"#
-        );
+        let prog = parse_src(r#"external python "os" "path_join"(a: str, b: str, c: i64) -> str"#);
         match &prog.items[0].kind {
-            ItemKind::ExternalFunction { params, return_type, .. } => {
+            ItemKind::ExternalFunction {
+                params,
+                return_type,
+                ..
+            } => {
                 assert_eq!(params.len(), 3);
                 assert_eq!(params[0], ("a".to_string(), Type::Str));
                 assert_eq!(params[1], ("b".to_string(), Type::Str));
@@ -2331,9 +2386,7 @@ mod tests {
 
     #[test]
     fn test_parse_external_void_return() {
-        let prog = parse_src(
-            r#"external rust "libc" "free"(ptr: i64) -> unit"#
-        );
+        let prog = parse_src(r#"external rust "libc" "free"(ptr: i64) -> unit"#);
         match &prog.items[0].kind {
             ItemKind::ExternalFunction { return_type, .. } => {
                 assert_eq!(*return_type, Type::Unit);
@@ -2344,12 +2397,13 @@ mod tests {
 
     #[test]
     fn test_parse_external_without_params() {
-        let prog = parse_src(
-            r#"external python "sys" "version"() -> i64"#
-        );
+        let prog = parse_src(r#"external python "sys" "version"() -> i64"#);
         match &prog.items[0].kind {
             ItemKind::ExternalFunction { params, .. } => {
-                assert!(params.is_empty(), "no-param external should have empty params");
+                assert!(
+                    params.is_empty(),
+                    "no-param external should have empty params"
+                );
             }
             other => panic!("expected ExternalFunction, got {:?}", other),
         }
@@ -2362,7 +2416,8 @@ mod tests {
         let msg = format!("{}", err);
         assert!(
             msg.contains("expected") || msg.contains("external"),
-            "error should mention the expected kind, got: {}", msg
+            "error should mention the expected kind, got: {}",
+            msg
         );
     }
 
@@ -2370,12 +2425,14 @@ mod tests {
 
     #[test]
     fn test_parse_qualified_call_with_str_arg() {
-        let prog = parse_src(r#"
+        let prog = parse_src(
+            r#"
 fn main() -> i64 {
     let n = builtins.len("hello")
     n
 }
-"#);
+"#,
+        );
         // Should parse without errors; check that the function was created
         assert!(prog.functions.len() >= 1);
     }
@@ -2383,24 +2440,28 @@ fn main() -> i64 {
     #[test]
     fn test_parse_qualified_call_multiple_arg_types() {
         // Call with mixed arg types: i64, str, bool
-        let prog = parse_src(r#"
+        let prog = parse_src(
+            r#"
 fn main() -> i64 {
     let result = py_math.compute(42, "text", true)
     result
 }
-"#);
+"#,
+        );
         assert!(prog.functions.len() >= 1);
     }
 
     #[test]
     fn test_parse_qualified_call_field_access_str_arg() {
         // `module.value` (field access, not a call)
-        let prog = parse_src(r#"
+        let prog = parse_src(
+            r#"
 fn main() -> i64 {
     let x = lib.value
     x
 }
-"#);
+"#,
+        );
         assert!(prog.functions.len() >= 1);
     }
 
@@ -2417,7 +2478,11 @@ use mymod::submod
         // First three should be ecosystem imports
         let json = &prog.items[0];
         match &json.kind {
-            ItemKind::UseDecl { path, alias, ecosystem } => {
+            ItemKind::UseDecl {
+                path,
+                alias,
+                ecosystem,
+            } => {
                 assert_eq!(path, &vec!["json".to_string()]);
                 assert_eq!(alias.as_deref(), Some("json"));
                 assert_eq!(*ecosystem, Some(ExternalKind::Python));
@@ -2457,7 +2522,11 @@ use mymod::submod
         let prog = parse_src("use rust:serde as s\n");
         assert_eq!(prog.items.len(), 1);
         match &prog.items[0].kind {
-            ItemKind::UseDecl { path, ecosystem, alias } => {
+            ItemKind::UseDecl {
+                path,
+                ecosystem,
+                alias,
+            } => {
                 assert_eq!(*ecosystem, Some(ExternalKind::Rust));
                 assert_eq!(path, &vec!["serde".to_string()]);
                 assert_eq!(alias.as_deref(), Some("s"));
@@ -2472,7 +2541,11 @@ use mymod::submod
         let prog = parse_src("use python:os\n");
         assert_eq!(prog.items.len(), 1);
         match &prog.items[0].kind {
-            ItemKind::UseDecl { path, alias, ecosystem } => {
+            ItemKind::UseDecl {
+                path,
+                alias,
+                ecosystem,
+            } => {
                 assert_eq!(*ecosystem, Some(ExternalKind::Python));
                 assert_eq!(path, &vec!["os".to_string()]);
                 assert_eq!(*alias, None);
@@ -2487,7 +2560,9 @@ use mymod::submod
         assert_eq!(prog.items.len(), 1);
         assert_eq!(prog.items[0].visibility, Visibility::Public);
         match &prog.items[0].kind {
-            ItemKind::UseDecl { ecosystem, alias, .. } => {
+            ItemKind::UseDecl {
+                ecosystem, alias, ..
+            } => {
                 assert_eq!(*ecosystem, Some(ExternalKind::Python));
                 assert_eq!(alias.as_deref(), Some("np"));
             }

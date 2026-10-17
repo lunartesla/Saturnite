@@ -1118,9 +1118,16 @@ fn gen_external_call<'ctx>(
                 ],
                 false,
             );
-            let call_fn = ctx
-                .module
-                .add_function("sat_py_call_flat", call_fn_ty, None);
+            // Reuse the function declaration if it already exists (multiple Python
+            // calls in the same module would otherwise cause LLVM to append a
+            // numeric suffix like "sat_py_call_flat.3" on COFF/Windows, which the
+            // linker can't resolve against the runtime archive).
+            let call_fn = if let Some(existing) = ctx.module.get_function("sat_py_call_flat") {
+                existing
+            } else {
+                ctx.module
+                    .add_function("sat_py_call_flat", call_fn_ty, None)
+            };
             let _call = ctx
                 .builder
                 .build_call(
@@ -1142,22 +1149,165 @@ fn gen_external_call<'ctx>(
                     CompilerError::codegen(format!("failed to emit sat_py_call_flat: {}", e))
                 })?;
 
-            // Read the result union field (index 2) out of the struct.
-            // inkwell requires an aggregate *value* (not the call site) for
-            // `build_extract_value`, so load the struct back from the alloca.
+            // Load the result struct back from the alloca and extract the
+            // relevant fields. The `sat_py_result` struct layout (matching
+            // pyrt.h) is:
+            //   [0] bool ok
+            //   [1] i32 kind
+            //   [2] i64 union (bool/i64/f64, or char* for str)
+            //   [3] i64 str_len
+            //   [4] ptr error_class
+            //   [5] ptr error_message
+            //   [6] ptr handle (opaque object, or NULL for primitives)
             let out_loaded = ctx
                 .builder
                 .build_load(sat_py_result_ty, out_alloca, "py_out_val")
                 .map_err(|e| CompilerError::codegen(format!("failed to load py out: {}", e)))?;
+            let out_sv = out_loaded.into_struct_value();
+
+            let ok_val = ctx
+                .builder
+                .build_extract_value(out_sv, 0, "py_ok")
+                .map_err(|e| CompilerError::codegen(format!("failed to extract py_ok: {}", e)))?;
+            let ok_cond = ok_val.into_int_value();
+
+            // Select between the success path (union value) and error path
+            // (zero/NULL) based on the `ok` flag. When the Python call raised,
+            // the runtime sets `ok = false` and the union is zeroed, so
+            // returning zero is safe for all primitive return types.
+            //
+            // For opaque handle returns (ret_ty is a struct/enum/list or
+            // otherwise not ABI-safe), we also check the `ok` flag: on
+            // failure, `handle` is NULL, which is a safe sentinel.
             let result_val = ctx
                 .builder
-                .build_extract_value(out_loaded.into_struct_value(), 2, "py_val")
+                .build_extract_value(out_sv, 2, "py_val")
                 .map_err(|e| CompilerError::codegen(format!("failed to extract py_val: {}", e)))?;
 
-            // If the call failed, the runtime leaves the value field zero-
-            // initialized (we zero the struct before the call), so the
-            // result is well-defined even on failure.
-            Ok(result_val)
+            // The union field at index 2 is stored as i64 in the LLVM struct.
+            // Convert it to the type expected by the local based on ret_ty:
+            //   - Str:    i64 → ptr (via int_to_ptr, the str_buf pointer)
+            //   - F64:    i64 → double (via bitcast, the f64 bits)
+            //   - Bool:   i64 → i1 (via truncate, then zero-extend)
+            //   - I64:    direct (already i64)
+            //   - Unit/Struct/Enum/List: i64 → ptr (opaque handle or zero)
+            let val_i64 = result_val.into_int_value();
+            match ret_ty {
+                HirType::Str => {
+                    // int_to_ptr i64 → ptr (str_buf pointer)
+                    let ptr_val = ctx
+                        .builder
+                        .build_int_to_ptr(val_i64, ptr_ty, "py_str_ptr")
+                        .map_err(|e| {
+                            CompilerError::codegen(format!(
+                                "failed to int_to_ptr for py str result: {}",
+                                e
+                            ))
+                        })?;
+                    // Select between the pointer and NULL based on ok flag.
+                    let null_ptr = ptr_ty.const_null();
+                    Ok(ctx
+                        .builder
+                        .build_select(ok_cond, ptr_val, null_ptr, "py_ret")
+                        .map_err(|e| {
+                            CompilerError::codegen(format!("failed to select py str result: {}", e))
+                        })?)
+                }
+                HirType::F64 => {
+                    // bitcast i64 → double (the f64_val is stored as i64
+                    // in the union at the C level; we reinterpret the bits).
+                    let f64_ty = ctx.context.f64_type();
+                    let f64_val = ctx
+                        .builder
+                        .build_bit_cast(val_i64, f64_ty, "py_f64_val")
+                        .map_err(|e| {
+                            CompilerError::codegen(format!(
+                                "failed to bitcast py f64 result: {}",
+                                e
+                            ))
+                        })?;
+                    let zero_f64 = f64_ty.const_float(0.0);
+                    // FloatValue does not implement BasicValue in inkwell 0.9,
+                    // so convert to BasicValueEnum for build_select.
+                    Ok(ctx
+                        .builder
+                        .build_select(
+                            ok_cond,
+                            f64_val.as_basic_value_enum(),
+                            zero_f64.as_basic_value_enum(),
+                            "py_ret",
+                        )
+                        .map_err(|e| {
+                            CompilerError::codegen(format!("failed to select py f64 result: {}", e))
+                        })?)
+                }
+                HirType::Bool => {
+                    // i64 → i1 (truncate to bool)
+                    let bool_ty = ctx.context.bool_type();
+                    let bool_val = ctx
+                        .builder
+                        .build_int_truncate(val_i64, bool_ty, "py_bool_val")
+                        .map_err(|e| {
+                            CompilerError::codegen(format!(
+                                "failed to truncate py bool result: {}",
+                                e
+                            ))
+                        })?;
+                    let zero_bool = bool_ty.const_int(0, false);
+                    Ok(ctx
+                        .builder
+                        .build_select(ok_cond, bool_val, zero_bool, "py_ret")
+                        .map_err(|e| {
+                            CompilerError::codegen(format!(
+                                "failed to select py bool result: {}",
+                                e
+                            ))
+                        })?)
+                }
+                _ => {
+                    // For I64, Unit, Struct, Enum, List, etc., the union
+                    // field is i64. For pointer-typed returns (struct/enum/
+                    // list), convert via int_to_ptr. For I64/Unit, return
+                    // directly.
+                    match mir_type_to_llvm(ctx.context, prog, ret_ty) {
+                        BasicTypeEnum::PointerType(_) => {
+                            // int_to_ptr for opaque handle / struct / enum / list
+                            let ptr_val = ctx
+                                .builder
+                                .build_int_to_ptr(val_i64, ptr_ty, "py_obj_ptr")
+                                .map_err(|e| {
+                                    CompilerError::codegen(format!(
+                                        "failed to int_to_ptr for py obj result: {}",
+                                        e
+                                    ))
+                                })?;
+                            let null_ptr = ptr_ty.const_null();
+                            Ok(ctx
+                                .builder
+                                .build_select(ok_cond, ptr_val, null_ptr, "py_ret")
+                                .map_err(|e| {
+                                    CompilerError::codegen(format!(
+                                        "failed to select py obj result: {}",
+                                        e
+                                    ))
+                                })?)
+                        }
+                        _ => {
+                            // I64 or Unit: return i64 directly (zero on error)
+                            let zero = i64_ty.const_int(0, false);
+                            Ok(ctx
+                                .builder
+                                .build_select(ok_cond, val_i64, zero, "py_ret")
+                                .map_err(|e| {
+                                    CompilerError::codegen(format!(
+                                        "failed to select py i64 result: {}",
+                                        e
+                                    ))
+                                })?)
+                        }
+                    }
+                }
+            }
         }
     }
 }

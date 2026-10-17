@@ -11,8 +11,13 @@ use common::{analyze_src, compile_src, ir_only};
 
 /// Full pipeline: compile an interpolated program and run it, returning
 /// (exit_code, stdout).
+///
+/// On Windows, the MSVC UCRT translates `\n` to `\r\n` in stdout when writing
+/// in text mode, which would break exact-string assertions. This helper
+/// normalizes CRLF to LF so tests are cross-platform.
 fn run_src(src: &str) -> (i32, String) {
-    compile_src(src).run()
+    let (code, out) = compile_src(src).run();
+    (code, out.replace("\r\n", "\n"))
 }
 
 #[test]

@@ -224,7 +224,11 @@ entry = "main"
                 .map(|(k, v)| match v {
                     // Saturnite deps use the simple form; others need the full form.
                     DependencySpec::Simple(v) => format!("{} = \"{}\"", k, v),
-                    DependencySpec::Full { kind, version, target } => {
+                    DependencySpec::Full {
+                        kind,
+                        version,
+                        target,
+                    } => {
                         let kind_str = match kind {
                             DependencyKind::Saturnite => "saturnite",
                             DependencyKind::Rust => "rust",

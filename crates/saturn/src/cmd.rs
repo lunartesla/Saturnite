@@ -175,10 +175,11 @@ fn parse_dep_spec(input: &str) -> Result<(String, DependencySpec)> {
     };
 
     // Split the rest into name and version spec.
-    let (name, version) = match rest.find(|c: char| c == '@' || c == '>' || c == '<' || c == '=' || c == '^') {
-        Some(idx) => (&rest[..idx], Some(&rest[idx..])),
-        None => (rest, None),
-    };
+    let (name, version) =
+        match rest.find(|c: char| c == '@' || c == '>' || c == '<' || c == '=' || c == '^') {
+            Some(idx) => (&rest[..idx], Some(&rest[idx..])),
+            None => (rest, None),
+        };
 
     // Strip the leading '@' if present (e.g. "@1.0" → "1.0").
     let version_str = version
@@ -218,7 +219,12 @@ pub fn add_dependency(project_root: &Path, dep_spec: &str) -> Result<()> {
     lockfile.add(&manifest.dependencies, &name, &spec)?;
     lockfile.save(project_root)?;
 
-    println!("Added dependency: {} ({:?}) {}", name, spec.kind(), spec.version());
+    println!(
+        "Added dependency: {} ({:?}) {}",
+        name,
+        spec.kind(),
+        spec.version()
+    );
     println!("  → saturn.toml updated");
     println!("  → saturn.lock updated");
 
@@ -286,9 +292,11 @@ pub fn install_dependencies(project_root: &Path, force: bool) -> Result<()> {
         }
     }
 
-    println!("\nLockfile written to {} ({} dependencies)",
-             lockfile_path(project_root).display(),
-             new_count);
+    println!(
+        "\nLockfile written to {} ({} dependencies)",
+        lockfile_path(project_root).display(),
+        new_count
+    );
 
     Ok(())
 }
@@ -298,11 +306,7 @@ pub fn install_dependencies(project_root: &Path, force: bool) -> Result<()> {
 /// - If `dep_name` is Some, only that dependency is updated.
 /// - If `all` is true, all dependencies are updated.
 /// - If neither, prints usage.
-pub fn update_dependencies(
-    project_root: &Path,
-    dep_name: Option<&str>,
-    all: bool,
-) -> Result<()> {
+pub fn update_dependencies(project_root: &Path, dep_name: Option<&str>, all: bool) -> Result<()> {
     let manifest = Manifest::from_dir(project_root)?;
     let mut lockfile = Lockfile::load(project_root)?;
 
@@ -326,9 +330,10 @@ pub fn update_dependencies(
         }
         lockfile.resolve(&manifest.dependencies)?;
     } else if let Some(name) = dep_name {
-        let spec = manifest.dependencies.get(name).ok_or_else(|| {
-            anyhow::anyhow!("dependency '{}' is not in saturn.toml", name)
-        })?;
+        let spec = manifest
+            .dependencies
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("dependency '{}' is not in saturn.toml", name))?;
         let resolved_before = lockfile
             .dependencies
             .get(name)
@@ -340,7 +345,10 @@ pub fn update_dependencies(
             .get(name)
             .map(|d| d.version.clone())
             .unwrap_or_default();
-        println!("  updated {}: {} → {}", name, resolved_before, resolved_after);
+        println!(
+            "  updated {}: {} → {}",
+            name, resolved_before, resolved_after
+        );
     }
 
     lockfile.save(project_root)?;
@@ -353,8 +361,12 @@ pub fn update_dependencies(
 fn lockfile_update(_name: &str, spec: &DependencySpec) -> Result<String> {
     let version_req = spec.version();
     // For now, re-use the same resolution logic (no registry lookup yet).
-    Ok(version_req.trim_start_matches('^').trim_start_matches('=').trim_start_matches('>')
-        .trim_start_matches('=').to_string())
+    Ok(version_req
+        .trim_start_matches('^')
+        .trim_start_matches('=')
+        .trim_start_matches('>')
+        .trim_start_matches('=')
+        .to_string())
 }
 
 /// Path to the lockfile within a project root.

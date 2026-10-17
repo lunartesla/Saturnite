@@ -90,56 +90,111 @@ impl<'cfg> Linker<'cfg> {
 
         // Add Python library if any Python externals are declared.
         if has_python {
-            // Try to get the Python library from the build script env var.
-            // Fall back to python3-config at link time, then to a default.
-            let py_lib = std::env::var("SAT_PYTHON_LIB")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    // Try python3-config at link time.
-                    std::process::Command::new("python3-config")
-                        .args(["--ldflags", "--embed"])
-                        .output()
-                        .ok()
-                        .filter(|o| o.status.success())
-                        .and_then(|o| {
-                            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                            for flag in s.split_whitespace() {
-                                if let Some(lib) = flag.strip_prefix("-l") {
-                                    return Some(lib.to_string());
-                                }
-                            }
-                            None
-                        })
-                })
-                .unwrap_or_else(|| "python3.13".to_string());
+            if matches!(env, Environment::Msvc) {
+                // MSVC link.exe doesn't understand -l flags; use /DEFAULTLIB:
+                // instead. The Python lib name comes from the build script env
+                // var (SAT_PYTHON_LIB), or is discovered at link time via the
+                // `python` executable.
+                let py_lib = std::env::var("SAT_PYTHON_LIB")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        // Query the Python installation at link time.
+                        let out = std::process::Command::new("python")
+                            .arg("-c")
+                            .arg("import sysconfig; print(sysconfig.get_config_var('LDLIBRARY') or '')")
+                            .output()
+                            .ok()?;
+                        if !out.status.success() {
+                            return None;
+                        }
+                        let ldlib = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        // LDLIBRARY on Windows is like "python313.dll"; the
+                        // import lib is "python3.lib".
+                        Some("python3".to_string())
+                    })
+                    .unwrap_or_else(|| "python3".to_string());
+                args.push(format!("/DEFAULTLIB:{}", py_lib));
 
-            // Also add library search path if available.
-            if let Ok(py_libdir) = std::env::var("SAT_PYTHON_LIBDIR") {
-                if !py_libdir.is_empty() {
-                    args.push(format!("-L{}", py_libdir));
+                // On Windows, the CRT is already linked via /DEFAULTLIB in
+                // build_linker_args, so we don't need -lpthread/-ldl/-lutil/-lm.
+                // The Windows SDK and CRT provide threading and math implicitly.
+                // Try to find the Python lib directory at link time.
+                let py_libdir = std::env::var("SAT_PYTHON_LIBDIR")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        let out = std::process::Command::new("python")
+                            .arg("-c")
+                            .arg(
+                                "import sysconfig; print(sysconfig.get_config_var('LIBDIR') or '')",
+                            )
+                            .output()
+                            .ok()?;
+                        if !out.status.success() {
+                            return None;
+                        }
+                        let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        if dir.is_empty() {
+                            None
+                        } else {
+                            Some(dir)
+                        }
+                    });
+                if let Some(libdir) = py_libdir {
+                    if !libdir.is_empty() {
+                        args.push(format!("/LIBPATH:{}", libdir));
+                    }
                 }
-            } else if let Ok(out) = std::process::Command::new("python3-config")
-                .args(["--ldflags", "--embed"])
-                .output()
-            {
-                if out.status.success() {
-                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    for flag in s.split_whitespace() {
-                        if let Some(dir) = flag.strip_prefix("-L") {
-                            if !dir.is_empty() {
-                                args.push(format!("-L{}", dir));
+            } else {
+                // Unix (Linux/macOS/GNU): use -l flags.
+                let py_lib = std::env::var("SAT_PYTHON_LIB")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        std::process::Command::new("python3-config")
+                            .args(["--ldflags", "--embed"])
+                            .output()
+                            .ok()
+                            .filter(|o| o.status.success())
+                            .and_then(|o| {
+                                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                for flag in s.split_whitespace() {
+                                    if let Some(lib) = flag.strip_prefix("-l") {
+                                        return Some(lib.to_string());
+                                    }
+                                }
+                                None
+                            })
+                    })
+                    .unwrap_or_else(|| "python3.13".to_string());
+
+                if let Ok(py_libdir) = std::env::var("SAT_PYTHON_LIBDIR") {
+                    if !py_libdir.is_empty() {
+                        args.push(format!("-L{}", py_libdir));
+                    }
+                } else if let Ok(out) = std::process::Command::new("python3-config")
+                    .args(["--ldflags", "--embed"])
+                    .output()
+                {
+                    if out.status.success() {
+                        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        for flag in s.split_whitespace() {
+                            if let Some(dir) = flag.strip_prefix("-L") {
+                                if !dir.is_empty() {
+                                    args.push(format!("-L{}", dir));
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            args.push(format!("-l{}", py_lib));
-            args.push("-lpthread".to_string());
-            args.push("-ldl".to_string());
-            args.push("-lutil".to_string());
-            args.push("-lm".to_string());
+                args.push(format!("-l{}", py_lib));
+                args.push("-lpthread".to_string());
+                args.push("-ldl".to_string());
+                args.push("-lutil".to_string());
+                args.push("-lm".to_string());
+            }
         }
 
         let linker_name = linker_cmd.first().map(|s| s.as_str()).unwrap_or("cc");
@@ -403,7 +458,9 @@ pub fn check_linker_available(target_config: &TargetConfig) -> Result<(), Compil
                 // MSVC's link.exe /? returns a non-zero exit code, so any
                 // process launch that doesn't fail is sufficient to confirm
                 // the linker binary is present and runnable.
-                Ok(output) if matches!((os, env), (OperatingSystem::Windows, Environment::Msvc)) => {
+                Ok(output)
+                    if matches!((os, env), (OperatingSystem::Windows, Environment::Msvc)) =>
+                {
                     if output.status.code().is_some() {
                         Ok(())
                     } else {
@@ -479,8 +536,7 @@ fn resolve_linker_path(
             }
         }
     }
-    which::which(name)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))
+    which::which(name).map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))
 }
 
 /// Find `rust-lld.exe` from the Rust toolchain.

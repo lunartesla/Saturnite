@@ -49,10 +49,12 @@ fn main() {
     // This links against the system CPython library. It is opt-in: a pure
     // Saturnite program with no Python dependency does not need it, but the
     // shim is always compiled into the runtime archive so that a Python-
-    // enabled program can link against it. The Python headers are discovered
-    // via `python3-config` when available; if Python is not installed, the
-    // shim is skipped and Python interop is unavailable at runtime (a clear
-    // diagnostic is produced at compile time, not a silent omission).
+    // enabled program can link against it.
+    //
+    // Python headers and library paths are discovered via `python3-config`
+    // on Unix, or via `python` + `sysconfig` on Windows. If Python is not
+    // installed, the shim is skipped and Python interop is unavailable at
+    // runtime (a warning is produced at compile time).
     let pyrt_h = runtime_dir.join("pyrt.h");
     let pyrt_impl = runtime_dir.join("pyrt_impl.c");
     if pyrt_impl.exists() {
@@ -62,62 +64,118 @@ fn main() {
         let py_ldflags = std::process::Command::new("python3-config")
             .args(["--ldflags", "--embed"])
             .output();
-        match (py_inc, py_ldflags) {
-            (Ok(inc), Ok(ld)) if inc.status.success() && ld.status.success() => {
-                let inc_str = String::from_utf8_lossy(&inc.stdout).trim().to_string();
-                let ld_str = String::from_utf8_lossy(&ld.stdout).trim().to_string();
-                // `python3-config --includes` returns `-I<path>` flags; cc's
-                // `include()` takes a bare directory path.
-                let mut inc_dirs: Vec<String> = Vec::new();
-                for flag in inc_str.split_whitespace() {
-                    if let Some(dir) = flag.strip_prefix("-I") {
-                        if !dir.is_empty() {
-                            inc_dirs.push(dir.to_string());
-                            build.include(dir);
-                        }
-                    }
+        let unix_ok = py_inc.is_ok()
+            && py_ldflags.is_ok()
+            && py_inc.as_ref().map(|o| o.status.success()).unwrap_or(false)
+            && py_ldflags
+                .as_ref()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+        let (inc_str, ld_str) = if unix_ok {
+            (
+                String::from_utf8_lossy(&py_inc.unwrap().stdout)
+                    .trim()
+                    .to_string(),
+                String::from_utf8_lossy(&py_ldflags.unwrap().stdout)
+                    .trim()
+                    .to_string(),
+            )
+        } else if std::env::consts::OS == "windows" {
+            // On Windows, `python3-config` doesn't exist. Use `python` to query
+            // sysconfig for include and library paths.
+            let query = |expr: &str| -> Option<String> {
+                let out = std::process::Command::new("python")
+                    .arg("-c")
+                    .arg(format!(
+                        "import sysconfig; print(sysconfig.get_config_var({:?}))",
+                        expr
+                    ))
+                    .output()
+                    .ok()?;
+                if !out.status.success() {
+                    return None;
                 }
-                build.file(&pyrt_impl);
-                build.include(&runtime_dir);
-                // The Python library is NOT linked into the runtime archive
-                // unconditionally: a pure Saturnite program with no Python
-                // dependency must compile and link without Python. The
-                // pyrt_impl.o object is only pulled from the archive when a
-                // Python-enabled program references it; the linker stage
-                // (see `codegen::linker`) adds `-lpython3.13` to the link
-                // line only when a Python dependency is present.
-                let mut lib_dir = String::new();
-                let mut lib_name = String::new();
-                for flag in ld_str.split_whitespace() {
-                    if let Some(dir) = flag.strip_prefix("-L") {
-                        if !dir.is_empty() {
-                            lib_dir = dir.to_string();
-                        }
-                    } else if let Some(lib) = flag.strip_prefix("-l") {
-                        if !lib.is_empty() {
-                            lib_name = lib.to_string();
-                        }
-                    }
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
                 }
-                if !lib_name.is_empty() {
-                    println!("cargo:rustc-env:SAT_PYTHON_LIB={}", lib_name);
-                }
-                if !lib_dir.is_empty() {
-                    println!("cargo:rustc-env:SAT_PYTHON_LIBDIR={}", lib_dir);
-                }
-                if !inc_dirs.is_empty() {
-                    println!("cargo:rustc-env:SAT_PYTHON_INC={}", inc_dirs.join(","));
-                }
-                println!("cargo:rerun-if-changed={}", pyrt_h.display());
-                println!("cargo:rerun-if-changed={}", pyrt_impl.display());
+            };
+
+            let inc = query("INCLUDEPY");
+            let libdir = query("LIBDIR");
+            let inc_dir = inc.unwrap_or_default();
+            let lib_dir = libdir.unwrap_or_default();
+
+            if inc_dir.is_empty() && lib_dir.is_empty() {
+                (String::new(), String::new())
+            } else {
+                let inc_flag = if inc_dir.is_empty() {
+                    String::new()
+                } else {
+                    format!("-I{}", inc_dir)
+                };
+                // MSVC Python ships the import library as "python3.lib"
+                // (the standard name on all CPython 3.x Windows installs).
+                let lib_name = "python3".to_string();
+                (inc_flag, format!("-L{} -l{}", lib_dir, lib_name))
             }
-            _ => {
-                eprintln!(
-                    "warning: Python headers/libraries not found via python3-config; \
-                     Python interoperability will be unavailable at runtime."
-                );
+        } else {
+            (String::new(), String::new())
+        };
+
+        if inc_str.is_empty() && ld_str.is_empty() {
+            eprintln!(
+                "warning: Python headers/libraries not found; \
+                 Python interoperability will be unavailable at runtime."
+            );
+            return;
+        }
+
+        // Parse include flags from `-I<path>` or bare path.
+        let mut inc_dirs: Vec<String> = Vec::new();
+        for flag in inc_str.split_whitespace() {
+            let dir = if let Some(d) = flag.strip_prefix("-I") {
+                d
+            } else {
+                flag
+            };
+            if !dir.is_empty() {
+                inc_dirs.push(dir.to_string());
+                build.include(dir);
             }
         }
+
+        build.file(&pyrt_impl);
+        build.include(&runtime_dir);
+
+        // Parse library and libdir from the link flags string.
+        let mut lib_dir = String::new();
+        let mut lib_name = String::new();
+        for flag in ld_str.split_whitespace() {
+            if let Some(dir) = flag.strip_prefix("-L") {
+                if !dir.is_empty() {
+                    lib_dir = dir.to_string();
+                }
+            } else if let Some(lib) = flag.strip_prefix("-l") {
+                if !lib.is_empty() {
+                    lib_name = lib.to_string();
+                }
+            }
+        }
+        if !lib_name.is_empty() {
+            println!("cargo:rustc-env:SAT_PYTHON_LIB={}", lib_name);
+        }
+        if !lib_dir.is_empty() {
+            println!("cargo:rustc-env:SAT_PYTHON_LIBDIR={}", lib_dir);
+        }
+        if !inc_dirs.is_empty() {
+            println!("cargo:rustc-env:SAT_PYTHON_INC={}", inc_dirs.join(","));
+        }
+        println!("cargo:rerun-if-changed={}", pyrt_h.display());
+        println!("cargo:rerun-if-changed={}", pyrt_impl.display());
     }
 
     // Detect the host C compiler so we can report what was searched for.

@@ -126,22 +126,22 @@ static int test_call_method_on_string(void) {
 
     /* Create a Python string via builtins.str(42) → call the str callable
        with an i64 arg. */
-    int32_t kinds[] = { SAT_PY_I64 };
-    int64_t values[] = { 42 };
     sat_py_result out;
     memset(&out, 0, sizeof(out));
 
-    bool ok = sat_py_call(builtins->object ? sat_py_get_callable(builtins, "str") : NULL,
-                          NULL, 0, &out);
-    /* Actually, let's use sat_py_call with a callable handle. */
     sat_py_object_handle *str_callable = sat_py_get_callable(builtins, "str");
     ASSERT(str_callable != NULL, "should get builtins.str callable");
 
-    ok = sat_py_call(str_callable, NULL, 0, &out);
+    /* Call str(42) — pass a sat_py_value with kind SAT_PY_I64. */
+    sat_py_value args[1];
+    args[0].kind = SAT_PY_I64;
+    args[0].as.i64_val = 42;
+
+    bool ok = sat_py_call(str_callable, args, 1, &out);
     ASSERT(ok == true, "sat_py_call should return true (bridge success)");
     ASSERT(out.ok == true, "result ok should be true");
-    /* str() with no args produces an empty string — kind should be STR. */
-    ASSERT(out.kind == SAT_PY_STR, "str() result should be a string");
+    /* str(42) produces the string "42". */
+    ASSERT(out.kind == SAT_PY_STR, "str(42) result should be a string");
 
     sat_py_free_result_str(out.as.str_buf);
     sat_py_release_handle(str_callable);
@@ -162,12 +162,14 @@ static int test_call_method_upper(void) {
 
     /* str("hello") → a Python str object. */
     const char *hello = "hello";
-    int32_t kinds[] = { SAT_PY_STR };
-    int64_t values[] = { (int64_t)(intptr_t)hello };
     sat_py_result out;
     memset(&out, 0, sizeof(out));
 
-    bool ok = sat_py_call(str_callable, kinds, 1, &out);
+    sat_py_value args[1];
+    args[0].kind = SAT_PY_STR;
+    args[0].as.str_val = hello;
+
+    bool ok = sat_py_call(str_callable, args, 1, &out);
     ASSERT(ok == true, "sat_py_call should return true");
     ASSERT(out.ok == true, "result ok should be true");
     ASSERT(out.kind == SAT_PY_STR, "result should be a string");

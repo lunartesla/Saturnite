@@ -36,7 +36,11 @@ fn test_add_rust_dependency() {
 
     // Add a Rust dependency.
     let (code, out, err) = run_saturn(&proj_dir, &["add", "rust:serde@1.0"]);
-    assert_eq!(code, 0, "saturn add rust:serde@1.0 failed: stdout={}, stderr={}", out, err);
+    assert_eq!(
+        code, 0,
+        "saturn add rust:serde@1.0 failed: stdout={}, stderr={}",
+        out, err
+    );
     assert!(out.contains("Added dependency"));
 
     // Verify saturn.toml was updated.
@@ -58,7 +62,11 @@ fn test_add_python_dependency() {
 
     // Add a Python dependency.
     let (code, out, err) = run_saturn(&proj_dir, &["add", "python:numpy>=1.24"]);
-    assert_eq!(code, 0, "saturn add python:numpy>=1.24 failed: stdout={}, stderr={}", out, err);
+    assert_eq!(
+        code, 0,
+        "saturn add python:numpy>=1.24 failed: stdout={}, stderr={}",
+        out, err
+    );
     assert!(out.contains("Added dependency"));
     assert!(out.contains("numpy"));
 
@@ -99,7 +107,12 @@ fn test_add_duplicate_dependency_fails() {
     // Try to add the same dependency again.
     let (code, out, err) = run_saturn(&proj_dir, &["add", "rust:serde@1.0"]);
     assert_eq!(code, 1, "adding duplicate dependency should fail");
-    assert!(out.contains("already in saturn.toml") || err.contains("already in saturn.toml") || out.contains("already") || err.contains("already"));
+    assert!(
+        out.contains("already in saturn.toml")
+            || err.contains("already in saturn.toml")
+            || out.contains("already")
+            || err.contains("already")
+    );
 }
 
 #[test]
@@ -195,7 +208,12 @@ fn test_update_without_name_or_all_fails() {
     // Update without a name or --all should error.
     let (code, out, err) = run_saturn(&proj_dir, &["update"]);
     assert_eq!(code, 1, "saturn update without args should fail");
-    assert!(out.contains("specify") || err.contains("specify") || out.contains("usage") || err.contains("usage"));
+    assert!(
+        out.contains("specify")
+            || err.contains("specify")
+            || out.contains("usage")
+            || err.contains("usage")
+    );
 }
 
 #[test]

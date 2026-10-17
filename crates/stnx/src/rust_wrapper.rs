@@ -124,15 +124,8 @@ pub fn generate_wrapper_src(metadata: &WrapperMetadata, funcs: &[EcosystemFuncti
         let ret_prefix = if ret_ty.is_empty() { "" } else { " -> " };
 
         // Build the call expression: crate_name::func_name(arg0, arg1, ...)
-        let call_args: Vec<String> = (0..func.params.len())
-            .map(param_name)
-            .collect();
-        let call = format!(
-            "{}::{}({})",
-            crate_name,
-            func.name,
-            call_args.join(", ")
-        );
+        let call_args: Vec<String> = (0..func.params.len()).map(param_name).collect();
+        let call = format!("{}::{}({})", crate_name, func.name, call_args.join(", "));
 
         shims.push_str(&format!(
             r#"
@@ -213,8 +206,9 @@ pub fn build_rust_wrapper(
 
     // Clean any previous build artifacts.
     if build_dir.exists() {
-        std::fs::remove_dir_all(&build_dir)
-            .map_err(|e| BuildError::wrapper_build(format!("failed to clean {}: {}", build_dir.display(), e)))?;
+        std::fs::remove_dir_all(&build_dir).map_err(|e| {
+            BuildError::wrapper_build(format!("failed to clean {}: {}", build_dir.display(), e))
+        })?;
     }
 
     // Create directory structure.
@@ -248,9 +242,9 @@ pub fn build_rust_wrapper(
     // Set the working directory to the generated crate.
     cmd.current_dir(&build_dir);
 
-    let output = cmd.output().map_err(|e| {
-        BuildError::wrapper_build(format!("failed to invoke cargo: {}", e))
-    })?;
+    let output = cmd
+        .output()
+        .map_err(|e| BuildError::wrapper_build(format!("failed to invoke cargo: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -294,7 +288,9 @@ fn find_staticlib(build_dir: &Path, crate_name: &str) -> BuildResult<PathBuf> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(&format!("lib{}", lib_name)) && (name.ends_with(".a") || name.ends_with(".lib")) {
+            if name.starts_with(&format!("lib{}", lib_name))
+                && (name.ends_with(".a") || name.ends_with(".lib"))
+            {
                 return Ok(entry.path());
             }
         }
