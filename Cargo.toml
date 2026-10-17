@@ -22,4 +22,5 @@ anyhow = "1"
 which = "5"
 cc = "1"
 tempfile = "3"
+semver = "1"
 

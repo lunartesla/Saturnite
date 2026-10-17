@@ -84,6 +84,7 @@ pub fn lower_program(hir: &HirProgram) -> CompilerResult<MirProgram> {
         structs: hir.structs.clone(),
         enums: hir.enums.clone(),
         external_libraries,
+        python_search_path: String::new(),
     })
 }
 

@@ -288,6 +288,7 @@ impl<'hir> Monomorphizer<'hir> {
                 all
             },
             enums: self.hir.enums.clone(),
+            python_search_path: self.hir.python_search_path.clone(),
             external_libraries: {
                 // Carry the declared external libraries through
                 // monomorphization unchanged (they are ABI metadata, not

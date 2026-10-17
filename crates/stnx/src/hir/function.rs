@@ -205,6 +205,10 @@ pub struct HirProgram {
     pub use_decls: Vec<HirUseDecl>,
     /// All `mod` declarations encountered during lowering.
     pub mod_decls: Vec<HirModDecl>,
+    /// Python search path (colon/semicolon-separated) for venv site-packages.
+    /// Populated from the project root's `target/saturnite/venvs/` directory.
+    /// Used by codegen to set the `search_path` parameter of `sat_py_call_flat`.
+    pub python_search_path: String,
 }
 
 impl HirProgram {

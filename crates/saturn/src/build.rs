@@ -147,6 +147,23 @@ impl BuildContext {
         // MIR-level optimizations.
         optimize(&mut mir);
 
+        // Populate the Python search path from the project venv if it exists.
+        let venv_root = self
+            .project_root
+            .join("target")
+            .join("saturnite")
+            .join("venvs")
+            .join(&self.manifest.package.name);
+        if venv_root.exists() {
+            if let Ok(pyenv) =
+                stnx::pyenv::PyEnv::create(&self.project_root, &self.manifest.package.name)
+            {
+                if let Ok(search_path) = pyenv.search_path() {
+                    mir.python_search_path = search_path;
+                }
+            }
+        }
+
         // Configure target and codegen.
         let config = self.target_config()?;
 

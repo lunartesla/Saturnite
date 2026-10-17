@@ -196,8 +196,9 @@ fn parse_dep_spec(input: &str) -> Result<(String, DependencySpec)> {
 
 /// Add a dependency to the project.
 ///
-/// Updates `saturn.toml` with the new dependency and resolves/regenerates
-/// the lockfile entry.
+/// Resolves the dependency against its registry FIRST, then writes both the
+/// manifest and lockfile only if resolution succeeds. This is transactional:
+/// if resolution fails, the project files are left untouched.
 pub fn add_dependency(project_root: &Path, dep_spec: &str) -> Result<()> {
     let mut manifest = Manifest::from_dir(project_root)?;
     let mut lockfile = Lockfile::load(project_root)?;
@@ -211,19 +212,23 @@ pub fn add_dependency(project_root: &Path, dep_spec: &str) -> Result<()> {
         );
     }
 
-    // Insert into the manifest and save.
+    // Stage the new dependency in the manifest (in memory only).
     manifest.dependencies.insert(name.clone(), spec.clone());
-    manifest.write_to(project_root)?;
 
-    // Resolve the new dependency into the lockfile.
-    lockfile.add(&manifest.dependencies, &name, &spec)?;
+    // Resolve BEFORE writing anything to disk — if this fails, the project
+    // files remain untouched.
+    let resolved = lockfile.add(&manifest.dependencies, &name, &spec)?;
+
+    // Now that resolution succeeded, persist both files.
+    manifest.write_to(project_root)?;
     lockfile.save(project_root)?;
 
     println!(
-        "Added dependency: {} ({:?}) {}",
+        "Added dependency: {} ({:?}) {} → {}",
         name,
         spec.kind(),
-        spec.version()
+        spec.version(),
+        resolved.version
     );
     println!("  → saturn.toml updated");
     println!("  → saturn.lock updated");
@@ -256,7 +261,7 @@ pub fn install_dependencies(project_root: &Path, force: bool) -> Result<()> {
 
     // Resolve all dependencies into the lockfile.
     let prev_count = lockfile.dependencies.len();
-    lockfile.resolve(&manifest.dependencies)?;
+    lockfile.resolve(&manifest.dependencies, force)?;
 
     // Save the lockfile.
     lockfile.save(project_root)?;
@@ -271,20 +276,106 @@ pub fn install_dependencies(project_root: &Path, force: bool) -> Result<()> {
     }
 
     // Prepare runtime artifacts for each dependency.
+    let wrappers_dir = project_root
+        .join("target")
+        .join("saturnite")
+        .join("wrappers");
+    std::fs::create_dir_all(&wrappers_dir)
+        .map_err(|e| anyhow::anyhow!("failed to create wrappers dir: {}", e))?;
+
     for (name, locked) in &lockfile.dependencies {
         match locked.kind {
             DependencyKind::Rust => {
-                println!("  [rust] {} → {}", name, locked.version);
-                // Wrapper crate generation happens during build via build_rust_wrapper.
-                // The metadata JSON is expected at target/saturnite/wrappers/.
+                println!("  [rust]   {} → {}", name, locked.version);
+                // Look for wrapper metadata; if present, build the wrapper.
+                let meta_path = wrappers_dir.join(format!("{}_saturnite.json", name));
+                if !meta_path.exists() {
+                    eprintln!(
+                        "  [rust]   WARNING: No wrapper metadata found for '{}'. \
+                         The crate '{}' was resolved but cannot be used from Saturnite. \
+                         Provide a wrapper metadata file at {} to expose its API.",
+                        name,
+                        name,
+                        meta_path.display()
+                    );
+                    continue;
+                }
+                // Read the metadata and build the wrapper.
+                let meta_contents = std::fs::read_to_string(&meta_path)
+                    .map_err(|e| anyhow::anyhow!("failed to read wrapper metadata: {}", e))?;
+                let metadata: serde_json::Value = serde_json::from_str(&meta_contents)
+                    .map_err(|e| anyhow::anyhow!("invalid wrapper metadata JSON: {}", e))?;
+                let crate_name = metadata["crate_name"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("wrapper metadata missing 'crate_name'"))?;
+
+                let wrapper_meta = stnx::hir::lower::WrapperMetadata {
+                    crate_name: crate_name.to_string(),
+                    functions: metadata["functions"]
+                        .as_array()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("wrapper metadata missing 'functions' array")
+                        })?
+                        .iter()
+                        .map(|f| stnx::hir::lower::EcosystemFunctionMeta {
+                            name: f["name"].as_str().unwrap_or("").to_string(),
+                            symbol: f["symbol"].as_str().unwrap_or("").to_string(),
+                            params: f["params"]
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .map(|p| p.as_str().unwrap_or("").to_string())
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            ret: f["ret"].as_str().unwrap_or("").to_string(),
+                        })
+                        .collect(),
+                };
+
+                let target_triple = stnx::target::TargetConfig::host()
+                    .map(|c| c.triple_str())
+                    .unwrap_or_default();
+                match stnx::rust_wrapper::build_rust_wrapper(
+                    &wrapper_meta,
+                    &locked.version,
+                    &wrappers_dir,
+                    Some(&target_triple),
+                ) {
+                    Ok(artifact) => {
+                        println!("  [rust]   built wrapper → {}", artifact.display());
+                    }
+                    Err(e) => {
+                        eprintln!("  [rust]   ERROR building wrapper for '{}': {}", name, e);
+                    }
+                }
             }
             DependencyKind::Python => {
                 println!("  [python] {} → {}", name, locked.version);
-                // Venv creation and pip install happen during build via PyEnv.
+                // Install into the project venv.
+                match stnx::pyenv::PyEnv::create(project_root, &manifest.package.name) {
+                    Ok(venv) => {
+                        let spec = format!("{}=={}", name, locked.version);
+                        if let Err(e) = venv.ensure_package(&spec) {
+                            eprintln!(
+                                "  [python] ERROR installing '{}=={}': {}",
+                                name, locked.version, e
+                            );
+                        } else {
+                            println!("  [python] installed {}=={}", name, locked.version);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  [python] WARNING: failed to create Python venv for '{}': {}",
+                            name, e
+                        );
+                    }
+                }
             }
             DependencyKind::Native => {
-                println!("  [native] {} → {}", name, locked.version);
-                // Native deps are linked via system libraries.
+                println!("  [native] {} → {} (system library)", name, locked.version);
+                // Native deps are linked via system libraries; no installation needed.
             }
             DependencyKind::Saturnite => {
                 println!("  [saturnite] {} → {}", name, locked.version);
@@ -317,15 +408,15 @@ pub fn update_dependencies(project_root: &Path, dep_name: Option<&str>, all: boo
     }
 
     if all {
-        // Re-resolve everything.
-        for (name, _spec) in &manifest.dependencies {
+        // Re-resolve everything: force=true bypasses cached lockfile entries.
+        for (name, _) in &manifest.dependencies {
             if let Some(locked) = lockfile.dependencies.get(name) {
-                println!("  locked {} → {}", name, locked.version);
+                println!("  re-resolving {} (was {})", name, locked.version);
             } else {
                 println!("  added {}", name);
             }
         }
-        lockfile.resolve(&manifest.dependencies)?;
+        lockfile.resolve(&manifest.dependencies, true)?;
     } else if let Some(name) = dep_name {
         let spec = manifest
             .dependencies
@@ -336,15 +427,10 @@ pub fn update_dependencies(project_root: &Path, dep_name: Option<&str>, all: boo
             .get(name)
             .map(|d| d.version.clone())
             .unwrap_or_else(|| "(not locked)".to_string());
-        lockfile.update(&manifest.dependencies, name, spec)?;
-        let resolved_after = lockfile
-            .dependencies
-            .get(name)
-            .map(|d| d.version.clone())
-            .unwrap_or_default();
+        let resolved = lockfile.update(&manifest.dependencies, name, spec)?;
         println!(
             "  updated {}: {} → {}",
-            name, resolved_before, resolved_after
+            name, resolved_before, resolved.version
         );
     }
 

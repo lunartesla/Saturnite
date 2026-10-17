@@ -372,6 +372,10 @@ pub struct MirProgram {
     /// the linker/build system can locate the right artifact
     /// (`lib<name>.a` for Rust, `lib<name>.so` for Native).
     pub external_libraries: Vec<ExternalLibrary>,
+    /// Python search path (colon/semicolon-separated) for finding venv
+    /// site-packages at runtime. Built from the project's `target/saturnite/venvs/`
+    /// directory. Empty string means no additional search path.
+    pub python_search_path: String,
 }
 
 /// A declared external library that must be linked.

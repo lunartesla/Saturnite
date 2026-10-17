@@ -110,19 +110,26 @@ impl Lockfile {
     /// Resolve all dependencies from the manifest into the lockfile.
     ///
     /// For each dependency in the manifest, if an existing lockfile entry
-    /// satisfies the version spec, it is kept. Otherwise, the resolver
-    /// queries the appropriate registry to find a compatible version.
-    pub fn resolve(&mut self, deps: &BTreeMap<String, DependencySpec>) -> Result<()> {
+    /// satisfies the version spec, it is kept (unless `force` is true).
+    /// Otherwise, the resolver queries the appropriate registry to find a
+    /// compatible version.
+    ///
+    /// If `force` is true, every dependency is re-resolved from its registry,
+    /// ignoring any existing lockfile entries. This is used by `update --all`.
+    pub fn resolve(&mut self, deps: &BTreeMap<String, DependencySpec>, force: bool) -> Result<()> {
         self.manifest_hash = Self::compute_manifest_hash(deps);
 
         for (name, spec) in deps {
             let kind = spec.kind();
             let version_req = spec.version();
 
-            // If the lockfile already has a compatible entry, keep it.
-            if let Some(existing) = self.dependencies.get(name) {
-                if existing.kind == kind && Self::satisfies(&existing.version, version_req) {
-                    continue;
+            // If the lockfile already has a compatible entry, keep it —
+            // unless we're forcing re-resolution.
+            if !force {
+                if let Some(existing) = self.dependencies.get(name) {
+                    if existing.kind == kind && Self::satisfies(&existing.version, version_req) {
+                        continue;
+                    }
                 }
             }
 
@@ -145,20 +152,21 @@ impl Lockfile {
         Ok(())
     }
 
-    /// Add or update a single dependency in the lockfile.
+    /// Add a new dependency: resolve it and insert into the lockfile.
+    /// Returns the resolved dependency.
     pub fn add(
         &mut self,
         deps: &BTreeMap<String, DependencySpec>,
         name: &str,
         spec: &DependencySpec,
-    ) -> Result<()> {
+    ) -> Result<LockedDependency> {
         let kind = spec.kind();
         let version_req = spec.version();
         let resolved = resolve_from_registry(name, kind, version_req)?;
 
-        self.dependencies.insert(name.to_string(), resolved);
+        self.dependencies.insert(name.to_string(), resolved.clone());
         self.manifest_hash = Self::compute_manifest_hash(deps);
-        Ok(())
+        Ok(resolved)
     }
 
     /// Update a single dependency to its latest compatible version.
@@ -167,78 +175,98 @@ impl Lockfile {
         _deps: &BTreeMap<String, DependencySpec>,
         name: &str,
         spec: &DependencySpec,
-    ) -> Result<()> {
+    ) -> Result<LockedDependency> {
         let kind = spec.kind();
         let version_req = spec.version();
         let resolved = resolve_from_registry(name, kind, version_req)?;
 
-        self.dependencies.insert(name.to_string(), resolved);
-        Ok(())
+        self.dependencies.insert(name.to_string(), resolved.clone());
+        Ok(resolved)
     }
 
     /// Check whether a resolved version satisfies a version requirement.
     ///
-    /// Supports simple formats:
-    /// - `"1.0"` → exact major.minor match (e.g. "1.0.3" matches)
-    /// - `"1.0.3"` → exact version match
-    /// - `">=1.0"` → minimum version
-    /// - `"^1.0"` → semver caret (compatible with 1.0.0)
-    /// - `"*"` → any version
+    /// Uses the `semver` crate for proper semver (Cargo-style) matching.
+    /// Supports: `"*"`, `"1.0.3"` (exact), `"^1.0"` (caret), `">=1.0"`,
+    /// `">1.0"`, `"<2.0"`, `"<=1.5"`, `"=1.0.3"`, and comma-separated ranges
+    /// like `">=0.1, <0.3"`.
+    ///
+    /// For `"1.0"` (bare two-part), this is treated as `^1.0` (caret compatible).
+    /// For `"1.0.*"`, this matches `>=1.0.0, <1.1.0`.
     fn satisfies(resolved: &str, req: &str) -> bool {
         if req == "*" {
             return true;
         }
 
-        // Parse the resolved version.
-        let (resolved_major, resolved_minor, resolved_patch) = parse_version(resolved);
-        let rm = resolved_major.unwrap_or(0);
-        let rmin = resolved_minor.unwrap_or(0);
-        let rp = resolved_patch.unwrap_or(0);
-
-        if req.starts_with('^') {
-            let inner = &req[1..];
-            let (major, minor, patch) = parse_version(inner);
-            let m = major.unwrap_or(0);
-            let mn = minor.unwrap_or(0);
-            let p = patch.unwrap_or(0);
-            // Caret: compatible with major.minor.patch
-            // For 0.x.y, only patch changes are allowed.
-            if m == 0 {
-                rm == 0 && rmin == mn && rp >= p
-            } else {
-                rm == m && (rmin, rp) >= (mn, p)
+        // Try parsing as a Cargo/semver requirement first.
+        if let Ok(parsed_req) = semver::VersionReq::parse(req) {
+            if let Ok(resolved_ver) = semver::Version::parse(resolved) {
+                return parsed_req.matches(&resolved_ver);
             }
-        } else if let Some(inner) = req.strip_prefix("=") {
-            let (major, minor, patch) = parse_version(inner);
-            let m = major.unwrap_or(0);
-            let mn = minor.unwrap_or(0);
-            let p = patch.unwrap_or(0);
-            rm == m && rmin == mn && rp == p
-        } else if let Some(rest) = req.strip_prefix(">=") {
-            let (major, minor, patch) = parse_version(rest);
-            let m = major.unwrap_or(0);
-            let mn = minor.unwrap_or(0);
-            let p = patch.unwrap_or(0);
-            (rm, rmin, rp) >= (m, mn, p)
-        } else {
-            // Bare version string: match major.minor (and patch if present in req).
-            let (major, minor, patch) = parse_version(req);
-            let m = major.unwrap_or(0);
-            let mn = minor.unwrap_or(0);
-            match patch {
-                Some(p) => rm == m && rmin == mn && rp == p,
-                None => rm == m && rmin == mn,
+        }
+
+        // Handle `1.0.*` glob-style requirements (not supported by semver crate).
+        if let Some(stripped) = req.strip_suffix(".*") {
+            let (rm, rmin, _) = parse_version_tuple(resolved);
+            let (m, mn, _) = parse_version_tuple(stripped);
+            return (rm, rmin) == (m, mn);
+        }
+
+        // Handle comma-separated range requirements (e.g. ">=0.1, <0.3").
+        if req.contains(',') {
+            let all_ok = req.split(',').all(|part| {
+                let part = part.trim();
+                Self::satisfies(resolved, part)
+            });
+            if all_ok {
+                return true;
+            }
+        }
+
+        // Fall back to bare-version matching: "1.0" → caret 1.0, "1.0.3" → exact.
+        let (rm, rmin, rp) = parse_version_tuple(resolved);
+        let parts: Vec<&str> = req.split('.').collect();
+        match parts.len() {
+            2 => {
+                // "1.0" → caret: same major, >= minor.patch
+                if let (Ok(m), Ok(mn)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                    rm == m && (rmin, rp) >= (mn, 0)
+                } else {
+                    false
+                }
+            }
+            1 => {
+                // "1" → caret: same major
+                if let Ok(m) = parts[0].parse::<u64>() {
+                    rm == m
+                } else {
+                    false
+                }
+            }
+            _ => {
+                // Exact match for full versions.
+                let (m, mn, p) = parse_version_tuple(req);
+                (rm, rmin, rp) == (m, mn, p)
             }
         }
     }
 }
 
-/// Parse a version string like "1.0.3" into (major, minor, patch) as Option<u64>.
-fn parse_version(s: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
+/// Parse a version string like "1.0.3" into (major, minor, patch) as u64.
+fn parse_version_tuple(s: &str) -> (u64, u64, u64) {
     let parts: Vec<&str> = s.split('.').collect();
-    let major = parts.get(0).and_then(|p| p.parse::<u64>().ok());
-    let minor = parts.get(1).and_then(|p| p.parse::<u64>().ok());
-    let patch = parts.get(2).and_then(|p| p.parse::<u64>().ok());
+    let major = parts
+        .get(0)
+        .and_then(|p| p.parse::<u64>().ok())
+        .unwrap_or(0);
+    let minor = parts
+        .get(1)
+        .and_then(|p| p.parse::<u64>().ok())
+        .unwrap_or(0);
+    let patch = parts
+        .get(2)
+        .and_then(|p| p.parse::<u64>().ok())
+        .unwrap_or(0);
     (major, minor, patch)
 }
 
@@ -248,7 +276,11 @@ fn parse_version(s: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
 /// - Python deps → queries PyPI via `pip index` or `pip install --dry-run`
 /// - Saturnite deps → returns the version as-is (no remote registry yet)
 /// - Native deps → returns the version as-is (delegating to system resolution at link time)
-fn resolve_from_registry(name: &str, kind: DependencyKind, version_req: &str) -> Result<LockedDependency> {
+fn resolve_from_registry(
+    name: &str,
+    kind: DependencyKind,
+    version_req: &str,
+) -> Result<LockedDependency> {
     match kind {
         DependencyKind::Rust => resolve_rust_crate(name, version_req),
         DependencyKind::Python => resolve_python_package(name, version_req),
@@ -304,9 +336,8 @@ fn resolve_rust_crate(name: &str, version_req: &str) -> Result<LockedDependency>
     // First, try to resolve using cargo's own dependency resolution.
     // We create a temporary Cargo project, add the dependency, and read
     // the resolved version from Cargo.lock.
-    let temp = tempfile::tempdir().map_err(|e| {
-        anyhow::anyhow!("failed to create temp dir for cargo resolution: {}", e)
-    })?;
+    let temp = tempfile::tempdir()
+        .map_err(|e| anyhow::anyhow!("failed to create temp dir for cargo resolution: {}", e))?;
 
     let cargo_toml = format!(
         r#"[package]
@@ -379,9 +410,9 @@ edition = "2021"
     let resolved_version = lock["package"]
         .as_array()
         .and_then(|pkgs| {
-            pkgs.iter().find(|p| p["name"].as_str() == Some(name)).and_then(|p| {
-                p["version"].as_str().map(|v| v.to_string())
-            })
+            pkgs.iter()
+                .find(|p| p["name"].as_str() == Some(name))
+                .and_then(|p| p["version"].as_str().map(|v| v.to_string()))
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -393,13 +424,11 @@ edition = "2021"
         })?;
 
     // Get checksum if available.
-    let checksum = lock["package"]
-        .as_array()
-        .and_then(|pkgs| {
-            pkgs.iter().find(|p| p["name"].as_str() == Some(name)).and_then(|p| {
-                p["checksum"].as_str().map(|s| s.to_string())
-            })
-        });
+    let checksum = lock["package"].as_array().and_then(|pkgs| {
+        pkgs.iter()
+            .find(|p| p["name"].as_str() == Some(name))
+            .and_then(|p| p["checksum"].as_str().map(|s| s.to_string()))
+    });
 
     Ok(LockedDependency {
         name: name.to_string(),
@@ -441,7 +470,9 @@ fn resolve_python_package(name: &str, version_req: &str) -> Result<LockedDepende
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // Check if it's a "no matching distribution" error.
-        if stderr.contains("Could not find a version") || stderr.contains("No matching distribution") {
+        if stderr.contains("Could not find a version")
+            || stderr.contains("No matching distribution")
+        {
             return Err(anyhow::anyhow!(
                 "Python package '{}' not found on PyPI or no version satisfies '{}': {}",
                 name,
@@ -530,7 +561,11 @@ fn build_pip_version_spec(req: &str) -> String {
         }
         let major: u64 = parts[0].parse().unwrap_or(0);
         if major == 0 {
-            let next_minor = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0) + 1;
+            let next_minor = parts
+                .get(1)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+                + 1;
             format!(">={},<0.{}", rest, next_minor)
         } else {
             let next_major = major + 1;
@@ -557,7 +592,12 @@ fn parse_pip_version_from_output(output: &str, crate_name: &str) -> Option<Strin
                 // Extract the version: first segment that starts with a digit
                 let version: String = rest
                     .split('-')
-                    .find(|s| s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+                    .find(|s| {
+                        s.chars()
+                            .next()
+                            .map(|c| c.is_ascii_digit())
+                            .unwrap_or(false)
+                    })
                     .map(|s| s.to_string())
                     .unwrap_or_default();
                 if !version.is_empty() {
@@ -612,8 +652,8 @@ fn resolve_pypi_version_api(name: &str, version_req: &str) -> Result<String> {
 
     // Sort versions (descending) and find the first that satisfies the requirement.
     versions.sort_by(|a, b| {
-        let av: Vec<u64> = a.split('.').filter_map(|s| s.parse().ok()).collect();
-        let bv: Vec<u64> = b.split('.').filter_map(|s| s.parse().ok()).collect();
+        let av = parse_version_tuple(a);
+        let bv = parse_version_tuple(b);
         bv.cmp(&av)
     });
 

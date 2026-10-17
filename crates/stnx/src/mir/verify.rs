@@ -284,6 +284,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             external_libraries: vec![],
+            python_search_path: String::new(),
         }
     }
 

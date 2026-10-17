@@ -1014,7 +1014,7 @@ fn gen_external_call<'ctx>(
                 })?;
             let search_ptr = ctx
                 .builder
-                .build_global_string_ptr("", "py_search")
+                .build_global_string_ptr(&prog.python_search_path, "py_search")
                 .map_err(|e| {
                     CompilerError::codegen(format!("failed to emit Python search path: {}", e))
                 })?;

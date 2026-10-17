@@ -840,6 +840,7 @@ impl HirLower {
             module_scopes,
             use_decls,
             mod_decls,
+            python_search_path: String::new(),
         })
     }
 
@@ -1534,6 +1535,7 @@ impl HirLower {
             module_scopes,
             use_decls,
             mod_decls,
+            python_search_path: String::new(),
         })
     }
 
