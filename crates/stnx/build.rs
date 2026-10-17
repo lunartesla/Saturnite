@@ -57,29 +57,75 @@ fn main() {
     // runtime (a warning is produced at compile time).
     let pyrt_h = runtime_dir.join("pyrt.h");
     let pyrt_impl = runtime_dir.join("pyrt_impl.c");
-    if pyrt_impl.exists() {
-        let py_inc = std::process::Command::new("python3-config")
-            .args(["--includes"])
-            .output();
-        let py_ldflags = std::process::Command::new("python3-config")
-            .args(["--ldflags", "--embed"])
-            .output();
-        let unix_ok = py_inc.is_ok()
-            && py_ldflags.is_ok()
-            && py_inc.as_ref().map(|o| o.status.success()).unwrap_or(false)
-            && py_ldflags
-                .as_ref()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-
-        let (inc_str, ld_str) = if unix_ok {
+    // Only compile the full pyrt_impl.c (which needs Python.h) if a Python
+    // development environment is available. The pyrt.h header is always
+    // installed so the C compiler succeeds even without Python.
+    let py_ok = pyrt_impl.exists() && {
+        // On Windows, `python3-config` doesn't exist; use `python` + sysconfig.
+        if std::env::consts::OS == "windows" {
+            let query = |expr: &str| -> Option<String> {
+                let out = std::process::Command::new("python")
+                    .arg("-c")
+                    .arg(format!(
+                        "import sysconfig; print(sysconfig.get_config_var({:?}))",
+                        expr
+                    ))
+                    .output()
+                    .ok()?;
+                if !out.status.success() {
+                    return None;
+                }
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            };
+            query("INCLUDEPY").is_some() && query("LIBDIR").is_some()
+        } else {
+            let py_inc = std::process::Command::new("python3-config")
+                .args(["--includes"])
+                .output();
+            let py_ldflags = std::process::Command::new("python3-config")
+                .args(["--ldflags", "--embed"])
+                .output();
+            py_inc.is_ok()
+                && py_ldflags.is_ok()
+                && py_inc.as_ref().map(|o| o.status.success()).unwrap_or(false)
+                && py_ldflags
+                    .as_ref()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+        }
+    };
+    if py_ok {
+        let (inc_str, ld_str) = if std::env::consts::OS != "windows" {
+            let py_inc = std::process::Command::new("python3-config")
+                .args(["--includes"])
+                .output()
+                .ok();
+            let py_ldflags = std::process::Command::new("python3-config")
+                .args(["--ldflags", "--embed"])
+                .output()
+                .ok();
             (
-                String::from_utf8_lossy(&py_inc.unwrap().stdout)
-                    .trim()
-                    .to_string(),
-                String::from_utf8_lossy(&py_ldflags.unwrap().stdout)
-                    .trim()
-                    .to_string(),
+                String::from_utf8_lossy(
+                    &py_inc
+                        .as_ref()
+                        .and_then(|o| Some(&o.stdout[..]))
+                        .unwrap_or(&[][..]),
+                )
+                .trim()
+                .to_string(),
+                String::from_utf8_lossy(
+                    &py_ldflags
+                        .as_ref()
+                        .and_then(|o| Some(&o.stdout[..]))
+                        .unwrap_or(&[][..]),
+                )
+                .trim()
+                .to_string(),
             )
         } else if std::env::consts::OS == "windows" {
             // On Windows, `python3-config` doesn't exist. Use `python` to query

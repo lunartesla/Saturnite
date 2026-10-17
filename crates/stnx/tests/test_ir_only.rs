@@ -76,7 +76,7 @@ fn main() -> f64 { sqrt(81.0) }"#;
     );
     // The call should go through sat_py_call_flat.
     assert!(
-        ir.contains("call ptr @sat_py_call_flat"),
+        ir.contains("call i1 @sat_py_call_flat"),
         "Python external call should call sat_py_call_flat"
     );
 }
@@ -121,7 +121,7 @@ fn test_codegen_sat_py_call_flat_declaration() {
 fn main() -> f64 { sqrt(81.0) }"#;
     let ir = ir_only(src);
     assert!(
-        ir.contains("declare ptr @sat_py_call_flat"),
+        ir.contains("declare i1 @sat_py_call_flat"),
         "IR should declare sat_py_call_flat"
     );
 }

@@ -210,6 +210,18 @@ void sat_py_free_result_str(char *buf);
 /// this while handles are still outstanding is undefined behaviour.
 void sat_py_shutdown(void);
 
+/// Report a Python bridge error to stderr and abort the process.
+///
+/// `bridge_failed` indicates a bridge-level failure (sat_py_call_flat
+/// returned false); otherwise `error_class`/`error_message` describe a
+/// Python exception. The error strings are copied before printing so it is
+/// safe to call this immediately after the bridge call without worrying
+/// about the static-buffer lifetime.
+///
+/// This function does not return; the process exits with status 1.
+void sat_py_abort(const char *error_class, const char *error_message,
+                   bool bridge_failed);
+
 #ifdef __cplusplus
 }
 #endif

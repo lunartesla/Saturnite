@@ -1219,10 +1219,315 @@ fn main() -> i64 {
     );
 
     // The IR must extract the `ok` field (extractvalue ... 0) and use
-    // a select instruction to handle the error path.
+    // conditional branching to handle the error path. On failure, the
+    // bridge aborts via sat_py_abort instead of silently returning a default.
     assert!(
-        ir.contains("select"),
-        "IR should contain a select instruction for error handling:\n{}",
+        ir.contains("py_ok"),
+        "IR should extract the ok flag:\n{}",
         ir
+    );
+    assert!(
+        ir.contains("sat_py_abort"),
+        "IR should call sat_py_abort on failure:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("br i1 %py_ok"),
+        "IR should branch on the ok flag:\n{}",
+        ir
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Failure handling and regression tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_python_exception_is_fatal() {
+    // A Python function that raises should abort the program with a
+    // nonzero exit status and a useful diagnostic on stderr. The program
+    // must NOT silently return a default value.
+    if !python_available() {
+        eprintln!("Python not available; skipping end-to-end test");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let metadata = r#"{
+        "module": "builtins",
+        "functions": [
+            {"name": "int", "symbol": "int", "params": ["str"], "ret": "i64"}
+        ]
+    }"#;
+    setup_wrapper_metadata(&temp, "builtins", metadata);
+
+    // builtins.int("not_a_number") raises ValueError.
+    let src = r#"
+use python:builtins as py
+
+fn main() -> i64 {
+    let val = py.int("not_a_number")
+    say val
+    0
+}
+"#;
+
+    let artifact = compile_src_with_root(src, temp.path());
+    let (code, _stdout, stderr) = artifact.run_with_stderr();
+    assert_ne!(
+        code, 0,
+        "program should exit nonzero on Python exception, got code {}",
+        code
+    );
+    assert!(
+        stderr.contains("Python error") || stderr.contains("ValueError"),
+        "stderr should mention the Python exception, got: {:?}",
+        stderr
+    );
+}
+
+#[test]
+fn test_python_missing_function_is_fatal() {
+    // Calling a function that doesn't exist on the module should fail
+    // with a diagnostic, not silently return a default.
+    if !python_available() {
+        eprintln!("Python not available; skipping end-to-end test");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let metadata = r#"{
+        "module": "builtins",
+        "functions": [
+            {"name": "nonexistent_func_xyz", "symbol": "nonexistent_func_xyz", "params": [], "ret": "i64"}
+        ]
+    }"#;
+    setup_wrapper_metadata(&temp, "builtins", metadata);
+
+    let src = r#"
+use python:builtins as py
+
+fn main() -> i64 {
+    let val = py.nonexistent_func_xyz()
+    say val
+    0
+}
+"#;
+
+    let artifact = compile_src_with_root(src, temp.path());
+    let (code, _stdout, stderr) = artifact.run_with_stderr();
+    assert_ne!(
+        code, 0,
+        "program should exit nonzero on missing function, got code {}",
+        code
+    );
+}
+
+#[test]
+fn test_python_missing_module_is_fatal() {
+    // Importing a nonexistent module should fail with a diagnostic.
+    if !python_available() {
+        eprintln!("Python not available; skipping end-to-end test");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let metadata = r#"{
+        "module": "nonexistent_module_xyz",
+        "functions": [
+            {"name": "foo", "symbol": "foo", "params": [], "ret": "i64"}
+        ]
+    }"#;
+    setup_wrapper_metadata(&temp, "nonexistent_module_xyz", metadata);
+
+    let src = r#"
+use python:nonexistent_module_xyz as nm
+
+fn main() -> i64 {
+    let val = nm.foo()
+    say val
+    0
+}
+"#;
+
+    let artifact = compile_src_with_root(src, temp.path());
+    let (code, _stdout, stderr) = artifact.run_with_stderr();
+    assert_ne!(
+        code, 0,
+        "program should exit nonzero on missing module, got code {}",
+        code
+    );
+}
+
+#[test]
+fn test_python_multiple_calls_in_one_module() {
+    // Multiple Python calls in the same compiled module must link and
+    // execute correctly. This is a regression test for the duplicate
+    // sat_py_call_flat declaration suffix issue on Windows COFF.
+    if !python_available() {
+        eprintln!("Python not available; skipping end-to-end test");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let metadata = r#"{
+        "module": "math",
+        "functions": [
+            {"name": "ceil", "symbol": "ceil", "params": ["f64"], "ret": "i64"},
+            {"name": "floor", "symbol": "floor", "params": ["f64"], "ret": "i64"}
+        ]
+    }"#;
+    setup_wrapper_metadata(&temp, "math", metadata);
+
+    let src = r#"
+use python:math
+
+fn main() -> i64 {
+    let a = math.ceil(3.7)
+    let b = math.floor(3.7)
+    say a
+    say b
+    0
+}
+"#;
+
+    let artifact = compile_src_with_root(src, temp.path());
+    let (code, out) = artifact.run();
+    assert_eq!(code, 0, "program should exit cleanly");
+    assert_eq!(out, "4\n3\n", "ceil(3.7)=4, floor(3.7)=3, got: {:?}", out);
+}
+
+#[test]
+fn test_python_i64_return() {
+    // A Python function returning an integer — verify the i64 path
+    // (extract from union, no conversion needed).
+    if !python_available() {
+        eprintln!("Python not available; skipping end-to-end test");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let metadata = r#"{
+        "module": "builtins",
+        "functions": [
+            {"name": "int", "symbol": "int", "params": ["f64"], "ret": "i64"}
+        ]
+    }"#;
+    setup_wrapper_metadata(&temp, "builtins", metadata);
+
+    let src = r#"
+use python:builtins as py
+
+fn main() -> i64 {
+    let val = py.int(42.0)
+    say val
+    0
+}
+"#;
+
+    let artifact = compile_src_with_root(src, temp.path());
+    let (code, out) = artifact.run();
+    assert_eq!(code, 0, "program should exit cleanly");
+    assert_eq!(out, "42\n", "int(42.0) should output 42, got: {:?}", out);
+}
+
+#[test]
+fn test_python_bool_return() {
+    // A Python function returning a bool — verify the truncate path.
+    // builtins.bool(1) returns True, which is truthy. We check via math.isclose
+    // or just check that bool(0) returns False (0) and bool(1) returns True (1).
+    if !python_available() {
+        eprintln!("Python not available; skipping end-to-end test");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let metadata = r#"{
+        "module": "builtins",
+        "functions": [
+            {"name": "bool", "symbol": "bool", "params": ["i64"], "ret": "bool"}
+        ]
+    }"#;
+    setup_wrapper_metadata(&temp, "builtins", metadata);
+
+    let src = r#"
+use python:builtins as py
+
+fn main() -> i64 {
+    let t = py.bool(1)
+    let f = py.bool(0)
+    if t {
+        say 1
+    }
+    if f {
+        say 2
+    }
+    0
+}
+"#;
+
+    let artifact = compile_src_with_root(src, temp.path());
+    let (code, out) = artifact.run();
+    assert_eq!(code, 0, "program should exit cleanly");
+    // bool True → branch taken, bool False → branch skipped
+    assert_eq!(out, "1\n", "bool(1) should be truthy, got: {:?}", out);
+}
+
+#[test]
+fn test_python_str_return_multiple_calls() {
+    // Multiple Python calls that return strings — verifies both the Str
+    // conversion path and the multiple-call declaration reuse.
+    if !python_available() {
+        eprintln!("Python not available; skipping end-to-end test");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let metadata = r#"{
+        "module": "builtins",
+        "functions": [
+            {"name": "str", "symbol": "str", "params": ["i64"], "ret": "str"}
+        ]
+    }"#;
+    setup_wrapper_metadata(&temp, "builtins", metadata);
+
+    let src = r#"
+use python:builtins as py
+
+fn main() -> i64 {
+    let a = py.str(123)
+    let b = py.str(456)
+    say "first: {a}"
+    say "second: {b}"
+    0
+}
+"#;
+
+    let artifact = compile_src_with_root(src, temp.path());
+    let (code, out) = artifact.run();
+    assert_eq!(code, 0, "program should exit cleanly");
+    assert_eq!(out, "first: 123\nsecond: 456\n", "got: {:?}", out);
+}
+
+#[test]
+fn test_parser_keyword_as_member_name() {
+    // Regression test: `py.str(42)` must parse correctly because `str` is
+    // a keyword token but is used as a member name in qualified calls.
+    let src = r#"
+use python:builtins as py
+
+fn main() -> i64 {
+    let s = py.str(42)
+    say s
+    0
+}
+"#;
+
+    let tokens = prepare(src).expect("prepare failed");
+    let program = parser::parse(src, tokens).expect("parsing should succeed");
+    assert_eq!(
+        program.functions.len(),
+        1,
+        "should parse successfully with keyword member name"
     );
 }

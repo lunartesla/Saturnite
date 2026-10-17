@@ -24,10 +24,12 @@ Imports a Rust crate whose wrapper metadata is available under
 Qualified call syntax — `crate.function(args)`:
 
 ```saturnite
-use rust:example_crate
+use rust:example_crate as rust_lib
 
 fn main() -> i64:
-    give example_crate.add(20, 22)
+    let result = rust_lib.add(20, 22)
+    say result
+    result
 ```
 
 ### Wrapper metadata format
@@ -86,10 +88,12 @@ use python:module_name
 ### Calling functions
 
 ```saturnite
-use python:math
+use python:math as py_math
 
 fn main() -> f64:
-    give math.sqrt(81.0)
+    let root = py_math.sqrt(81.0)
+    say root
+    root
 ```
 
 ### Runtime bridge

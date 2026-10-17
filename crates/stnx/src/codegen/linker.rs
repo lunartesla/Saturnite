@@ -108,7 +108,7 @@ impl<'cfg> Linker<'cfg> {
                         if !out.status.success() {
                             return None;
                         }
-                        let ldlib = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        let _ldlib = String::from_utf8_lossy(&out.stdout).trim().to_string();
                         // LDLIBRARY on Windows is like "python313.dll"; the
                         // import lib is "python3.lib".
                         Some("python3".to_string())

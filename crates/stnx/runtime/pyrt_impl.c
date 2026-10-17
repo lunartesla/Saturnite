@@ -716,6 +716,24 @@ bool sat_py_call_method(sat_py_object_handle *handle, const char *method_name,
     return ok;
 }
 
+void sat_py_abort(const char *error_class, const char *error_message,
+                  bool bridge_failed) {
+    if (bridge_failed) {
+        fputs("Saturnite runtime: Python bridge failure\n", stderr);
+    } else if (error_class != NULL && error_message != NULL) {
+        fprintf(stderr, "Saturnite runtime: Python error: %s: %s\n",
+                error_class, error_message);
+    } else if (error_class != NULL) {
+        fprintf(stderr, "Saturnite runtime: Python error: %s\n",
+                error_class);
+    } else {
+        fputs("Saturnite runtime: Python error (no details)\n", stderr);
+    }
+    fflush(stderr);
+    sat_py_shutdown();
+    exit(1);
+}
+
 void sat_py_shutdown(void) {
     if (g_interpreter_initialized) {
         // Free cached module handles.

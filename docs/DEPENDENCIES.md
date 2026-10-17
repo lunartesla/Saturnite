@@ -44,8 +44,26 @@ version = "0.1.0"
 edition = "2026"
 
 [dependencies]
+# Saturnite-native dependency (simple version string)
 saturnite-stdlib = "0.1"
+
+# Ecosystem dependencies (full form with kind)
+serde = { kind = "rust", version = "1.0" }
+numpy = { kind = "python", version = "1.24" }
+sqlite = { kind = "native", version = "3.40" }
+
+# The simple form defaults to kind = "saturnite"
+myutil = "0.1"
 ```
+
+### Dependency kinds
+
+| `kind` value | Import syntax | Meaning |
+|---|---|---|
+| `saturnite` | `use module` | Import a Saturnite-native module. |
+| `rust` | `use rust:crate` | Import a Rust crate (wrapper-backed C ABI boundary). |
+| `python` | `use python:module` | Import a Python library (runtime bridge via embedded interpreter). |
+| `native` | `use native:lib` | Import a native C-ABI library. |
 
 ### Fields
 
@@ -54,7 +72,7 @@ saturnite-stdlib = "0.1"
 | `[package]` | `name` | `String` | — | Project name. |
 | `[package]` | `version` | `String` | `"0.1.0"` | Semantic version. |
 | `[package]` | `edition` | `String` | `"2026"` | Saturnite edition (informational for current release). |
-| `[dependencies]` | `<name>` | `String` | — | Version requirement for a Saturnite-native dependency. |
+| `[dependencies]` | `<name>` | `String` or `Table` | — | Version requirement. Simple string defaults to `kind = "saturnite"`. Table form allows `{ kind = "...", version = "..." }`. |
 
 ### Version requirement semantics
 

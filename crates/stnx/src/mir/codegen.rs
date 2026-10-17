@@ -115,11 +115,19 @@ impl<'ctx> MirCodeGenContext<'ctx> {
     /// Declare builtin functions (e.g. `println_i64`) in the module.
     pub fn declare_builtin_functions(&mut self) {
         let i64_ty = self.context.i64_type();
+        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+        let bool_ty = self.context.bool_type();
         self.module
             .add_function("println_i64", i64_ty.fn_type(&[i64_ty.into()], false), None);
-        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
         self.module
             .add_function("println_str", i64_ty.fn_type(&[ptr_ty.into()], false), None);
+        // sat_py_abort(const char *error_class, const char *error_message,
+        //              bool bridge_failed) — does not return.
+        self.module.add_function(
+            "sat_py_abort",
+            ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), bool_ty.into()], false),
+            None,
+        );
         // 0.5.1 string interpolation: `concat_str(i8*, i8*) -> i8*` and
         // `str_i64(i64) -> i8*`.
         self.module.add_function(
@@ -1063,6 +1071,15 @@ fn gen_external_call<'ctx>(
                             CompilerError::codegen(format!("failed to bitcast py arg: {}", e))
                         })?
                         .into_int_value(),
+                    BasicValueEnum::PointerValue(pv) => ctx
+                        .builder
+                        .build_ptr_to_int(*pv, i64_ty, "py_arg_p2i")
+                        .map_err(|e| {
+                            CompilerError::codegen(format!(
+                                "failed to ptr_to_int for py arg: {}",
+                                e
+                            ))
+                        })?,
                     other => other.into_int_value(),
                 };
                 let val_slot = unsafe {
@@ -1107,7 +1124,8 @@ fn gen_external_call<'ctx>(
                 .build_store(out_alloca, sat_py_result_ty.const_zero())
                 .map_err(|e| CompilerError::codegen(format!("failed to zero py out: {}", e)))?;
 
-            let call_fn_ty = ptr_ty.fn_type(
+            let bool_ty = ctx.context.bool_type();
+            let call_fn_ty = bool_ty.fn_type(
                 &[
                     ptr_ty.into(), // spec
                     ptr_ty.into(), // search_path
@@ -1128,7 +1146,11 @@ fn gen_external_call<'ctx>(
                 ctx.module
                     .add_function("sat_py_call_flat", call_fn_ty, None)
             };
-            let _call = ctx
+            // Capture the bridge return value. sat_py_call_flat returns false
+            // only on a bridge-level failure (NULL out, allocation failure, etc.).
+            // When it returns false, the sat_py_result struct is not reliably
+            // populated, so we cannot read error_class/error_message from it.
+            let call = ctx
                 .builder
                 .build_call(
                     call_fn,
@@ -1148,6 +1170,58 @@ fn gen_external_call<'ctx>(
                 .map_err(|e| {
                     CompilerError::codegen(format!("failed to emit sat_py_call_flat: {}", e))
                 })?;
+            let call_result = call
+                .try_as_basic_value()
+                .basic()
+                .ok_or_else(|| CompilerError::codegen("sat_py_call_flat did not return a value"))?
+                .into_int_value();
+
+            // Check the bridge return: false means a bridge-level failure
+            // (not a Python exception). Abort with a diagnostic.
+            let abort_fn = ctx
+                .module
+                .get_function("sat_py_abort")
+                .expect("sat_py_abort must be declared");
+
+            let current_fn = ctx
+                .builder
+                .get_insert_block()
+                .ok_or_else(|| CompilerError::codegen("no insert block for py call"))?
+                .get_parent()
+                .ok_or_else(|| CompilerError::codegen("py call not inside a function"))?;
+
+            let bridge_fail_block = ctx.context.append_basic_block(current_fn, "py_bridge_fail");
+            let ok_block = ctx.context.append_basic_block(current_fn, "py_ok");
+            ctx.builder
+                .build_conditional_branch(call_result, ok_block, bridge_fail_block)
+                .map_err(|e| {
+                    CompilerError::codegen(format!("failed to emit py bridge check: {}", e))
+                })?;
+
+            // Bridge failure path: abort with a diagnostic.
+            ctx.builder.position_at_end(bridge_fail_block);
+            let null_ptr = ptr_ty.const_null();
+            let bridge_failed = ctx.context.bool_type().const_int(1, false);
+            ctx.builder
+                .build_call(
+                    abort_fn,
+                    &[
+                        null_ptr.as_basic_value_enum().into(),
+                        null_ptr.as_basic_value_enum().into(),
+                        bridge_failed.as_basic_value_enum().into(),
+                    ],
+                    "py_bridge_abort",
+                )
+                .map_err(|e| {
+                    CompilerError::codegen(format!("failed to emit py abort call: {}", e))
+                })?;
+            // sat_py_abort does not return; mark the block as unreachable.
+            ctx.builder.build_unreachable().map_err(|e| {
+                CompilerError::codegen(format!("failed to emit unreachable: {}", e))
+            })?;
+
+            // Success path: check the `ok` flag inside sat_py_result.
+            ctx.builder.position_at_end(ok_block);
 
             // Load the result struct back from the alloca and extract the
             // relevant fields. The `sat_py_result` struct layout (matching
@@ -1171,14 +1245,55 @@ fn gen_external_call<'ctx>(
                 .map_err(|e| CompilerError::codegen(format!("failed to extract py_ok: {}", e)))?;
             let ok_cond = ok_val.into_int_value();
 
-            // Select between the success path (union value) and error path
-            // (zero/NULL) based on the `ok` flag. When the Python call raised,
-            // the runtime sets `ok = false` and the union is zeroed, so
-            // returning zero is safe for all primitive return types.
-            //
-            // For opaque handle returns (ret_ty is a struct/enum/list or
-            // otherwise not ABI-safe), we also check the `ok` flag: on
-            // failure, `handle` is NULL, which is a safe sentinel.
+            // If the Python call raised (ok == false), abort with the
+            // exception's error_class and error_message. These point to static
+            // buffers valid until the next bridge call, so we must consume them
+            // immediately by passing them to sat_py_abort (which copies them
+            // before printing).
+            let conv_block = ctx.context.append_basic_block(current_fn, "py_conv");
+            let exc_block = ctx.context.append_basic_block(current_fn, "py_exc");
+            ctx.builder
+                .build_conditional_branch(ok_cond, conv_block, exc_block)
+                .map_err(|e| {
+                    CompilerError::codegen(format!("failed to emit py ok check: {}", e))
+                })?;
+
+            // Exception path: extract error_class/error_message and abort.
+            ctx.builder.position_at_end(exc_block);
+            let err_class_val = ctx
+                .builder
+                .build_extract_value(out_sv, 4, "py_err_class")
+                .map_err(|e| {
+                    CompilerError::codegen(format!("failed to extract py_err_class: {}", e))
+                })?;
+            let err_msg_val = ctx
+                .builder
+                .build_extract_value(out_sv, 5, "py_err_msg")
+                .map_err(|e| {
+                    CompilerError::codegen(format!("failed to extract py_err_msg: {}", e))
+                })?;
+            let err_class_ptr = err_class_val.into_pointer_value();
+            let err_msg_ptr = err_msg_val.into_pointer_value();
+            let not_bridge = ctx.context.bool_type().const_int(0, false);
+            ctx.builder
+                .build_call(
+                    abort_fn,
+                    &[
+                        err_class_ptr.as_basic_value_enum().into(),
+                        err_msg_ptr.as_basic_value_enum().into(),
+                        not_bridge.as_basic_value_enum().into(),
+                    ],
+                    "py_exc_abort",
+                )
+                .map_err(|e| {
+                    CompilerError::codegen(format!("failed to emit py exc abort: {}", e))
+                })?;
+            ctx.builder.build_unreachable().map_err(|e| {
+                CompilerError::codegen(format!("failed to emit unreachable: {}", e))
+            })?;
+
+            // Success path: extract the union value and convert it.
+            ctx.builder.position_at_end(conv_block);
             let result_val = ctx
                 .builder
                 .build_extract_value(out_sv, 2, "py_val")
@@ -1204,14 +1319,7 @@ fn gen_external_call<'ctx>(
                                 e
                             ))
                         })?;
-                    // Select between the pointer and NULL based on ok flag.
-                    let null_ptr = ptr_ty.const_null();
-                    Ok(ctx
-                        .builder
-                        .build_select(ok_cond, ptr_val, null_ptr, "py_ret")
-                        .map_err(|e| {
-                            CompilerError::codegen(format!("failed to select py str result: {}", e))
-                        })?)
+                    Ok(ptr_val.as_basic_value_enum())
                 }
                 HirType::F64 => {
                     // bitcast i64 → double (the f64_val is stored as i64
@@ -1226,20 +1334,7 @@ fn gen_external_call<'ctx>(
                                 e
                             ))
                         })?;
-                    let zero_f64 = f64_ty.const_float(0.0);
-                    // FloatValue does not implement BasicValue in inkwell 0.9,
-                    // so convert to BasicValueEnum for build_select.
-                    Ok(ctx
-                        .builder
-                        .build_select(
-                            ok_cond,
-                            f64_val.as_basic_value_enum(),
-                            zero_f64.as_basic_value_enum(),
-                            "py_ret",
-                        )
-                        .map_err(|e| {
-                            CompilerError::codegen(format!("failed to select py f64 result: {}", e))
-                        })?)
+                    Ok(f64_val.as_basic_value_enum())
                 }
                 HirType::Bool => {
                     // i64 → i1 (truncate to bool)
@@ -1253,16 +1348,7 @@ fn gen_external_call<'ctx>(
                                 e
                             ))
                         })?;
-                    let zero_bool = bool_ty.const_int(0, false);
-                    Ok(ctx
-                        .builder
-                        .build_select(ok_cond, bool_val, zero_bool, "py_ret")
-                        .map_err(|e| {
-                            CompilerError::codegen(format!(
-                                "failed to select py bool result: {}",
-                                e
-                            ))
-                        })?)
+                    Ok(bool_val.as_basic_value_enum())
                 }
                 _ => {
                     // For I64, Unit, Struct, Enum, List, etc., the union
@@ -1271,7 +1357,6 @@ fn gen_external_call<'ctx>(
                     // directly.
                     match mir_type_to_llvm(ctx.context, prog, ret_ty) {
                         BasicTypeEnum::PointerType(_) => {
-                            // int_to_ptr for opaque handle / struct / enum / list
                             let ptr_val = ctx
                                 .builder
                                 .build_int_to_ptr(val_i64, ptr_ty, "py_obj_ptr")
@@ -1281,29 +1366,11 @@ fn gen_external_call<'ctx>(
                                         e
                                     ))
                                 })?;
-                            let null_ptr = ptr_ty.const_null();
-                            Ok(ctx
-                                .builder
-                                .build_select(ok_cond, ptr_val, null_ptr, "py_ret")
-                                .map_err(|e| {
-                                    CompilerError::codegen(format!(
-                                        "failed to select py obj result: {}",
-                                        e
-                                    ))
-                                })?)
+                            Ok(ptr_val.as_basic_value_enum())
                         }
                         _ => {
-                            // I64 or Unit: return i64 directly (zero on error)
-                            let zero = i64_ty.const_int(0, false);
-                            Ok(ctx
-                                .builder
-                                .build_select(ok_cond, val_i64, zero, "py_ret")
-                                .map_err(|e| {
-                                    CompilerError::codegen(format!(
-                                        "failed to select py i64 result: {}",
-                                        e
-                                    ))
-                                })?)
+                            // I64 or Unit: return i64 directly.
+                            Ok(val_i64.as_basic_value_enum())
                         }
                     }
                 }
