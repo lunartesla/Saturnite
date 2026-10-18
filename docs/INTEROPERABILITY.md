@@ -116,6 +116,30 @@ Python exceptions.
 `str` (UTF-8 text). Other types return an opaque handle that must be released
 via `sat_py_release_handle`.
 
+### Venv setup and interpreter discovery
+
+When `saturn install` processes a Python dependency (`use python:module`), it
+creates a virtual environment at `target/saturnite/venvs/<project_name>/` and
+pip-installs the resolved package version into it. The venv's site-packages
+directory becomes the `search_path` passed to `sat_py_call_flat` at runtime,
+so `PyImport_Import` can locate the module.
+
+Python interpreter discovery is platform-aware:
+
+- **Unix (Linux/macOS)**: candidates `["python3", "python"]`
+- **Windows**: candidates `["python", "python3"]`
+
+The first candidate that responds to `python --version` (or `--version`)
+successfully is used. This follows the convention that Unix systems typically
+provide `python3` (while `python` may not exist), whereas Windows CPython
+installs are registered as `python` (while `python3` may not exist).
+
+Both `PyEnv::create()` in `crates/stnx/src/pyenv.rs` and
+`find_python_with_pip()` in `crates/saturn/src/lockfile.rs` use this
+platform-aware discovery. The Python headers and library used to compile the
+`pyrt_impl.c` shim are discovered via `python3-config --includes` / `--ldflags`
+on Unix, or via `python` + `sysconfig` on Windows (see `crates/stnx/build.rs`).
+
 ### End-to-end test
 
 Wrapper metadata for `math` at `target/saturnite/wrappers/math_saturnite.json`

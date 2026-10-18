@@ -186,13 +186,19 @@ impl Lockfile {
 
     /// Check whether a resolved version satisfies a version requirement.
     ///
-    /// Uses the `semver` crate for proper semver (Cargo-style) matching.
-    /// Supports: `"*"`, `"1.0.3"` (exact), `"^1.0"` (caret), `">=1.0"`,
-    /// `">1.0"`, `"<2.0"`, `"<=1.5"`, `"=1.0.3"`, and comma-separated ranges
-    /// like `">=0.1, <0.3"`.
+    /// For Rust dependencies (crates.io), this uses the `semver` crate for
+    /// proper Cargo-style semver matching. Supports: `"*"`, `"1.0.3"` (exact),
+    /// `"^1.0"` (caret), `">=1.0"`, `">1.0"`, `"<2.0"`, `"<=1.5"`, `"=1.0.3"`,
+    /// and comma-separated ranges like `">=0.1, <0.3"`. Bare `"1.0"` is treated
+    /// as `^1.0` and `"1.0.*"` matches `>=1.0.0, <1.1.0`.
     ///
-    /// For `"1.0"` (bare two-part), this is treated as `^1.0` (caret compatible).
-    /// For `"1.0.*"`, this matches `>=1.0.0, <1.1.0`.
+    /// **Note on Python**: Python uses PEP 440 version specifiers, which differ
+    /// from Cargo semver. In practice, Python resolution is delegated to `pip`
+    /// (which handles PEP 440 natively), and `satisfies` here is only used as a
+    /// fallback for the PyPI JSON API path. Pre-release versions (e.g.
+    /// `1.0.0rc1`) may not be matched correctly by the `semver` crate, and
+    /// PEP 440 operators like `~=1.4` are not fully supported. This is a known
+    /// limitation; pip-based resolution is the primary path for Python deps.
     fn satisfies(resolved: &str, req: &str) -> bool {
         if req == "*" {
             return true;
@@ -523,8 +529,15 @@ fn resolve_python_package(name: &str, version_req: &str) -> Result<LockedDepende
 }
 
 /// Find a Python interpreter that has pip available.
+/// On Windows, `python` is preferred (standard CPython install name);
+/// on Unix, `python3` is preferred.
 fn find_python_with_pip() -> Result<String> {
-    for candidate in &["python3", "python"] {
+    #[cfg(windows)]
+    let candidates = ["python", "python3"];
+    #[cfg(not(windows))]
+    let candidates = ["python3", "python"];
+
+    for candidate in &candidates {
         let output = std::process::Command::new(candidate)
             .arg("-m")
             .arg("pip")

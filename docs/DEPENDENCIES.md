@@ -1,10 +1,11 @@
 # Saturnite Dependency Model
 
-## Status: IMPLEMENTED (dependency model); RESOLVER DEFERRED (no package manager yet)
+## Status: IMPLEMENTED
 
 This document describes Saturnite's dependency model — how `saturn.toml`
 declares dependencies, how the four dependency kinds map to the compiler's
-import system, and what is implemented vs. deferred.
+import system, and the `saturn` CLI commands for adding, installing, and
+updating dependencies.
 
 ---
 
@@ -83,14 +84,101 @@ myutil = "0.1"
 | `">=0.1, <0.3"` | Explicit range. |
 | `"*"` | Any version (discouraged). |
 
-> **Note:** Full version-range parsing and dependency resolution are
-> **deferred** (see §4). The `DependencySpec` currently records a version
-> string; the resolver that resolves these against a local or remote index
-> is not yet implemented.
+**Rust and Saturnite/Native** deps use Cargo-style semver semantics via the
+`semver` crate (`VersionReq::parse`). Python deps use PEP 440 semantics,
+which are delegated to `pip` at install time. The `satisfies()` helper
+in `lockfile.rs` is used as a fallback for the PyPI JSON API path and does
+not fully support PEP 440 operators like `~=` or pre-release versions.
 
 ---
 
-## 3. Rust interoperability boundary
+## 3. CLI commands
+
+Dependencies are managed via the `saturn` CLI:
+
+```sh
+saturn init myproject      # create a new project
+saturn add serde           # add a Saturnite dep (defaults to kind = saturnite)
+saturn add rust:serde@1.0  # add a Rust dep with explicit version
+saturn add python:numpy@1.24
+saturn install             # resolve + install all deps from saturn.toml
+saturn install --force     # force re-resolution, then install
+saturn update              # update a single dep (saturn update <name>)
+saturn update --all        # update all deps to latest compatible versions
+```
+
+### `saturn add <dep_spec>`
+
+Adds a dependency to `saturn.toml` and resolves it immediately against the
+appropriate registry:
+
+- `rust:` → crates.io (via `cargo update` in a temp project)
+- `python:` → PyPI (via `pip install --dry-run`)
+- `native:` → records the version (system library resolved at link time)
+- `saturnite:` → records the version as-is (no remote registry yet)
+
+If resolution succeeds, both `saturn.toml` and `saturn.lock` are updated
+transactionally. If resolution fails, the project files are left untouched.
+
+### `saturn install [--force]`
+
+Installs all dependencies declared in `saturn.toml`. The install process has
+two phases:
+
+**Phase 1 — Resolution** (only when stale or `--force`):
+- If the lockfile is current (manifest hash matches and all deps are locked),
+  re-resolution is skipped.
+- If `--force` is given or the lockfile is stale, all dependencies are
+  re-resolved from their registries.
+- The lockfile (`saturn.lock`) is written to disk.
+
+**Phase 2 — Preparation** (always runs, idempotent):
+- **Rust deps**: If wrapper metadata JSON exists at
+  `target/saturnite/wrappers/<name>_saturnite.json`, a Rust wrapper crate
+  is built into a static library. If no metadata is found, the dependency
+  is recorded as a failure (the crate was resolved but can't be used from
+  Saturnite without a wrapper).
+- **Python deps**: A virtual environment is created (if it doesn't already
+  exist) at `target/saturnite/venvs/<project_name>/`, and the package is
+  `pip install`ed into it.
+- **Native deps**: No installation needed; the system library is linked at
+  compile time.
+- **Saturnite deps**: No preparation needed.
+
+**Failure reporting**: Failures are accumulated across all dependencies.
+After all eligible dependencies have been processed, a formatted summary
+is printed listing each failure with its kind and reason. If any failures
+occurred, `install` exits with a nonzero status code.
+
+### `saturn.lock` format
+
+The lockfile (`saturn.lock`) records the exact resolved version and source
+for each dependency:
+
+```toml
+version = 1
+manifest_hash = "ab12cd34..."
+
+[dependencies.serde]
+name = "serde"
+version = "1.0.210"
+kind = "rust"
+source = "crates.io"
+checksum = "abcd1234..."
+
+[dependencies.numpy]
+name = "numpy"
+version = "1.26.4"
+kind = "python"
+source = "pypi.org"
+```
+
+The `manifest_hash` is an FNV-1a hash of the serialized `[dependencies]`
+section, used to detect when the lockfile needs re-resolution.
+
+---
+
+## 4. Rust interoperability boundary
 
 Rust interop uses explicit ABI declarations. Only ABI-safe primitive types
 are supported at the boundary:
@@ -112,18 +200,6 @@ See [`INTEROPERABILITY.md`](./INTEROPERABILITY.md) for the full ABI contract.
 
 ---
 
-## 4. Deferred (not yet implemented)
-
-- Full dependency resolver / package manager (`stnx add`, `stnx remove`, `stnx install`)
-- Lockfile (`saturn.lock`)
-- Cache layer for wrapper artifacts
-- Automated wrapper generation for arbitrary Rust crates
-- Multi-threaded Python integration
-- Cross-platform target verification for dependencies
-- Remote registry / package download
-
----
-
 ## 5. Source policy
 
 - **No rustc source** is copied or vendored. Saturnite may use Rust crates
@@ -142,7 +218,9 @@ See [`INTEROPERABILITY.md`](./INTEROPERABILITY.md) for the full ABI contract.
   — audit of all crate dependencies in `Cargo.toml`.
 - [`INTEROPERABILITY.md`](./INTEROPERABILITY.md) — Rust and Python interop
   model, ABI rules, fixtures.
-- `crates/stnx/src/interop.rs` — `DependencyKind` enum and `DependencyEntry`
-  struct (source).
+- `crates/saturn/src/lockfile.rs` — `Lockfile`, `LockedDependency`, resolver
+  for crates.io, PyPI, Saturnite, and native deps.
+- `crates/saturn/src/cmd.rs` — `add_dependency`, `install_dependencies`,
+  `update_dependency` CLI orchestration.
 - `crates/stnx/src/config.rs` — `SaturnConfig`, `Package`, `DependencySpec`
   (source).

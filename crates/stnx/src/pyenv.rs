@@ -17,6 +17,30 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{BuildError, BuildResult};
 
+/// Find a usable Python interpreter by trying candidates.
+/// On Unix, prefers `python3`; on Windows, prefers `python` (which is the
+/// standard CPython install name), falling back to `python3`.
+fn find_python_interpreter() -> BuildResult<String> {
+    #[cfg(windows)]
+    let candidates = ["python", "python3"];
+    #[cfg(not(windows))]
+    let candidates = ["python3", "python"];
+
+    for candidate in &candidates {
+        let output = std::process::Command::new(candidate)
+            .arg("--version")
+            .output();
+        if let Ok(o) = output {
+            if o.status.success() {
+                return Ok(candidate.to_string());
+            }
+        }
+    }
+    Err(BuildError::wrapper_build(
+        "no Python interpreter found; install Python 3 to use Python dependencies",
+    ))
+}
+
 /// A Python virtual environment associated with a Saturnite project.
 #[derive(Debug, Clone)]
 pub struct PyEnv {
@@ -57,24 +81,27 @@ impl PyEnv {
             .join(name);
 
         if !venv_root.exists() {
-            // Create the venv from scratch. We use `python3 -m venv` — the
-            // standard library venv module — which is available on all
-            // CPython 3.3+ installations.
-            let status = std::process::Command::new("python3")
+            // Discover a usable Python interpreter. On Unix, `python3` is
+            // conventional; on Windows, Python is typically installed as
+            // `python` (python3.exe may also exist in some setups).
+            let python = find_python_interpreter()?;
+
+            let status = std::process::Command::new(&python)
                 .arg("-m")
                 .arg("venv")
                 .arg(&venv_root)
                 .status()
                 .map_err(|e| {
                     BuildError::wrapper_build(format!(
-                        "failed to invoke python3 to create venv: {}",
-                        e
+                        "failed to invoke {} to create venv: {}",
+                        python, e
                     ))
                 })?;
 
             if !status.success() {
                 return Err(BuildError::wrapper_build(format!(
-                    "python3 -m venv failed with exit status {:?}",
+                    "{} -m venv failed with exit status {:?}",
+                    python,
                     status.code()
                 )));
             }

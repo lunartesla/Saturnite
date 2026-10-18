@@ -241,41 +241,56 @@ pub fn add_dependency(project_root: &Path, dep_spec: &str) -> Result<()> {
 /// For Rust deps, this generates wrapper crates and builds static libraries.
 /// For Python deps, this creates virtual environments and pip-installs packages.
 /// For Native deps, this registers them for linking.
+///
+/// Resolution from the registry is skipped when the lockfile is current (unless
+/// `--force` is given). Preparation (venv creation, pip install, wrapper build)
+/// always runs so that a missing environment or stale artifact is repaired.
 pub fn install_dependencies(project_root: &Path, force: bool) -> Result<()> {
     let manifest = Manifest::from_dir(project_root)?;
 
     // Load or create the lockfile.
     let mut lockfile = Lockfile::load(project_root)?;
 
+    let mut failures: Vec<(String, String, String)> = Vec::new();
+
+    // Phase 1: Resolution (only when stale or forced).
     if !force && !lockfile.is_stale(&manifest.dependencies) {
-        println!("All dependencies are up to date (lockfile is current).");
-        println!("  → {} dependencies locked", lockfile.dependencies.len());
-        return Ok(());
-    }
-
-    if force {
-        println!("Forcing re-resolution of all dependencies...");
+        println!(
+            "Lockfile is current ({} dependencies).",
+            lockfile.dependencies.len()
+        );
     } else {
-        println!("Resolving dependencies (lockfile is stale or missing)...");
-    }
-
-    // Resolve all dependencies into the lockfile.
-    let prev_count = lockfile.dependencies.len();
-    lockfile.resolve(&manifest.dependencies, force)?;
-
-    // Save the lockfile.
-    lockfile.save(project_root)?;
-
-    // Report what changed.
-    let new_count = lockfile.dependencies.len();
-    if new_count != prev_count {
-        let added = new_count.saturating_sub(prev_count);
-        if added > 0 {
-            println!("  → {} new dependencies resolved", added);
+        if force {
+            println!("Forcing re-resolution of all dependencies...");
+        } else {
+            println!("Resolving dependencies...");
         }
+
+        let prev_count = lockfile.dependencies.len();
+        match lockfile.resolve(&manifest.dependencies, force) {
+            Ok(()) => {
+                let new_count = lockfile.dependencies.len();
+                if new_count != prev_count {
+                    let added = new_count.saturating_sub(prev_count);
+                    if added > 0 {
+                        println!("  → {} new dependencies resolved", added);
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("dependency resolution failed: {}", e));
+            }
+        }
+
+        lockfile.save(project_root)?;
+        println!(
+            "\nLockfile written to {} ({} dependencies)",
+            lockfile_path(project_root).display(),
+            lockfile.dependencies.len()
+        );
     }
 
-    // Prepare runtime artifacts for each dependency.
+    // Phase 2: Preparation (always runs — idempotent).
     let wrappers_dir = project_root
         .join("target")
         .join("saturnite")
@@ -287,20 +302,17 @@ pub fn install_dependencies(project_root: &Path, force: bool) -> Result<()> {
         match locked.kind {
             DependencyKind::Rust => {
                 println!("  [rust]   {} → {}", name, locked.version);
-                // Look for wrapper metadata; if present, build the wrapper.
+
                 let meta_path = wrappers_dir.join(format!("{}_saturnite.json", name));
                 if !meta_path.exists() {
-                    eprintln!(
-                        "  [rust]   WARNING: No wrapper metadata found for '{}'. \
-                         The crate '{}' was resolved but cannot be used from Saturnite. \
-                         Provide a wrapper metadata file at {} to expose its API.",
-                        name,
-                        name,
-                        meta_path.display()
-                    );
+                    failures.push((
+                        name.clone(),
+                        "rust".to_string(),
+                        format!("no wrapper metadata found at {}", meta_path.display()),
+                    ));
                     continue;
                 }
-                // Read the metadata and build the wrapper.
+
                 let meta_contents = std::fs::read_to_string(&meta_path)
                     .map_err(|e| anyhow::anyhow!("failed to read wrapper metadata: {}", e))?;
                 let metadata: serde_json::Value = serde_json::from_str(&meta_contents)
@@ -346,17 +358,27 @@ pub fn install_dependencies(project_root: &Path, force: bool) -> Result<()> {
                         println!("  [rust]   built wrapper → {}", artifact.display());
                     }
                     Err(e) => {
+                        failures.push((
+                            name.clone(),
+                            "rust".to_string(),
+                            format!("wrapper build error: {}", e),
+                        ));
                         eprintln!("  [rust]   ERROR building wrapper for '{}': {}", name, e);
                     }
                 }
             }
             DependencyKind::Python => {
                 println!("  [python] {} → {}", name, locked.version);
-                // Install into the project venv.
+
                 match stnx::pyenv::PyEnv::create(project_root, &manifest.package.name) {
                     Ok(venv) => {
                         let spec = format!("{}=={}", name, locked.version);
                         if let Err(e) = venv.ensure_package(&spec) {
+                            failures.push((
+                                name.clone(),
+                                "python".to_string(),
+                                format!("pip install failed: {}", e),
+                            ));
                             eprintln!(
                                 "  [python] ERROR installing '{}=={}': {}",
                                 name, locked.version, e
@@ -366,6 +388,11 @@ pub fn install_dependencies(project_root: &Path, force: bool) -> Result<()> {
                         }
                     }
                     Err(e) => {
+                        failures.push((
+                            name.clone(),
+                            "python".to_string(),
+                            format!("venv creation failed: {}", e),
+                        ));
                         eprintln!(
                             "  [python] WARNING: failed to create Python venv for '{}': {}",
                             name, e
@@ -375,7 +402,6 @@ pub fn install_dependencies(project_root: &Path, force: bool) -> Result<()> {
             }
             DependencyKind::Native => {
                 println!("  [native] {} → {} (system library)", name, locked.version);
-                // Native deps are linked via system libraries; no installation needed.
             }
             DependencyKind::Saturnite => {
                 println!("  [saturnite] {} → {}", name, locked.version);
@@ -383,11 +409,21 @@ pub fn install_dependencies(project_root: &Path, force: bool) -> Result<()> {
         }
     }
 
-    println!(
-        "\nLockfile written to {} ({} dependencies)",
-        lockfile_path(project_root).display(),
-        new_count
-    );
+    // Phase 3: Failure summary — report and return nonzero if any required
+    // installation failed.
+    if !failures.is_empty() {
+        println!();
+        println!("───────────────────────────────────────────");
+        println!("Failed dependencies ({}):", failures.len());
+        for (dep_name, kind, reason) in &failures {
+            println!("  [{kind}] {dep_name}: {reason}");
+        }
+        println!("───────────────────────────────────────────");
+        anyhow::bail!(
+            "install completed with {} failure(s); see output above for details",
+            failures.len()
+        );
+    }
 
     Ok(())
 }
