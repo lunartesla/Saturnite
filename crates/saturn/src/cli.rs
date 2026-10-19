@@ -8,6 +8,7 @@ use crate::build::BuildContext;
 use crate::profile::BuildProfile;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 /// Saturnite toolchain — project-oriented build system.
 #[derive(Parser, Debug)]
@@ -52,6 +53,11 @@ pub enum Commands {
         #[arg(long)]
         save_temps: bool,
 
+        /// Compilation backend: "auto" (default), "llvm", or "hybrid".
+        /// Overrides the `backend` field in `saturn.toml` `[build]` section.
+        #[arg(long, value_name = "MODE")]
+        backend: Option<String>,
+
         /// Verbose output.
         #[arg(short, long)]
         verbose: bool,
@@ -71,6 +77,11 @@ pub enum Commands {
         #[arg(long, conflicts_with = "release")]
         debug: bool,
 
+        /// Compilation backend: "auto" (default), "llvm", or "hybrid".
+        /// Overrides the `backend` field in `saturn.toml` `[build]` section.
+        #[arg(long, value_name = "MODE")]
+        backend: Option<String>,
+
         /// Verbose output.
         #[arg(short, long)]
         verbose: bool,
@@ -81,6 +92,11 @@ pub enum Commands {
         /// Optional source file (advanced).
         #[arg(value_name = "FILE", required = false)]
         input: Option<PathBuf>,
+
+        /// Compilation backend: "auto" (default), "llvm", or "hybrid".
+        /// Overrides the `backend` field in `saturn.toml` `[build]` section.
+        #[arg(long, value_name = "MODE")]
+        backend: Option<String>,
 
         /// Verbose output.
         #[arg(short, long)]
@@ -173,15 +189,24 @@ impl SaturnCli {
     }
 
     /// Create a `BuildContext` from CLI flags + optional input file.
+    /// `backend` is an optional `--backend` CLI override (parsed to
+    /// `stnx::BackendMode` before being stored on the context).
     pub fn make_build_context(
         input: Option<&PathBuf>,
         release: bool,
         debug: bool,
         no_link: bool,
         save_temps: bool,
+        backend: Option<String>,
     ) -> anyhow::Result<BuildContext> {
         let profile = Self::resolve_profile(release, debug);
         let cwd = std::env::current_dir()?;
+
+        let backend_override = if let Some(b) = &backend {
+            Some(stnx::BackendMode::from_str(b).map_err(|e| anyhow::anyhow!("{}", e))?)
+        } else {
+            None
+        };
 
         match input {
             Some(entry) => {
@@ -192,6 +217,7 @@ impl SaturnCli {
                 let mut ctx = BuildContext::with_entry(project_root, entry.clone(), profile)?;
                 ctx.no_link = no_link;
                 ctx.save_temps = save_temps;
+                ctx.backend_override = backend_override;
                 Ok(ctx)
             }
             None => {
@@ -200,6 +226,7 @@ impl SaturnCli {
                 let mut ctx = BuildContext::new(project.root, profile)?;
                 ctx.no_link = no_link;
                 ctx.save_temps = save_temps;
+                ctx.backend_override = backend_override;
                 Ok(ctx)
             }
         }

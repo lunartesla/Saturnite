@@ -312,6 +312,7 @@ impl<'hir> Monomorphizer<'hir> {
                 }
                 libs
             },
+            selected_backend: None,
         })
     }
 

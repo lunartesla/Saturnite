@@ -22,11 +22,18 @@ fn main() -> anyhow::Result<()> {
             output: _,
             no_link,
             save_temps,
+            backend,
             verbose,
         } => {
             let profile = SaturnCli::resolve_profile(release, debug);
-            let ctx =
-                SaturnCli::make_build_context(input.as_ref(), release, debug, no_link, save_temps)?;
+            let ctx = SaturnCli::make_build_context(
+                input.as_ref(),
+                release,
+                debug,
+                no_link,
+                save_temps,
+                backend,
+            )?;
 
             if verbose {
                 eprintln!("project root: {}", ctx.project_root.display());
@@ -49,10 +56,18 @@ fn main() -> anyhow::Result<()> {
             input,
             release,
             debug,
+            backend,
             verbose,
         } => {
             let profile = SaturnCli::resolve_profile(release, debug);
-            let ctx = SaturnCli::make_build_context(input.as_ref(), release, debug, false, false)?;
+            let ctx = SaturnCli::make_build_context(
+                input.as_ref(),
+                release,
+                debug,
+                false,
+                false,
+                backend,
+            )?;
 
             if verbose {
                 eprintln!("profile: {}", profile.as_str());
@@ -63,8 +78,13 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(exit_code);
         }
 
-        Commands::Check { input, verbose } => {
-            let ctx = SaturnCli::make_build_context(input.as_ref(), false, false, false, false)?;
+        Commands::Check {
+            input,
+            backend,
+            verbose,
+        } => {
+            let ctx =
+                SaturnCli::make_build_context(input.as_ref(), false, false, false, false, backend)?;
 
             if verbose {
                 eprintln!("checking: {}", ctx.entry.display());

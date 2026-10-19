@@ -285,6 +285,7 @@ mod tests {
             enums: vec![],
             external_libraries: vec![],
             python_search_path: String::new(),
+            selected_backend: None,
         }
     }
 

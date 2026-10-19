@@ -31,6 +31,9 @@ pub struct BuildContext {
     pub no_link: bool,
     /// Whether to keep intermediate object files.
     pub save_temps: bool,
+    /// Optional `--backend` CLI override. If `Some`, this takes precedence
+    /// over the `backend` field in `saturn.toml`.
+    pub backend_override: Option<stnx::BackendMode>,
 }
 
 impl BuildContext {
@@ -53,6 +56,7 @@ impl BuildContext {
             output,
             no_link: false,
             save_temps: false,
+            backend_override: None,
         })
     }
 
@@ -84,6 +88,7 @@ impl BuildContext {
             output,
             no_link: false,
             save_temps: false,
+            backend_override: None,
         })
     }
 
@@ -134,9 +139,31 @@ impl BuildContext {
         )
         .map_err(|e| anyhow::anyhow!("Semantic error: {}", e))?;
 
+        // Backend selection: resolve which backend to use based on the manifest's
+        // `backend` field (or the `--backend` CLI override) and the HIR program's
+        // reachable Rust imports. This is done after HIR lowering (which
+        // populates `use_decls` and `external_functions`) and before MIR
+        // generation (which carries the selection via `selected_backend`).
+        let backend_mode = self
+            .backend_override
+            .unwrap_or(self.manifest.build.backend);
+        let selection = stnx::backend::select_backend(backend_mode, &hir)
+            .map_err(|e| anyhow::anyhow!("backend selection failed: {}", e))?;
+        if std::env::var("SATURNITE_VERBOSE").is_ok() {
+            eprintln!("backend:      {}", match selection.backend {
+                stnx::SelectedBackend::Llvm => "llvm",
+                stnx::SelectedBackend::Hybrid => "hybrid",
+            });
+            eprintln!("backend reason: {}", selection.reason);
+        }
+
         // HIR → MIR (with monomorphization for generics).
         let mut mir =
             monomorphize(&hir).map_err(|e| anyhow::anyhow!("monomorphization failed: {}", e))?;
+
+        // Store the selected backend on the MIR program so downstream stages
+        // (hybrid codegen, dual-backend linking) know which path to take.
+        mir.selected_backend = Some(selection.backend);
 
         // Verify MIR CFG.
         if let Err(errs) = mir.verify() {
@@ -169,8 +196,31 @@ impl BuildContext {
 
         let start = std::time::Instant::now();
 
-        compile_from_mir_ext(&mir, self.output.to_str().unwrap(), config, self.save_temps)
-            .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
+        // Branch on the selected backend. The hybrid backend compiles Saturnite
+        // source that is reachable from `use rust:` imports into a separate Rust
+        // crate (compiled with cargo/rustc), then links it with the LLVM-produced
+        // object for the remaining native code. The LLVM-only backend uses the
+        // single-step `compile_from_mir_ext` path as before.
+        match selection.backend {
+            stnx::SelectedBackend::Llvm => {
+                compile_from_mir_ext(&mir, self.output.to_str().unwrap(), config, self.save_temps)
+                    .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
+            }
+            stnx::SelectedBackend::Hybrid => {
+                let crate_name = &self.manifest.package.name;
+                let result = stnx::build_hybrid(
+                    &hir,
+                    &mir,
+                    self.output.to_str().unwrap(),
+                    &config,
+                    &self.project_root,
+                    crate_name,
+                )
+                .map_err(|e| anyhow::anyhow!("Hybrid build failed: {}", e))?;
+                // Override the elapsed time with the hybrid build's timing.
+                let _ = result;
+            }
+        }
 
         let elapsed = start.elapsed();
 

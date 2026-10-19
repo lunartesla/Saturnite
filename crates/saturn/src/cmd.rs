@@ -69,6 +69,7 @@ pub fn init_project(name: Option<&str>, in_place: bool, pkg_version: Option<&str
         build: crate::manifest::BuildSection {
             source: "src".to_string(),
             entry: "main".to_string(),
+            backend: stnx::BackendMode::Auto,
         },
     };
     manifest.write_to(&project_dir)?;

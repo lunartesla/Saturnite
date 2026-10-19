@@ -18,6 +18,7 @@
 //! - [`config`] — `saturn.toml` project configuration representation.
 
 pub mod ast;
+pub mod backend;
 pub mod codegen;
 pub mod config;
 pub mod error;
@@ -31,6 +32,9 @@ pub mod module;
 pub mod parser;
 pub mod pyenv;
 pub mod resolver;
+pub mod rust_codegen;
+pub mod rust_discovery;
+pub mod hybrid_build;
 pub mod rust_wrapper;
 pub mod semantic;
 pub mod target;
@@ -87,6 +91,22 @@ pub use error::{
 
 pub use config::{BuildConfig, DependencySpec, Package, SaturnConfig};
 pub use interop::SAT_ABI_VERSION;
+
+// --- Backend selection re-exports ---
+//
+// Backend mode selection for the hybrid compiler (LLVM-only vs Rust-aware).
+
+pub use backend::{BackendMode, BackendSelection, SelectedBackend, select_backend};
+
+// --- Hybrid build re-exports ---
+//
+// Orchestration for the hybrid backend: LLVM object emission + Rust source
+// generation + cargo build + cross-linking.
+
+pub use hybrid_build::{
+    build_hybrid, is_rust_ecosystem_crate, rust_crates_to_build, verify_hybrid_prerequisites,
+    HybridBuildResult,
+};
 
 // --- Module system re-exports ---
 //

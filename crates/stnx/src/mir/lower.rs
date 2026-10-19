@@ -85,6 +85,7 @@ pub fn lower_program(hir: &HirProgram) -> CompilerResult<MirProgram> {
         enums: hir.enums.clone(),
         external_libraries,
         python_search_path: String::new(),
+        selected_backend: None,
     })
 }
 

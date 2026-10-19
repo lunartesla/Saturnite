@@ -1457,6 +1457,56 @@ pub fn generate_ir_from_mir(mir: &MirProgram) -> CompilerResult<String> {
     Ok(ir.to_string())
 }
 
+/// Emit a `MirProgram` to a native object file (no linking).
+///
+/// This is used by the hybrid backend: the LLVM object is emitted separately,
+/// then linked together with the Rust staticlib produced by `cargo build`.
+pub fn emit_object_from_mir(
+    mir: &MirProgram,
+    output_path: &str,
+    target_config: &TargetConfig,
+) -> CompilerResult<()> {
+    use crate::codegen::ObjectEmitter;
+    use std::path::Path;
+
+    let context = LLVMContext::create();
+    let mut ctx = MirCodeGenContext::new(&context);
+    ctx.declare_builtin_functions();
+    ctx.declare_functions(mir)?;
+    for func in &mir.functions {
+        ctx.generate_function(func, mir)?;
+    }
+
+    let triple = target_config.triple();
+    ctx.module.set_triple(triple);
+
+    // Run LLVM optimizations if in release mode.
+    let opt_level = target_config.to_inkwell_opt_level();
+    if opt_level != InkwellOptLevel::None {
+        let target_machine = target_config
+            .create_target_machine()
+            .map_err(CompilerError::Target)?;
+        let opt_passes = target_config.opt_pass_name();
+        let opts = PassBuilderOptions::create();
+        ctx.module
+            .run_passes(opt_passes, &target_machine, opts)
+            .map_err(|e| CompilerError::codegen(format!("LLVM optimization failed: {}", e)))?;
+    }
+
+    let output_path = Path::new(output_path);
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CompilerError::codegen(format!("failed to create output dir: {}", e)))?;
+        }
+    }
+
+    let emitter = ObjectEmitter::new(ctx.module, &target_config)?;
+    emitter.emit_object(output_path)?;
+
+    Ok(())
+}
+
 /// Entry point: compile a `MirProgram` to a native executable.
 pub fn compile_from_mir(
     mir: &MirProgram,

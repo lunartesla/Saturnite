@@ -376,6 +376,11 @@ pub struct MirProgram {
     /// site-packages at runtime. Built from the project's `target/saturnite/venvs/`
     /// directory. Empty string means no additional search path.
     pub python_search_path: String,
+    /// The selected compilation backend (LLVM-only or Rust-aware hybrid),
+    /// determined by `stnx::backend::select_backend`. None when the program
+    /// has not been through backend selection (e.g. in tests or the `check`
+    /// pipeline). Set by the toolchain `BuildContext::build` before codegen.
+    pub selected_backend: Option<crate::backend::SelectedBackend>,
 }
 
 /// A declared external library that must be linked.

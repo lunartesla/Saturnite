@@ -22,6 +22,7 @@
 | [`SATURNITE_0_4_ARCHITECTURE.md`](./SATURNITE_0_4_ARCHITECTURE.md) | Compiler architecture — pipeline, MIR, HIR, module system, codegen overview. |
 | [`SATURNITE_CRATE_DEPENDENCY_AUDIT.md`](./SATURNITE_CRATE_DEPENDENCY_AUDIT.md) | Dependency audit — all crate dependencies, versions, purposes, risk levels. |
 | [`DEPENDENCIES.md`](./DEPENDENCIES.md) | Dependency model — `saturn.toml` configuration, version requirements, future resolver plan. |
+| [`HYBRID_BACKEND_ENGINEERING_REPORT.md`](./HYBRID_BACKEND_ENGINEERING_REPORT.md) | Hybrid backend engineering report — architecture, design decisions, test coverage for the LLVM + Rust dual-backend pipeline. |
 | [`README.md`](../README.md) | Top-level project README — quick start, language reference, CLI reference, project layout. |
 | [Toolchain reference](../crates/saturn/src/lib.rs) | The `saturn` toolchain — project-oriented build, profiles, project discovery. |
 

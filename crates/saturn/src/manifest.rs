@@ -54,7 +54,7 @@ impl Default for Package {
     }
 }
 
-/// `[build]` section — controls source layout.
+/// `[build]` section — controls source layout and backend selection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildSection {
     /// Source root directory relative to the project root (default: `src`).
@@ -64,6 +64,14 @@ pub struct BuildSection {
     /// The toolchain appends `.stn` (canonical) with `.stnx` as fallback.
     #[serde(default = "default_entry")]
     pub entry: String,
+    /// Backend selection mode (default: `"auto"`).
+    /// See `stnx::BackendMode` for available options.
+    #[serde(default, skip_serializing_if = "is_default_backend")]
+    pub backend: stnx::BackendMode,
+}
+
+fn is_default_backend(mode: &stnx::BackendMode) -> bool {
+    *mode == stnx::BackendMode::Auto
 }
 
 fn default_source_dir() -> String {
@@ -79,6 +87,7 @@ impl Default for BuildSection {
         Self {
             source: default_source_dir(),
             entry: default_entry(),
+            backend: stnx::BackendMode::Auto,
         }
     }
 }
@@ -251,6 +260,29 @@ entry = "main"
                 .join("\n")
         };
 
+        let build_section = if is_default_backend(&self.build.backend) {
+            format!(
+                r#"[build]
+source = "src"
+entry = "main"
+"#,
+            )
+        } else {
+            let backend_str = match self.build.backend {
+                stnx::BackendMode::Auto => "auto",
+                stnx::BackendMode::Llvm => "llvm",
+                stnx::BackendMode::Hybrid => "hybrid",
+            };
+            format!(
+                r#"[build]
+source = "src"
+entry = "main"
+backend = "{}"
+"#,
+                backend_str
+            )
+        };
+
         format!(
             r#"[package]
 name = "{}"
@@ -260,11 +292,8 @@ edition = "{}"
 [dependencies]
 {}
 
-[build]
-source = "src"
-entry = "main"
-"#,
-            self.package.name, self.package.version, self.package.edition, deps_str
+{}"#,
+            self.package.name, self.package.version, self.package.edition, deps_str, build_section
         )
     }
 

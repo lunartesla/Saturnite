@@ -17,6 +17,7 @@
 //! saturnite-stdlib = "0.1"
 //! ```
 
+use crate::backend::BackendMode;
 use crate::error::CompilerError;
 use crate::interop::DependencyKind;
 use crate::CompilerResult;
@@ -83,10 +84,21 @@ edition = "2026"
 
 /// Build configuration section: `[build]`.
 ///
-/// Controls where the compiler looks for source files and what the default
-/// entry point name is.  All fields are optional — sensible defaults are
-/// provided so that a minimal `saturn.toml` with just `[package]` works
-/// out of the box.
+/// Controls where the compiler looks for source files, what the default
+/// entry point name is, and which compilation backend to use.
+///
+/// All fields are optional — sensible defaults are provided so that a
+/// minimal `saturn.toml` with just `[package]` works out of the box.
+///
+/// ## `backend`
+///
+/// The `backend` field controls whether the compiler uses the LLVM-only
+/// backend or the Rust-aware hybrid backend:
+///
+/// - `"auto"` (default) — automatically selects the hybrid backend if the
+///   project has reachable `use rust:` imports, otherwise LLVM-only.
+/// - `"llvm"` — forces the LLVM-only backend.
+/// - `"hybrid"` — forces the Rust-aware hybrid backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildConfig {
     /// The source root directory relative to the project root (default: `src`).
@@ -96,6 +108,17 @@ pub struct BuildConfig {
     /// The toolchain appends `.stn` (canonical) and falls back to `.stnx`.
     #[serde(default = "default_entry")]
     pub entry: String,
+    /// Backend selection mode (default: `"auto"`).
+    /// See [`BackendMode`] for the available options.
+    #[serde(default, skip_serializing_if = "is_default_backend")]
+    pub backend: BackendMode,
+}
+
+/// Returns true if the backend mode is `Auto` (the default).
+/// Used with `skip_serializing_if` so the TOML doesn't include a redundant
+/// `backend = "auto"` line for projects that don't override it.
+fn is_default_backend(mode: &BackendMode) -> bool {
+    *mode == BackendMode::Auto
 }
 
 impl Default for BuildConfig {
@@ -103,6 +126,7 @@ impl Default for BuildConfig {
         Self {
             source: default_source_dir(),
             entry: default_entry(),
+            backend: BackendMode::Auto,
         }
     }
 }

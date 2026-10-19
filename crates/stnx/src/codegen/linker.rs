@@ -319,7 +319,7 @@ impl<'cfg> Linker<'cfg> {
         Err(searched)
     }
 
-    fn select_linker(&self, os: &OperatingSystem, env: &Environment) -> Vec<String> {
+    pub fn select_linker(&self, os: &OperatingSystem, env: &Environment) -> Vec<String> {
         match (os, env) {
             (OperatingSystem::Linux, _) => vec!["cc".to_string()],
             (OperatingSystem::Darwin, _) => vec!["clang".to_string()],
@@ -347,7 +347,7 @@ impl<'cfg> Linker<'cfg> {
         }
     }
 
-    fn build_linker_args(
+    pub fn build_linker_args(
         &self,
         os: &OperatingSystem,
         env: &Environment,
@@ -419,6 +419,16 @@ impl<'cfg> Linker<'cfg> {
                 ]
             }
         }
+    }
+
+    /// Check whether the hybrid backend is needed based on backend selection.
+    ///
+    /// Returns the list of Rust crate names that need to be built (i.e. the
+    /// reachable Rust imports from the HIR program).
+    pub fn has_rust_externals(&self, externals: &[crate::mir::ExternalLibrary]) -> bool {
+        externals
+            .iter()
+            .any(|e| e.kind == crate::mir::MirExternalKind::Rust)
     }
 }
 
@@ -513,7 +523,7 @@ pub fn check_linker_available(target_config: &TargetConfig) -> Result<(), Compil
 /// The MSYS2 linker doesn't understand MSVC-style `/DEFAULTLIB:` flags. This
 /// function uses `vswhere` to find the Visual Studio installation's `link.exe`
 /// first, falling back to `which` if that fails.
-fn resolve_linker_path(
+pub fn resolve_linker_path(
     name: &str,
     os: &OperatingSystem,
     env: &Environment,
@@ -695,7 +705,7 @@ fn find_msvc_lib_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn describe_os(os: &OperatingSystem) -> &'static str {
+pub fn describe_os(os: &OperatingSystem) -> &'static str {
     match os {
         OperatingSystem::Linux => "Linux",
         OperatingSystem::Darwin => "macOS",
@@ -705,7 +715,7 @@ fn describe_os(os: &OperatingSystem) -> &'static str {
     }
 }
 
-fn describe_env(env: &Environment) -> &'static str {
+pub fn describe_env(env: &Environment) -> &'static str {
     match env {
         Environment::Msvc => "MSVC",
         Environment::Gnu => "GNU",
