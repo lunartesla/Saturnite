@@ -1,23 +1,25 @@
 //! Hybrid backend build orchestration.
 //!
-//! When the hybrid backend is selected, the Saturnite compiler must:
+//! When the hybrid backend is selected, the Saturnite compiler emits an LLVM
+//! object from the MIR program (LLVM backend), then links it together with
+//! pre-built Rust wrapper static libraries. The Rust wrappers are thin
+//! `#[no_mangle] extern "C"` adapter crates that forward to real Rust crates;
+//! they are built during `saturn install` by [`crate::rust_wrapper`] and stored
+//! under `target/saturnite/wrappers/<crate>_wrapper/target/release/`.
 //!
-//! 1. Emit LLVM IR/object from the MIR program (LLVM backend).
-//! 2. Generate Rust source from the HIR program (Rust backend).
-//! 3. Compile the generated Rust source into a `staticlib` via `cargo build`.
-//! 4. Link the LLVM object, Rust staticlib, and Saturnite runtime support
-//!    into a single executable.
+//! This module provides [`build_hybrid`] which orchestrates:
 //!
-//! This module provides [`build_hybrid`] which orchestrates all four steps
-//! in the correct sequence. All subprocess invocations use
-//! `std::process::Command` (process API, not shell strings).
+//! 1. LLVM object emission from MIR.
+//! 2. Location of pre-built Rust wrapper staticlibs for reachable Rust imports.
+//! 3. Linking the LLVM object + Rust staticlibs + Saturnite runtime into the
+//!    final executable.
+//!
+//! All subprocess invocations use [`std::process::Command`] (process API, not
+//! shell strings).
 
 use crate::error::{CompilerError, CompilerResult};
 use crate::hir::HirProgram;
 use crate::mir::codegen::emit_object_from_mir;
-use crate::rust_codegen::{
-    build_rust_crate, generate_cargo_toml, generate_rust_source, CodegenOptions, RustSource,
-};
 use crate::target::TargetConfig;
 use std::path::{Path, PathBuf};
 
@@ -26,33 +28,30 @@ use std::path::{Path, PathBuf};
 pub struct HybridBuildResult {
     /// The final executable path.
     pub output: PathBuf,
-    /// The LLVM object file (intermediate).
+    /// The LLVM object file (intermediate, may be cleaned up).
     pub llvm_object: PathBuf,
-    /// The Rust static library (intermediate, may not exist if no Rust deps).
-    pub rust_staticlib: Option<PathBuf>,
-    /// The generated Rust source directory (intermediate).
-    pub rust_source_dir: PathBuf,
+    /// The Rust wrapper static libraries that were linked (may be empty).
+    pub rust_staticlibs: Vec<PathBuf>,
     /// Build time in milliseconds.
     pub elapsed_ms: u64,
 }
 
-/// Orchestrate the full hybrid build pipeline.
+/// Orchestrate the hybrid build pipeline.
 ///
 /// This is the primary entry point for the hybrid backend. It:
 ///
 /// 1. Emits an LLVM object file from the MIR program.
-/// 2. Generates Rust source from the HIR program.
-/// 3. Writes the generated source and `Cargo.toml` to a build directory.
-/// 4. Runs `cargo build --release` to produce a `staticlib`.
-/// 5. Links the LLVM object + Rust staticlib + runtime into the final executable.
+/// 2. Locates pre-built Rust wrapper static libraries for all reachable
+///    `use rust:` imports in the HIR program.
+/// 3. Links the LLVM object + Rust staticlibs + runtime into the final
+///    executable.
 ///
 /// # Arguments
-/// * `hir` — The HIR program (used for Rust source generation).
+/// * `hir` — The HIR program (used to find Rust wrapper staticlibs).
 /// * `mir` — The MIR program (used for LLVM object emission).
 /// * `output_path` — Path for the final executable.
 /// * `target_config` — Target configuration (triple, profile, output kind).
-/// * `project_root` — Project root (used for the build directory and wrapper cache).
-/// * `crate_name` — Name for the generated Rust crate.
+/// * `project_root` — Project root (used for the wrappers directory and runtime).
 ///
 /// # Returns
 /// Build artifacts and timing information.
@@ -62,67 +61,35 @@ pub fn build_hybrid(
     output_path: &str,
     target_config: &TargetConfig,
     project_root: &Path,
-    crate_name: &str,
 ) -> CompilerResult<HybridBuildResult> {
     let start = std::time::Instant::now();
     let output_path = Path::new(output_path);
 
     // --- Step 1: Emit LLVM object from MIR ---
+    // Saturnite source compiles entirely through HIR → MIR → LLVM.
+    // No Saturnite code is translated to Rust.
     let llvm_obj_path = output_path.with_extension("o");
     let obj_path_str = llvm_obj_path.to_string_lossy().to_string();
     emit_object_from_mir(mir, &obj_path_str, target_config)?;
 
-    // --- Step 2: Generate Rust source from HIR ---
-    // Use as_binary=false (staticlib mode) so we can link the Rust code
-    // together with the LLVM object.
-    let options = CodegenOptions {
-        as_binary: false,
-    };
-    let rust_source: RustSource = generate_rust_source(hir, crate_name, &options)?;
-
-    // --- Step 3: Write generated source and Cargo.toml to build directory ---
-    let rust_build_dir = project_root
+    // --- Step 2: Locate pre-built Rust wrapper staticlibs ---
+    // These were built during `saturn install` via rust_wrapper::build_rust_wrapper.
+    let wrappers_dir = project_root
         .join("target")
         .join("saturnite")
-        .join("rust_backend")
-        .join(crate_name);
+        .join("wrappers");
 
-    // Clean previous build.
-    if rust_build_dir.exists() {
-        std::fs::remove_dir_all(&rust_build_dir)
-            .map_err(|e| CompilerError::codegen(format!("failed to clean rust build dir: {}", e)))?;
-    }
+    let rust_staticlibs = find_rust_staticlibs(hir, &wrappers_dir, target_config)?;
 
-    let src_dir = rust_build_dir.join("src");
-    std::fs::create_dir_all(&src_dir)
-        .map_err(|e| CompilerError::codegen(format!("failed to create rust src dir: {}", e)))?;
+    // --- Step 3: Link LLVM object + Rust staticlibs + runtime ---
+    link_hybrid(
+        target_config,
+        &llvm_obj_path,
+        &rust_staticlibs,
+        output_path,
+    )?;
 
-    // Write Cargo.toml.
-    // Dependencies come from the RustSource (collected from `use rust:` imports).
-    let deps: Vec<(String, String)> = rust_source.dependencies.clone();
-    let cargo_toml = generate_cargo_toml(&rust_source.crate_name, &rust_source.edition, &deps, false);
-    std::fs::write(rust_build_dir.join("Cargo.toml"), cargo_toml)
-        .map_err(|e| CompilerError::codegen(format!("failed to write Cargo.toml: {}", e)))?;
-
-    // Write src/lib.rs.
-    std::fs::write(src_dir.join("lib.rs"), &rust_source.source)
-        .map_err(|e| CompilerError::codegen(format!("failed to write lib.rs: {}", e)))?;
-
-    // --- Step 4: Build Rust crate with cargo ---
-    let target_triple = target_config.triple().to_string();
-    let rust_staticlib: PathBuf = build_rust_crate(&rust_build_dir, Some(&target_triple), false)?;
-
-    // --- Step 5: Link LLVM object + Rust staticlib + runtime ---
-    let rust_staticlib_opt = if rust_staticlib.exists() {
-        Some(rust_staticlib.clone())
-    } else {
-        None
-    };
-
-    link_hybrid(target_config, &llvm_obj_path, rust_staticlib_opt.as_deref(), output_path)?;
-
-    // Clean up intermediates unless save_temps is set.
-    // (The caller controls save_temps, but for now we always clean.)
+    // Clean up the intermediate object file.
     let _ = std::fs::remove_file(&llvm_obj_path);
 
     let elapsed = start.elapsed();
@@ -130,21 +97,147 @@ pub fn build_hybrid(
     Ok(HybridBuildResult {
         output: output_path.to_path_buf(),
         llvm_object: llvm_obj_path,
-        rust_staticlib: rust_staticlib_opt,
-        rust_source_dir: rust_build_dir,
+        rust_staticlibs,
         elapsed_ms: elapsed.as_millis() as u64,
     })
 }
 
-/// Link the LLVM object, Rust staticlib, and Saturnite runtime into an
-/// executable.
+/// Locate pre-built Rust wrapper static libraries for all reachable
+/// `use rust:` imports in the HIR program.
 ///
-/// This uses the standard [`Linker`](crate::codegen::Linker) infrastructure, adding the Rust staticlib
-/// to the link line alongside the LLVM object and runtime support library.
+/// For each Rust ecosystem import, this looks in
+/// `wrappers_dir/<crate>_wrapper/target/release/` for the static library
+/// produced by `cargo build --release` during `saturn install`.
+fn find_rust_staticlibs(
+    hir: &HirProgram,
+    wrappers_dir: &Path,
+    target_config: &TargetConfig,
+) -> CompilerResult<Vec<PathBuf>> {
+    let mut staticlibs = Vec::new();
+
+    // Collect unique Rust crate names from use_decls.
+    let rust_crates: Vec<String> = hir
+        .use_decls
+        .iter()
+        .filter_map(|ud| {
+            if ud.ecosystem != Some(crate::ast::ExternalKind::Rust) {
+                return None;
+            }
+            let crate_name = hir
+                .symbols
+                .lookup(ud.path.first().copied().unwrap_or(crate::hir::symbol::SymbolId(0)))
+                .unwrap_or("");
+            if crate_name.is_empty() {
+                None
+            } else {
+                Some(crate_name.to_string())
+            }
+        })
+        .collect::<std::collections::HashSet<String>>()
+        .into_iter()
+        .collect();
+
+    let os = target_config.os();
+    let env = target_config.environment();
+
+    for crate_name in &rust_crates {
+        let sanitized = crate::rust_discovery::sanitize_crate_name(crate_name);
+        let wrapper_dir_name = format!("{}_wrapper", crate_name);
+        let release_dir = wrappers_dir
+            .join(&wrapper_dir_name)
+            .join("target")
+            .join("release");
+
+        if !release_dir.is_dir() {
+            return Err(CompilerError::codegen(format!(
+                "Rust wrapper for crate '{}' not found. Run `saturn install` first. \
+                 Expected static library in {}",
+                crate_name,
+                release_dir.display()
+            )));
+        }
+
+        // Staticlib naming: lib<name>.a on Unix, <name>.lib on MSVC.
+        let lib_base = format!("{}-saturnite-wrapper", sanitized);
+        let candidates = match (os, env) {
+            (crate::target::OperatingSystem::Linux, _)
+            | (crate::target::OperatingSystem::Darwin, _)
+            | (crate::target::OperatingSystem::Windows, crate::target::Environment::Gnu) => {
+                vec![
+                    format!("lib{}.a", lib_base),
+                    format!("lib{}.so", lib_base), // in case of cdylib fallback
+                ]
+            }
+            (crate::target::OperatingSystem::Windows, crate::target::Environment::Msvc) => {
+                vec![
+                    format!("{}.lib", lib_base),
+                    format!("lib{}.lib", lib_base),
+                ]
+            }
+            _ => vec![
+                format!("lib{}.a", lib_base),
+                format!("{}.lib", lib_base),
+            ],
+        };
+
+        let mut found = None;
+        for candidate in &candidates {
+            let path = release_dir.join(candidate);
+            if path.is_file() {
+                found = Some(path);
+                break;
+            }
+        }
+
+        if found.is_none() {
+            // Search in deps subdirectory.
+            let deps_dir = release_dir.join("deps");
+            if deps_dir.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&deps_dir) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if name.starts_with(&format!("lib{}", lib_base))
+                            && (name.ends_with(".a") || name.ends_with(".lib"))
+                        {
+                            found = Some(entry.path());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let lib_path = found.ok_or_else(|| {
+            CompilerError::codegen(format!(
+                "Rust wrapper static library for crate '{}' not found in {}. \
+                 Run `saturn install` to build it.",
+                crate_name,
+                release_dir.display()
+            ))
+        })?;
+
+        if std::env::var("SATURNITE_VERBOSE").is_ok() {
+            eprintln!("rust wrapper: {} → {}", crate_name, lib_path.display());
+        }
+
+        staticlibs.push(lib_path);
+    }
+
+    Ok(staticlibs)
+}
+
+/// Link the LLVM object, Rust wrapper staticlibs, and Saturnite runtime into
+/// an executable.
+///
+/// This uses the standard [`crate::codegen::Linker`] infrastructure, inserting
+/// each Rust staticlib on the link line alongside the LLVM object and runtime
+/// support library. The staticlibs are placed before the output flag so their
+/// symbols resolve the LLVM object's external references.
 pub fn link_hybrid(
     target_config: &TargetConfig,
     llvm_obj: &Path,
-    rust_staticlib: Option<&Path>,
+    rust_staticlibs: &[PathBuf],
     output_path: &Path,
 ) -> CompilerResult<()> {
     use crate::codegen::Linker;
@@ -157,22 +250,23 @@ pub fn link_hybrid(
     // Build base linker args (object, output, runtime, platform flags).
     let base_args = linker.build_linker_args(os, env, llvm_obj, output_path);
 
-    // Insert the Rust staticlib on the link line.
-    let args = if let Some(lib) = rust_staticlib {
-        let lib_str = lib.display().to_string();
-        // Insert before the output flag so the staticlib symbols are available
-        // when resolving the object's references.
+    // Insert all Rust staticlibs before the output flag so their symbols are
+    // available when resolving the object's external references.
+    let args = if rust_staticlibs.is_empty() {
+        base_args
+    } else {
         let insert_at = base_args
             .iter()
             .position(|a| a == "-o" || a.starts_with("/OUT:"))
             .unwrap_or(base_args.len().saturating_sub(1));
-        let mut args = Vec::with_capacity(base_args.len() + 1);
+
+        let mut args = Vec::with_capacity(base_args.len() + rust_staticlibs.len());
         args.extend(base_args[..insert_at].iter().cloned());
-        args.push(lib_str);
+        for lib in rust_staticlibs {
+            args.push(lib.display().to_string());
+        }
         args.extend(base_args[insert_at..].iter().cloned());
         args
-    } else {
-        base_args
     };
 
     let linker_cmd = linker.select_linker(os, env);
@@ -298,7 +392,10 @@ pub fn verify_hybrid_prerequisites(target_config: &TargetConfig) -> CompilerResu
 ///
 /// This is a simple predicate used by the orchestrator to decide whether to
 /// route a crate through the Rust wrapper build path.
-pub fn is_rust_ecosystem_crate(name: &str, kind: crate::interop::DependencyKind) -> bool {
+pub fn is_rust_ecosystem_crate(
+    name: &str,
+    kind: crate::interop::DependencyKind,
+) -> bool {
     kind == crate::interop::DependencyKind::Rust && !name.is_empty()
 }
 

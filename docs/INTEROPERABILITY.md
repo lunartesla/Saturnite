@@ -57,14 +57,17 @@ both `f32`→`f64` widening and truncation.
 
 ### Linking
 
-Static libraries are searched in:
-- Output directory (`target/`)
-- Current working directory
-- `<cwd>/libs/<crate_name>/`
-- `<cwd>/libs/`
-- `<dir>/<crate_name>/target/release/` (Cargo build output)
+When the hybrid backend is selected, the compiler searches for pre-built
+Rust wrapper static libraries at:
 
-File patterns: `lib<name>.a` (Linux/macOS) or `<name>.lib` (Windows MSVC).
+- `<project_root>/target/saturnite/wrappers/<crate>_wrapper/target/release/`
+
+The naming convention is `lib<crate>-saturnite-wrapper.a` (Linux/macOS) or
+`<crate>-saturnite-wrapper.lib` (Windows MSVC). These wrappers are built
+during `saturn install` by `rust_wrapper::build_rust_wrapper()`.
+
+The LLVM object (from Saturnite source) and Rust staticlibs are linked
+together with the Saturnite runtime via `link_hybrid`.
 
 ### End-to-end test
 

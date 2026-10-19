@@ -207,14 +207,12 @@ impl BuildContext {
                     .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
             }
             stnx::SelectedBackend::Hybrid => {
-                let crate_name = &self.manifest.package.name;
                 let result = stnx::build_hybrid(
                     &hir,
                     &mir,
                     self.output.to_str().unwrap(),
                     &config,
                     &self.project_root,
-                    crate_name,
                 )
                 .map_err(|e| anyhow::anyhow!("Hybrid build failed: {}", e))?;
                 // Override the elapsed time with the hybrid build's timing.

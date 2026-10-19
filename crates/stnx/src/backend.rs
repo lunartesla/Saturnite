@@ -6,10 +6,10 @@
 //!   and linked with `cc`/`link.exe`/`rust-lld`. Rust crate dependencies are
 //!   handled via pre-built static-library wrappers.
 //!
-//! - **Rust-aware (hybrid)**: Saturnite source that is reachable from `use rust:`
-//!   imports is translated to Rust source and compiled with the real `rustc` /
-//!   `cargo` toolchain. Non-Rust code (native Saturnite functions, Python calls)
-//!   continues through the LLVM backend. The two object sets are linked together.
+//! - **Rust-aware (hybrid)**: Saturnite source compiles through the LLVM
+//!   backend (HIR → MIR → object). Pre-built Rust wrapper static libraries
+//!   (built during `saturn install`) are linked alongside the LLVM object
+//!   to resolve `use rust:` calls. No Saturnite source is translated to Rust.
 //!
 //! ## Automatic selection rules
 //!

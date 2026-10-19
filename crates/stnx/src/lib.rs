@@ -100,13 +100,22 @@ pub use backend::{BackendMode, BackendSelection, SelectedBackend, select_backend
 
 // --- Hybrid build re-exports ---
 //
-// Orchestration for the hybrid backend: LLVM object emission + Rust source
-// generation + cargo build + cross-linking.
+// Orchestration for the hybrid backend: LLVM object emission + pre-built Rust
+// wrapper staticlib discovery + cross-linking. Saturnite source stays on the
+// LLVM path (HIR → MIR → object); only Rust wrapper crates go through cargo.
 
 pub use hybrid_build::{
     build_hybrid, is_rust_ecosystem_crate, rust_crates_to_build, verify_hybrid_prerequisites,
     HybridBuildResult,
 };
+
+// --- Rust wrapper re-exports ---
+//
+// Functions for generating and building Rust adapter crates (`#[no_mangle]`
+// extern "C" shims) that bridge Saturnite's LLVM backend to real Rust crates.
+// These are invoked during `saturn install`, not during `saturn build`.
+
+pub use rust_wrapper::{build_rust_wrapper, generate_cargo_toml, generate_wrapper_src};
 
 // --- Module system re-exports ---
 //
